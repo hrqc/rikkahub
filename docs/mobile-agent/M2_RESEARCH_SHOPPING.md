@@ -114,8 +114,8 @@ Root 仍只提供受限输入能力。模型不获得任意 shell、Root 管理�
 
 | 项目 | 本轮记录 |
 | --- | --- |
-| 源码分支、commit、tag、回滚点 | 主线在提交后填写；最近稳定回滚点为 `cd843f1` / `mobile-agent-v1-m2.5-overlay-internal` |
-| APK versionName / versionCode、路径、SHA-256、签名 | 本轮源码为 `2.5.4-mobile-agent-v1-m2.6-research-shopping` / 197；构建后记录 SHA-256，使用 debug 签名 |
+| 源码分支、commit、tag、回滚点 | `feature/mobile-agent-v1` @ `3d84accd`；tag `mobile-agent-v1-m2.6-research-shopping`；回滚点 `cd843f1` / `mobile-agent-v1-m2.5-overlay-internal` |
+| APK versionName / versionCode、路径、SHA-256、签名 | `2.5.4-mobile-agent-v1-m2.6-research-shopping` / 197；`artifacts/v1-m2.6-research-shopping/RikkaHub-Mobile-Agent-v1-m2.6-197-arm64-debug.apk` SHA-256 `742F11EAB189A1BD044A96CE7BDA1FF1E991A9F2B838981C74A1959A096CC432`；测试 APK SHA-256 `6D0A4D92853DEA4186CE6600D4D877880E186EDF34276198221DECB1D95DE322`；apksigner verify 通过 |
 | JVM 选定回归：命令、报告时间、通过/失败/跳过 | 2026-09-26：30 个 suite、268 tests，0 failures、0 errors、0 skipped；日志 `artifacts/v1-m2/research197-unit-tests-final.log` |
 | 主 APK / instrumentation APK 构建 | 197 主 APK 与 instrumentation APK 构建成功；日志 `artifacts/v1-m2/research197-apk-build.log` |
 | 保留数据安装、启动、服务连接 | OnePlus Ace 5 Pro 覆盖安装成功且保留数据；无障碍服务曾被系统标为 crashed，按用户已授权范围重连后恢复 bound、无 crashed marker |
