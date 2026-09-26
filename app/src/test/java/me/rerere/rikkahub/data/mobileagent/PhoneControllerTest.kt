@@ -75,6 +75,48 @@ class PhoneControllerTest {
         try { block(); fail("Expected $code") } catch (error: PhoneControlException) { assertEquals(code, error.code) }
     }
 
+    @Test fun `live activity follows actual model observation and dispatch lifecycle`() = runBlocking {
+        Fixture().use { f ->
+            val token = f.start()
+            assertEquals(PhoneActivity.READY, f.controller.state.value.activity)
+            f.controller.setModelWorking(token, true)
+            assertEquals(PhoneActivity.WAITING_MODEL, f.controller.state.value.activity)
+            val reading = CompletableDeferred<Unit>()
+            val release = CompletableDeferred<Unit>()
+            f.backend.beforeRead = { reading.complete(Unit); release.await() }
+            val pending = async { f.controller.observe(token) }
+            reading.await()
+            assertEquals(PhoneActivity.OBSERVING, f.controller.state.value.activity)
+            release.complete(Unit)
+            val observation = pending.await()
+            assertEquals(PhoneActivity.WAITING_MODEL, f.controller.state.value.activity)
+            assertEquals("observe", f.controller.state.value.audit.last().operation)
+            f.backend.beforeDispatch = { assertEquals(PhoneActivity.ACTING, f.controller.state.value.activity) }
+            f.controller.act(token, observation.id, PhoneAction.Click("button"))
+            assertEquals(PhoneActivity.WAITING_MODEL, f.controller.state.value.activity)
+            f.controller.setModelWorking(token, false)
+            assertEquals(PhoneActivity.READY, f.controller.state.value.activity)
+            assertFalse(f.controller.state.value.modelWorking)
+        }
+    }
+
+    @Test fun `stale generation completion cannot reset resumed activity and stop clears working state`() {
+        Fixture().use { f ->
+            val old = f.start()
+            f.controller.setModelWorking(old, true)
+            f.controller.pause()
+            assertFalse(f.controller.state.value.modelWorking)
+            val current = f.controller.resume()
+            f.controller.setModelWorking(current, true)
+            f.controller.setModelWorking(old, false)
+            assertTrue(f.controller.state.value.modelWorking)
+            assertEquals(PhoneActivity.WAITING_MODEL, f.controller.state.value.activity)
+            f.controller.stop()
+            assertFalse(f.controller.state.value.modelWorking)
+            assertEquals(PhoneActivity.READY, f.controller.state.value.activity)
+        }
+    }
+
     @Test fun `ordinary chat has no phone token and rejected observations never read backend`() = runBlocking {
         Fixture().use { f ->
             assertNull(f.controller.activeToken("chat", "assistant"))

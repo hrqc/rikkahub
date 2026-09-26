@@ -134,6 +134,8 @@ fun createPhoneTools(
                 重试或恢复任务时先观察并核对上次执行结果。已完成的发送、提交等操作不要重复；动作曾被接受但后续观察失败，不等于未执行，无法核实时先询问用户。
                 遇到系统授权弹窗，应停止手机操作并请用户处理；不要点击授权选项，也不要反复调用 open_app。
                 工具调用被拒绝不代表任务已完成；只能依据重新观察到的目标应用状态判断结果。
+                PAGE_UNSTABLE 表示同一页面持续刷新且内部有限重读未取得稳定结果，不代表用户授权或 Root 丢失；停止重复 observe，请用户等页面加载后继续或切到稳定页面。
+                STALE_WINDOW 表示窗口或快照已改变，不等于系统权限被关闭；至多重新观察一次，仍失败就报告实际错误并暂停等待，不循环消耗任务预算。
             """.trimIndent(),
         ) { listOf(UIMessagePart.Text(json.encodeToString(controller.observe(token)))) },
         tool("click", "点击已观察到的节点。$actionResultHint", node) {

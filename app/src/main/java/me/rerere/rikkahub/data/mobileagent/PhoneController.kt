@@ -30,6 +30,7 @@ class PhoneController(
     private val operations = Mutex()
     private val mutableState = MutableStateFlow(PhoneSessionState())
     val state: StateFlow<PhoneSessionState> = mutableState.asStateFlow()
+    val taskControls = PhoneTaskControlRegistry { state.value }
     private var epoch = 0L
     private var observation: PhoneObservation? = null
     private var enteredTarget = false
@@ -106,7 +107,7 @@ class PhoneController(
                     token = it, targetPackage = targetPackage, status = PhoneSessionStatus.RUNNING,
                     detail = "已允许本聊天控制选定应用", useRoot = useRoot,
                     allowScreenshots = allowScreenshots, startedAtMillis = now(),
-                    audit = listOf(PhoneAuditEntry(now(), "start", "用户开启会话")),
+                    audit = listOf(PhoneAuditEntry(now(), "start", "用户开启会话")), activityStartedAtMillis = now(),
                 )
             }
         }
@@ -132,6 +133,22 @@ class PhoneController(
 
     fun pause() = pauseWith(PhoneSessionStatus.PAUSED, "用户暂停，旧动作和页面快照已失效")
 
+    /** UI events carry the exact displayed epoch; validation and owner callbacks are atomic. */
+    fun requestTaskControl(expected: PhoneSessionToken, action: PhoneTaskControl): Boolean = synchronized(gate) {
+        taskControls.dispatch(expected, action)
+    }
+
+    /** Generation lifecycle only; never expose model text or hidden reasoning in status. */
+    fun setModelWorking(token: PhoneSessionToken, working: Boolean) = synchronized(gate) {
+        val current = state.value
+        if (current.token != token || current.status != PhoneSessionStatus.RUNNING) return@synchronized
+        mutableState.value = current.copy(
+            modelWorking = working,
+            activity = if (working) PhoneActivity.WAITING_MODEL else PhoneActivity.READY,
+            activityStartedAtMillis = now(),
+        )
+    }
+
     /** A delayed preparation timeout/cancellation must never pause a newer authorization. */
     fun pauseIfCurrent(token: PhoneSessionToken, reason: String) =
         pauseWith(PhoneSessionStatus.PAUSED, reason, token)
@@ -153,7 +170,8 @@ class PhoneController(
             foregroundDeadline?.cancel()
             foregroundDeadline = null
             enteredTarget = false
-            mutableState.value = current.copy(token = updated, status = PhoneSessionStatus.RUNNING, detail = "用户恢复，请重新观察页面")
+            mutableState.value = current.copy(token = updated, status = PhoneSessionStatus.RUNNING, detail = "用户恢复，请重新观察页面",
+                modelWorking = false, activity = PhoneActivity.READY, activityStartedAtMillis = now())
             updated
         }
         backend.invalidate()
@@ -195,7 +213,9 @@ class PhoneController(
         mutableState.value = current.copy(
             token = current.token?.copy(epoch = ++epoch), status = status, detail = reason,
             audit = (current.audit + PhoneAuditEntry(now(), "stop", reason)).takeLast(60),
+            modelWorking = false, activity = PhoneActivity.READY, activityStartedAtMillis = now(),
         )
+        current.token?.let { taskControls.clearSession(it.sessionId) }
         observation = null
         enteredTarget = false
         deadline?.cancel()
@@ -212,6 +232,7 @@ class PhoneController(
         mutableState.value = current.copy(
             token = current.token?.copy(epoch = ++epoch), status = status, detail = reason,
             audit = (current.audit + PhoneAuditEntry(now(), "pause", reason)).takeLast(60),
+            modelWorking = false, activity = PhoneActivity.READY, activityStartedAtMillis = now(),
         )
         observation = null
         foregroundDeadline?.cancel()
@@ -248,7 +269,8 @@ class PhoneController(
                     fail("OBSERVATION_LIMIT", "观察预算不足")
                 }
                 observation = null // A snapshot is single-use, including rejected platform actions.
-                mutableState.value = current.copy(actionsUsed = current.actionsUsed + 1)
+                mutableState.value = current.copy(actionsUsed = current.actionsUsed + 1,
+                    activity = PhoneActivity.ACTING, activityStartedAtMillis = now())
             }
             val result = backend.execute(permit(token), before, action)
             authorize(token)
@@ -292,7 +314,8 @@ class PhoneController(
                 pauseWith(PhoneSessionStatus.PAUSED, "已到本次观察次数上限")
                 fail("OBSERVATION_LIMIT", "已到本次观察次数上限")
             }
-            mutableState.value = current.copy(observationsUsed = current.observationsUsed + 1)
+            mutableState.value = current.copy(observationsUsed = current.observationsUsed + 1,
+                activity = PhoneActivity.OBSERVING, activityStartedAtMillis = now())
         }
         val raw = backend.observe(permit(token))
         authorize(token)
@@ -310,7 +333,9 @@ class PhoneController(
             authorize(token)
             enteredTarget = true
             observation = safe
-            mutableState.value = mutableState.value.copy(detail = "已观察目标页面")
+            val current = mutableState.value
+            mutableState.value = current.copy(detail = "已观察目标页面",
+                audit = (current.audit + PhoneAuditEntry(now(), "observe", "已读取目标页面")).takeLast(60))
         }
         return safe
     }
@@ -394,11 +419,29 @@ class PhoneController(
             pauseWith(PhoneSessionStatus.PAUSED, "操作已取消或超时，请检查后恢复", token)
             throw cancelled
         } catch (failure: PhoneControlException) {
+            synchronized(gate) {
+                val current = state.value
+                if (current.token == token && current.status == PhoneSessionStatus.RUNNING) {
+                    mutableState.value = current.copy(
+                        audit = (current.audit + PhoneAuditEntry(now(), "error", failure.code)).takeLast(60),
+                    )
+                }
+            }
             pauseForSafetyFailure(token, failure)
             throw failure
         } catch (_: Exception) {
             pauseWith(PhoneSessionStatus.PAUSED, "操作未能完成，请人工检查", token)
             fail("OPERATION_FAILED", "操作未能完成，未确认任务成功")
+        } finally {
+            synchronized(gate) {
+                val current = state.value
+                if (current.token == token && current.status == PhoneSessionStatus.RUNNING) {
+                    mutableState.value = current.copy(
+                        activity = if (current.modelWorking) PhoneActivity.WAITING_MODEL else PhoneActivity.READY,
+                        activityStartedAtMillis = now(),
+                    )
+                }
+            }
         }
     }
 

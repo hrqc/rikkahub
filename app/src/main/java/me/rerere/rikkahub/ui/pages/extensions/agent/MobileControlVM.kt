@@ -67,12 +67,14 @@ class MobileControlVM(
     val openingTarget = _openingTarget.asStateFlow()
     private var generationStateReady = false
     private var cancelGenerationJob: Job? = null
+    private var modelGenerationJob: Job? = null
     private var appsJob: Job? = null
     private val taskLauncher = PhoneTaskLauncher(controller, backend)
     private var preparationJob: Job? = null
     private var preparationToken: PhoneSessionToken? = null
     private var preparationSequence = 0L
     private var pendingModelTask: Pair<String, String>? = null
+    private val taskControlOwner = Any()
 
     init {
         chatService.addConversationReference(conversationUuid)
@@ -162,6 +164,7 @@ class MobileControlVM(
             _preparedSessionId.value = token.sessionId.takeIf { prepareOnly }
             _modelSessionId.value = token.sessionId.takeUnless { prepareOnly }
             pendingModelTask = (token.sessionId to task.trim()).takeUnless { prepareOnly }
+            registerTaskControls(token)
             if (!prepareOnly) prepareAndSend(token, task.trim())
         } catch (error: Exception) {
             startedToken?.let { controller.pauseIfCurrent(it, "未能准备模型任务，请检查后恢复") }
@@ -174,7 +177,7 @@ class MobileControlVM(
         try {
             controller.pause()
             cancelPreparation()
-            cancelGeneration(pauseOnly = true)
+            cancelGeneration()
         } catch (error: Exception) {
             _message.value = safeMessage(error, "未能暂停任务，请使用 STOP 停止。")
         }
@@ -193,6 +196,7 @@ class MobileControlVM(
         try {
             val token = controller.resume()
             resumedToken = token
+            registerTaskControls(token)
             if (prepareOnly) {
                 _preparedSessionId.value = token.sessionId
             } else {
@@ -209,16 +213,21 @@ class MobileControlVM(
 
     fun stop() {
         // Revocation is synchronous: STOP must not wait for network cancellation or a UI coroutine.
+        controller.taskControls.unregister(taskControlOwner)
         controller.stopForConversation(conversationId)
         cancelPreparation()
-        cancelGeneration(pauseOnly = false)
+        cancelGeneration()
+    }
+
+    private fun registerTaskControls(token: PhoneSessionToken) {
+        controller.taskControls.register(taskControlOwner, token, ::pause, ::resume, ::stop)
     }
 
     private fun prepareAndSend(token: PhoneSessionToken, task: String) {
         val sequence = ++preparationSequence
         preparationToken = token
         _openingTarget.value = true
-        preparationJob = viewModelScope.launch {
+        preparationJob = viewModelScope.launch(Dispatchers.Main) {
             try {
                 taskLauncher.prepare(token)
                 if (!validateConversation()) {
@@ -226,9 +235,8 @@ class MobileControlVM(
                     return@launch
                 }
                 taskLauncher.requireReady(token)
-                if (chatService.sendPhoneTask(conversationUuid, token, listOf(UIMessagePart.Text(task))) == null) {
-                    throw PhoneControlException("CHAT_BUSY", "聊天或控制授权状态已变化，未发送模型请求，请检查后恢复。")
-                }
+                modelGenerationJob = chatService.sendPhoneTask(conversationUuid, token, listOf(UIMessagePart.Text(task)))
+                    ?: throw PhoneControlException("CHAT_BUSY", "聊天或控制授权状态已变化，未发送模型请求，请检查后恢复。")
                 if (pendingModelTask?.first == token.sessionId) pendingModelTask = null
             } catch (cancelled: CancellationException) {
                 throw cancelled
@@ -253,8 +261,9 @@ class MobileControlVM(
             controller.pauseIfCurrent(it, "目标应用准备已取消，未发送模型请求，请检查后恢复")
         }
         preparationToken = null
-        preparationJob?.cancel()
+        val oldPreparation = preparationJob
         preparationJob = null
+        if (oldPreparation != null) viewModelScope.launch(Dispatchers.Main) { oldPreparation.cancel() }
         _openingTarget.value = false
     }
 
@@ -279,18 +288,19 @@ class MobileControlVM(
         }
     }
 
-    private fun cancelGeneration(pauseOnly: Boolean) {
+    private fun cancelGeneration() {
         if (cancelGenerationJob?.isActive == true) return
+        val captured = modelGenerationJob ?: return
         _busy.value = true
-        cancelGenerationJob = viewModelScope.launch {
+        cancelGenerationJob = viewModelScope.launch(Dispatchers.Main) {
             try {
-                if (pauseOnly) chatService.pausePhoneGeneration(conversationUuid)
-                else chatService.stopGeneration(conversationUuid)
+                chatService.cancelPhoneTaskGeneration(conversationUuid, captured)
             } catch (cancelled: CancellationException) {
                 throw cancelled
             } catch (_: Exception) {
                 _message.value = "设备操作已撤销，但尚未确认聊天生成结束。请返回聊天检查并停止生成。"
             } finally {
+                if (modelGenerationJob === captured) modelGenerationJob = null
                 _busy.value = false
             }
         }
@@ -321,6 +331,7 @@ class MobileControlVM(
     fun dismissMessage() { _message.value = null }
 
     override fun onCleared() {
+        controller.taskControls.unregister(taskControlOwner)
         cancelPreparation()
         chatService.removeConversationReference(conversationUuid)
         super.onCleared()

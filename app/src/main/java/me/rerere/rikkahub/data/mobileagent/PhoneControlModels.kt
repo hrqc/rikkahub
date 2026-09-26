@@ -11,6 +11,7 @@ data class PhoneSessionToken(
 )
 
 enum class PhoneSessionStatus { IDLE, RUNNING, PAUSED, WAITING_FOR_FOREGROUND, STOPPED, EXPIRED }
+enum class PhoneActivity { READY, WAITING_MODEL, OBSERVING, ACTING }
 
 enum class PhoneBackendStopReason { NOTIFICATION_STOP, SERVICE_INTERRUPTED, SERVICE_DISCONNECTED, SERVICE_REPLACED }
 
@@ -28,6 +29,9 @@ data class PhoneSessionState(
     val observationLimit: Int = 90,
     val durationLimitMillis: Long = 300_000,
     val audit: List<PhoneAuditEntry> = emptyList(),
+    val modelWorking: Boolean = false,
+    val activity: PhoneActivity = PhoneActivity.READY,
+    val activityStartedAtMillis: Long = 0,
 )
 
 data class PhoneAuditEntry(val atMillis: Long, val operation: String, val result: String)

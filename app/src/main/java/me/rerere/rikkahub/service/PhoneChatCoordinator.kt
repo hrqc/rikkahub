@@ -8,6 +8,7 @@ import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.flow.combine
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.yield
 import me.rerere.rikkahub.data.mobileagent.PhoneBackend
 import me.rerere.rikkahub.data.mobileagent.PhoneControlException
 import me.rerere.rikkahub.data.mobileagent.PhoneController
@@ -101,11 +102,12 @@ class PhoneChatCoordinator(
                 if (session.token?.sessionId != task.token.sessionId) return@collect
                 when (session.status) {
                     PhoneSessionStatus.PAUSED, PhoneSessionStatus.WAITING_FOR_FOREGROUND -> {
-                        task.generation?.cancel()
+                        cancelAfterControl(task.generation)
                         mutableState.value = taskState(task, PhoneChatPhase.PAUSED, session.detail)
                     }
                     PhoneSessionStatus.STOPPED, PhoneSessionStatus.EXPIRED -> {
-                        task.generation?.cancel()
+                        controller.taskControls.unregister(task)
+                        cancelAfterControl(task.generation)
                         mutableState.value = taskState(task, PhoneChatPhase.ENDED, session.detail)
                     }
                     else -> Unit
@@ -135,8 +137,7 @@ class PhoneChatCoordinator(
     /** Call for a fresh input, edit or regeneration before it reaches the generation service. */
     fun abandonCurrent(reason: String = "已收到新的聊天操作，手机控制已停止") {
         ++sequence
-        proposalWork?.cancel()
-        executionWork?.cancel()
+        cancelAfterControl(proposalWork, executionWork)
         proposalWork = null
         executionWork = null
         proposal?.let { intents.invalidate(it.binding) }
@@ -144,9 +145,10 @@ class PhoneChatCoordinator(
         pendingLaunch?.let { intents.invalidate(it.binding) }
         pendingLaunch = null
         currentTask?.let { task ->
+            controller.taskControls.unregister(task)
             intents.invalidate(task.binding)
-            task.generation?.cancel()
             matchingToken(task)?.let { controller.stopIfCurrent(it, reason) }
+            cancelAfterControl(task.generation)
         }
         currentTask = null
         mutableState.value = PhoneChatControlState()
@@ -217,6 +219,7 @@ class PhoneChatCoordinator(
                 val task = Task(accepted.binding, target, token)
                 pendingLaunch = null
                 currentTask = task
+                registerTaskControls(task)
                 runTask(task)
             } catch (cancelled: CancellationException) {
                 throw cancelled
@@ -242,13 +245,12 @@ class PhoneChatCoordinator(
         if (task == null) {
             val pending = pendingLaunch ?: return
             ++sequence
-            executionWork?.cancel()
+            cancelAfterControl(executionWork)
             mutableState.value = PhoneChatControlState(PhoneChatPhase.PAUSED, "任务尚未开始，已暂停。", originalText = pending.binding.originalText)
             return
         }
         matchingToken(task)?.let { controller.pauseIfCurrent(it, "用户暂停，请确认当前页面后继续") }
-        task.generation?.cancel()
-        executionWork?.cancel()
+        cancelAfterControl(task.generation, executionWork)
     }
 
     fun resume() {
@@ -260,14 +262,17 @@ class PhoneChatCoordinator(
         if (!isCurrent(previous.binding) || matchingToken(previous) == null) return
         if (controller.state.value.status !in setOf(PhoneSessionStatus.PAUSED, PhoneSessionStatus.WAITING_FOR_FOREGROUND)) return
         val expected = ++sequence
-        executionWork?.cancel()
+        cancelAfterControl(executionWork)
         executionWork = scope.launch {
+            // A ready launcher may not suspend. Never enter ChatService under the controller gate.
+            yield()
             try {
                 previous.generation?.join()
                 if (expected != sequence || !isCurrent(previous.binding) || matchingToken(previous) == null) return@launch
                 requireModel()
                 val task = Task(previous.binding, previous.target, controller.resume())
                 currentTask = task
+                registerTaskControls(task)
                 runTask(task)
             } catch (cancelled: CancellationException) {
                 throw cancelled
@@ -280,18 +285,19 @@ class PhoneChatCoordinator(
     fun stop() {
         val task = currentTask
         ++sequence
-        proposalWork?.cancel()
+        cancelAfterControl(proposalWork)
         proposal?.let { intents.invalidate(it.binding) }
         proposal = null
         pendingLaunch?.let { intents.invalidate(it.binding) }
         pendingLaunch = null
         task?.let {
+            controller.taskControls.unregister(it)
             intents.invalidate(it.binding)
             matchingToken(it)?.let { token -> controller.stopIfCurrent(token) }
-            it.generation?.cancel()
+            cancelAfterControl(it.generation)
             mutableState.value = taskState(it, PhoneChatPhase.ENDED, "手机控制已停止")
         }
-        executionWork?.cancel()
+        cancelAfterControl(executionWork)
         currentTask = null
         if (task == null) mutableState.value = PhoneChatControlState(PhoneChatPhase.ENDED, "手机控制已停止")
     }
@@ -301,6 +307,7 @@ class PhoneChatCoordinator(
         try {
             launcher.prepare(task.token)
             if (currentTask !== task || !isCurrent(task.binding)) {
+                controller.taskControls.unregister(task)
                 controller.stopIfCurrent(task.token, "本次聊天授权已失效，手机控制已停止")
                 return
             }
@@ -317,6 +324,7 @@ class PhoneChatCoordinator(
             if (session.status in setOf(PhoneSessionStatus.PAUSED, PhoneSessionStatus.WAITING_FOR_FOREGROUND)) {
                 mutableState.value = taskState(task, PhoneChatPhase.PAUSED, session.detail)
             } else {
+                controller.taskControls.unregister(task)
                 controller.stopIfCurrent(task.token, "本轮模型执行已结束，手机控制授权已撤销")
                 mutableState.value = taskState(task, PhoneChatPhase.ENDED, "本轮执行已结束，请查看聊天结果。")
                 intents.invalidate(task.binding)
@@ -331,6 +339,27 @@ class PhoneChatCoordinator(
                 if (controller.state.value.status in setOf(PhoneSessionStatus.STOPPED, PhoneSessionStatus.EXPIRED)) PhoneChatPhase.ENDED else PhoneChatPhase.PAUSED,
                 message(error),
             )
+        }
+    }
+
+    private fun registerTaskControls(task: Task) {
+        controller.taskControls.register(
+            owner = task,
+            token = task.token,
+            onPause = { if (currentTask === task) pause() },
+            onResume = { if (currentTask === task) resume() },
+            onStop = { if (currentTask === task) stop() },
+        )
+    }
+
+    private fun cancelAfterControl(vararg jobs: Job?) {
+        val captured = jobs.filterNotNull().distinct()
+        if (captured.isEmpty()) return
+        scope.launch {
+            // Job.cancel may synchronously invoke a ChatService completion callback. Defer
+            // the captured jobs, never a later task, until the synchronous revoke has returned.
+            yield()
+            captured.forEach { it.cancel() }
         }
     }
 

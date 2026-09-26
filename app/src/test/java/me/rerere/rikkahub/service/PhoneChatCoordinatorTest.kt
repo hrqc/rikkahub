@@ -1,6 +1,7 @@
 package me.rerere.rikkahub.service
 
 import kotlinx.coroutines.CoroutineScope
+import kotlinx.coroutines.CoroutineDispatcher
 import kotlinx.coroutines.CompletableJob
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
@@ -14,10 +15,14 @@ import kotlinx.coroutines.yield
 import me.rerere.rikkahub.data.mobileagent.*
 import org.junit.Assert.*
 import org.junit.Test
+import kotlin.coroutines.CoroutineContext
 
 class PhoneChatCoordinatorTest {
-    private class Fixture(val apps: List<PhoneTargetApp> = listOf(PhoneTargetApp("com.example.calc", "计算器"))) : AutoCloseable {
-        val scope = CoroutineScope(SupervisorJob() + Dispatchers.Unconfined)
+    private class Fixture(
+        val apps: List<PhoneTargetApp> = listOf(PhoneTargetApp("com.example.calc", "计算器")),
+        dispatcher: CoroutineDispatcher = Dispatchers.Unconfined,
+    ) : AutoCloseable {
+        val scope = CoroutineScope(SupervisorJob() + dispatcher)
         val backend = Backend()
         val controller = PhoneController(backend, "com.example.agent", scope = scope, settleMillis = 0)
         val intents = PhoneIntentStore()
@@ -44,6 +49,16 @@ class PhoneChatCoordinatorTest {
             coordinator.setVisible(false)
             controller.close()
             scope.cancel()
+        }
+    }
+
+    /** Main.immediate starts inline, but yield posts until the current UI callback returns. */
+    private class QueuedMainDispatcher : CoroutineDispatcher() {
+        private val pending = ArrayDeque<Runnable>()
+        override fun isDispatchNeeded(context: CoroutineContext) = false
+        override fun dispatch(context: CoroutineContext, block: Runnable) { pending.addLast(block) }
+        fun drain() {
+            while (pending.isNotEmpty()) pending.removeFirst().run()
         }
     }
 
@@ -223,6 +238,104 @@ class PhoneChatCoordinatorTest {
             val resumed = f.host.submitted.last()
             assertEquals("打开计算器", resumed.first.originalText)
             assertNotEquals(oldToken.epoch, resumed.second.epoch)
+        }
+    }
+
+    @Test fun `registered overlay controls resume the model task with a fresh token and stop it`() = runBlocking {
+        Fixture().use { f ->
+            f.propose("打开计算器")
+            f.await(PhoneChatPhase.RUNNING)
+            val oldToken = f.host.submitted.single().second
+            assertTrue(f.controller.requestTaskControl(oldToken, PhoneTaskControl.PAUSE))
+            f.await(PhoneChatPhase.PAUSED)
+            val pausedToken = f.controller.state.value.token!!
+            assertTrue(f.host.runs.first().isCancelled)
+            assertFalse(f.controller.requestTaskControl(oldToken, PhoneTaskControl.RESUME))
+            assertTrue(f.controller.taskControls.canResume(pausedToken))
+            assertTrue(f.controller.requestTaskControl(pausedToken, PhoneTaskControl.RESUME))
+            f.await(PhoneChatPhase.RUNNING)
+            assertEquals(2, f.host.submitted.size)
+            val resumedToken = f.host.submitted.last().second
+            assertNotEquals(oldToken.epoch, resumedToken.epoch)
+            assertEquals("打开计算器", f.host.submitted.last().first.originalText)
+            assertTrue(f.controller.requestTaskControl(resumedToken, PhoneTaskControl.STOP))
+            f.await(PhoneChatPhase.ENDED)
+            assertTrue(f.host.runs.last().isCancelled)
+            assertFalse(f.controller.taskControls.canResume(f.controller.state.value.token!!))
+        }
+    }
+
+    @Test fun `closing the task removes its overlay resume route`() = runBlocking {
+        Fixture().use { f ->
+            f.propose("打开计算器")
+            f.await(PhoneChatPhase.RUNNING)
+            f.coordinator.pause()
+            f.await(PhoneChatPhase.PAUSED)
+            val pausedToken = f.controller.state.value.token!!
+            assertTrue(f.controller.taskControls.canResume(pausedToken))
+            f.coordinator.setVisible(false)
+            assertFalse(f.controller.taskControls.canResume(pausedToken))
+            assertFalse(f.controller.requestTaskControl(pausedToken, PhoneTaskControl.RESUME))
+            assertEquals(1, f.host.submitted.size)
+        }
+    }
+
+    @Test fun `overlay revoke is synchronous but generation cancellation and resumed send leave the callback stack`() = runBlocking {
+        val dispatcher = QueuedMainDispatcher()
+        Fixture(dispatcher = dispatcher).use { f ->
+            f.propose("打开计算器")
+            dispatcher.drain() // combine also yields while starting the initial proposal.
+            f.await(PhoneChatPhase.RUNNING)
+            val original = f.host.submitted.single().second
+            val oldJob = f.host.runs.single()
+            var insideDispatch = false
+            oldJob.invokeOnCompletion { assertFalse("Completion ran under the controller callback", insideDispatch) }
+
+            insideDispatch = true
+            assertTrue(f.controller.requestTaskControl(original, PhoneTaskControl.PAUSE))
+            assertEquals(PhoneSessionStatus.PAUSED, f.controller.state.value.status)
+            assertNull(f.controller.activeToken("chat", "assistant"))
+            assertFalse(oldJob.isCancelled)
+            insideDispatch = false
+            dispatcher.drain()
+            assertTrue(oldJob.isCancelled)
+
+            val paused = f.controller.state.value.token!!
+            assertTrue(f.controller.requestTaskControl(paused, PhoneTaskControl.RESUME))
+            assertEquals(paused, f.controller.state.value.token)
+            assertEquals(1, f.host.submitted.size)
+            dispatcher.drain()
+            assertEquals(2, f.host.submitted.size)
+            val resumed = f.host.submitted.last().second
+            val resumedJob = f.host.runs.last()
+            resumedJob.invokeOnCompletion { assertFalse("STOP completed under the controller callback", insideDispatch) }
+            insideDispatch = true
+            assertTrue(f.controller.requestTaskControl(resumed, PhoneTaskControl.STOP))
+            assertEquals(PhoneSessionStatus.STOPPED, f.controller.state.value.status)
+            assertFalse(resumedJob.isCancelled)
+            insideDispatch = false
+            dispatcher.drain()
+            assertTrue(resumedJob.isCancelled)
+        }
+    }
+
+    @Test fun `deferred cancellation captures old jobs and cannot cancel a replacement task`() = runBlocking {
+        val dispatcher = QueuedMainDispatcher()
+        Fixture(dispatcher = dispatcher).use { f ->
+            f.propose("打开计算器")
+            dispatcher.drain()
+            f.await(PhoneChatPhase.RUNNING)
+            val oldToken = f.host.submitted.single().second
+            val oldJob = f.host.runs.single()
+            assertTrue(f.controller.requestTaskControl(oldToken, PhoneTaskControl.STOP))
+            assertFalse(oldJob.isCancelled)
+            // A different entry can register its replacement before this owner's posted cleanup.
+            val replacement = f.controller.start("chat", "assistant", "com.example.calc")
+            val replacementJob = f.host.sendExecution(f.host.submitted.first().first.copy(id = "replacement"), replacement)
+            dispatcher.drain()
+            assertTrue(oldJob.isCancelled)
+            assertFalse(replacementJob.isCancelled)
+            assertEquals(replacement, f.controller.activeToken("chat", "assistant"))
         }
     }
 

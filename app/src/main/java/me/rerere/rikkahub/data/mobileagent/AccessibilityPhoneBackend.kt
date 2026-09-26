@@ -11,16 +11,19 @@ import android.graphics.Rect
 import android.os.Build
 import android.os.Bundle
 import android.os.PowerManager
+import android.os.SystemClock
 import android.view.accessibility.AccessibilityEvent
 import android.view.accessibility.AccessibilityNodeInfo
 import android.view.accessibility.AccessibilityWindowInfo
 import androidx.core.content.FileProvider
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.currentCoroutineContext
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.flow.update
+import kotlinx.coroutines.isActive
 import kotlinx.coroutines.suspendCancellableCoroutine
 import kotlinx.coroutines.sync.Mutex
 import kotlinx.coroutines.sync.withLock
@@ -46,6 +49,7 @@ class AccessibilityPhoneBackend(context: Context) : PhoneBackend {
     override val state: StateFlow<PhoneBackendState> = mutableState.asStateFlow()
     override val supportsScreenshot: Boolean get() = Build.VERSION.SDK_INT >= 34
     private val revision = AtomicLong()
+    private val windowIdentity = AtomicLong()
     private val operationLock = Mutex()
     private val reader = AccessibilityTreeReader()
     private val rootExecutor = ControlledRootExecutor()
@@ -54,6 +58,7 @@ class AccessibilityPhoneBackend(context: Context) : PhoneBackend {
     private val snapshot = AtomicReference<Snapshot?>(null)
     // Accessed only on Main. Contains package metadata, never accessibility text or event.source.
     private val windowPackages = mutableMapOf<Int, String>()
+    private var controlOverlayWindowId: Int? = null
     private val recentEvents = ArrayDeque<EventMetadata>()
 
     private data class SessionNotice(val token: PhoneSessionToken, val targetPackage: String, val onStop: (PhoneBackendStopReason) -> Unit)
@@ -92,6 +97,7 @@ class AccessibilityPhoneBackend(context: Context) : PhoneBackend {
             val stopPreviousSession = activeNotice.get()?.onStop
             invalidate()
             windowPackages.clear()
+            controlOverlayWindowId = null
             stopPreviousSession?.invoke(PhoneBackendStopReason.SERVICE_REPLACED)
             mutableState.value = PhoneBackendState(connected = true, windowRevision = revision.get(), locked = isLocked())
         }
@@ -102,6 +108,7 @@ class AccessibilityPhoneBackend(context: Context) : PhoneBackend {
         val stopSession = activeNotice.get()?.onStop
         invalidate()
         windowPackages.clear()
+        controlOverlayWindowId = null
         // Revoke synchronously with the actual cause before the state collector can stop it.
         stopSession?.invoke(PhoneBackendStopReason.SERVICE_DISCONNECTED)
         mutableState.value = PhoneBackendState(windowRevision = revision.get(), locked = isLocked())
@@ -110,6 +117,16 @@ class AccessibilityPhoneBackend(context: Context) : PhoneBackend {
     fun onServiceInterrupted() {
         invalidate()
         activeNotice.get()?.onStop?.invoke(PhoneBackendStopReason.SERVICE_INTERRUPTED)
+    }
+
+    /** Main only. The overlay owner supplies its attached view's actual accessibility window ID. */
+    fun setControlOverlayWindowId(windowId: Int?) {
+        val attachedId = windowId?.takeIf { it >= 0 }
+        if (controlOverlayWindowId == attachedId) return
+        controlOverlayWindowId = attachedId
+        revision.incrementAndGet()
+        snapshot.set(null)
+        refreshEnvironment()
     }
 
     fun onAccessibilityEvent(event: AccessibilityEvent) {
@@ -121,8 +138,17 @@ class AccessibilityPhoneBackend(context: Context) : PhoneBackend {
         if (eventWindowId >= 0 && !packageName.isNullOrBlank()) windowPackages[eventWindowId] = packageName
         if (windowPackages.size > 64) windowPackages.clear()
         val previous = mutableState.value
-        if (event.eventType == AccessibilityEvent.TYPE_WINDOWS_CHANGED ||
-            event.eventType == AccessibilityEvent.TYPE_WINDOW_STATE_CHANGED || eventWindowId == previous.windowId) {
+        val structuralChange = event.eventType == AccessibilityEvent.TYPE_WINDOWS_CHANGED ||
+            event.eventType == AccessibilityEvent.TYPE_WINDOW_STATE_CHANGED
+        val ownOverlayEvent = eventWindowId == controlOverlayWindowId && withWindows { windows ->
+            windows.firstOrNull { it.id == eventWindowId }
+                ?.let { isPhoneControlOverlay(windowMetadata(it), controlOverlayWindowId) } == true
+        }
+        // Do not hide A -> B -> A inside a content retry when the event queue trails the live list.
+        if (shouldChangePhoneWindowIdentity(eventWindowId, previous.windowId, structuralChange, ownOverlayEvent)) {
+            windowIdentity.incrementAndGet()
+        }
+        if (shouldInvalidatePhoneWindowRevision(eventWindowId, previous.windowId, structuralChange, ownOverlayEvent)) {
             revision.incrementAndGet()
             snapshot.set(null)
         }
@@ -143,7 +169,7 @@ class AccessibilityPhoneBackend(context: Context) : PhoneBackend {
         }.getOrElse { "unavailable:${it.javaClass.simpleName}" }
         val windowsMetadata = runCatching {
             withWindows { windows ->
-                val selectedId = (windows.firstOrNull { it.isActive } ?: windows.firstOrNull { it.isFocused })?.id
+                val selectedId = selectedWindow(windows)?.id
                 val entries = windows.take(32).joinToString { window ->
                     "{id=${window.id},type=${window.type},active=${window.isActive},focused=${window.isFocused}}"
                 }
@@ -159,6 +185,7 @@ class AccessibilityPhoneBackend(context: Context) : PhoneBackend {
     }
 
     override fun invalidate() {
+        windowIdentity.incrementAndGet()
         revision.incrementAndGet()
         snapshot.set(null)
         rootExecutor.cancel()
@@ -169,31 +196,48 @@ class AccessibilityPhoneBackend(context: Context) : PhoneBackend {
         withContext(Dispatchers.Main.immediate) {
             try {
                 requirePermit(permit)
-                val capturedRevision = mutableState.value.windowRevision
-                val root = authorizedRoot(permit)
-                try {
-                    val tree = withContext(Dispatchers.Default) {
-                        reader.capture(root, permit.targetPackage) { validAtRevision(permit, capturedRevision) }
-                    }
-                    requireRevision(permit, capturedRevision)
-                    val observation = PhoneObservation(
-                        id = UUID.randomUUID().toString(),
-                        packageName = permit.targetPackage,
-                        windowId = root.windowId,
-                        windowRevision = capturedRevision,
-                        capturedAtMillis = System.currentTimeMillis(),
-                        nodes = if (tree.sensitive) tree.nodes.map { it.copy(text = "", description = "") } else tree.nodes,
-                        truncated = tree.truncated,
-                        sensitive = tree.sensitive,
-                        fingerprint = tree.fingerprint,
-                    )
-                    snapshot.set(Snapshot(permit.token, observation, tree))
-                    observation
-                } finally {
-                    recycleNode(root)
-                }
-            } catch (_: TreeReadAborted) {
-                throw PhoneControlException("STALE_WINDOW", "窗口或执行许可已改变，请重新观察。")
+                val captured = readStablePhoneObservation(
+                    nowMillis = SystemClock::elapsedRealtime,
+                    version = {
+                        requirePermit(permit)
+                        val current = mutableState.value
+                        PhoneObservationVersion(current.windowId, windowIdentity.get(), current.windowRevision)
+                    },
+                    capture = { version ->
+                        val root = authorizedRoot(permit)
+                        try {
+                            val tree = withContext(Dispatchers.Default) {
+                                val readContext = currentCoroutineContext()
+                                reader.capture(root, permit.targetPackage) {
+                                    readContext.isActive && validAtRevision(permit, version.revision)
+                                }
+                            }
+                            requireRevision(permit, version.revision)
+                            val observation = PhoneObservation(
+                                id = UUID.randomUUID().toString(),
+                                packageName = permit.targetPackage,
+                                windowId = root.windowId,
+                                windowRevision = version.revision,
+                                capturedAtMillis = System.currentTimeMillis(),
+                                nodes = if (tree.sensitive) tree.nodes.map { it.copy(text = "", description = "") } else tree.nodes,
+                                truncated = tree.truncated,
+                                sensitive = tree.sensitive,
+                                fingerprint = tree.fingerprint,
+                            )
+                            Snapshot(permit.token, observation, tree)
+                        } catch (_: TreeReadAborted) {
+                            throw PhoneObservationInvalidated()
+                        } catch (error: PhoneControlException) {
+                            if (error.code == "STALE_WINDOW") throw PhoneObservationInvalidated()
+                            throw error
+                        } finally {
+                            recycleNode(root)
+                        }
+                    },
+                )
+                // Nothing is published until a whole read finishes at its original revision.
+                snapshot.set(captured)
+                captured.observation
             } catch (error: PhoneControlException) {
                 throw error
             } catch (cancelled: CancellationException) {
@@ -290,13 +334,14 @@ class AccessibilityPhoneBackend(context: Context) : PhoneBackend {
         var windowId: Int? = null
         if (connectedService != null) {
             withWindows { windows ->
-                windowId = (windows.firstOrNull { it.isActive } ?: windows.firstOrNull { it.isFocused })?.id
+                windowId = selectedWindow(windows)?.id
             }
         }
         val packageName = windowId?.let(windowPackages::get)
         val locked = isLocked()
         val previous = mutableState.value
         if (previous.windowId != windowId || previous.foregroundPackage != packageName || previous.locked != locked) {
+            windowIdentity.incrementAndGet()
             revision.incrementAndGet()
             snapshot.set(null)
         }
@@ -334,9 +379,14 @@ class AccessibilityPhoneBackend(context: Context) : PhoneBackend {
 
     private fun authorizedRoot(permit: PhonePermit): AccessibilityNodeInfo {
         requirePermit(permit)
-        val connectedService = service.get() ?: fail("ACCESSIBILITY_DISCONNECTED", "无障碍服务已断开。")
         val expectedWindow = mutableState.value.windowId
-        val root = if (Build.VERSION.SDK_INT >= 33) connectedService.getRootInActiveWindow(0) else connectedService.rootInActiveWindow
+        // The active root can be our STOP overlay. Read only the selected, package-verified window.
+        val root = withWindows { windows ->
+            val target = selectedWindow(windows)
+                ?.takeIf { it.id == expectedWindow && windowPackages[it.id] == permit.targetPackage }
+                ?: fail("FOREGROUND_CONFLICT", "活动窗口与获准目标不符，已取消读取。")
+            if (Build.VERSION.SDK_INT >= 33) target.getRoot(0) else target.root
+        }
         if (root == null) fail("WINDOW_UNAVAILABLE", "当前没有可读取的目标窗口。")
         // Window changes can race the metadata read. Inspect only identity before any contents.
         if (root.windowId != expectedWindow || root.packageName?.toString() != permit.targetPackage || !permit.isValid()) {
@@ -436,14 +486,14 @@ class AccessibilityPhoneBackend(context: Context) : PhoneBackend {
     }
 
     private fun activeWindowBounds(): Rect = withWindows { windows ->
-        val window = windows.firstOrNull { it.id == mutableState.value.windowId && it.isActive }
+        val window = selectedWindow(windows)?.takeIf { it.id == mutableState.value.windowId }
             ?: fail("FOREGROUND_CONFLICT", "目标窗口不再活动。")
         Rect().also(window::getBoundsInScreen)
     }
 
-    /** Coordinate input must not hit an IME, permission dialog, or another app's overlay. */
+    /** Coordinate input must not hit an IME, permission dialog, or any overlay, including our STOP. */
     private fun requireGestureRegion(x1: Int, y1: Int, x2: Int, y2: Int) = withWindows { windows ->
-        val target = windows.firstOrNull { it.id == mutableState.value.windowId && it.isActive }
+        val target = selectedWindow(windows)?.takeIf { it.id == mutableState.value.windowId }
             ?: fail("FOREGROUND_CONFLICT", "目标窗口不再活动。")
         val area = Rect(min(x1, x2), min(y1, y2), max(x1, x2) + 1, max(y1, y2) + 1)
         val targetBounds = Rect().also(target::getBoundsInScreen)
@@ -452,6 +502,15 @@ class AccessibilityPhoneBackend(context: Context) : PhoneBackend {
             fail("FOREGROUND_CONFLICT", "操作区域被其他窗口覆盖，请由用户先关闭遮挡。")
         }
     }
+
+    private fun selectedWindow(windows: List<AccessibilityWindowInfo>): AccessibilityWindowInfo? {
+        val selectedId = selectPhoneWindowId(windows.map(::windowMetadata), controlOverlayWindowId)
+        return windows.firstOrNull { it.id == selectedId }
+    }
+
+    private fun windowMetadata(window: AccessibilityWindowInfo) = PhoneWindowMetadata(
+        window.id, window.isActive, window.isFocused, window.type == AccessibilityWindowInfo.TYPE_ACCESSIBILITY_OVERLAY,
+    )
 
     private inline fun <T> withWindows(block: (List<AccessibilityWindowInfo>) -> T): T {
         val windows = service.get()?.windows.orEmpty()

@@ -209,13 +209,7 @@ class ChatService(
                         try {
                             val run = phoneGenerationRuns[id]
                             if (run != null && state.token != null && isRevokedPhoneGeneration(run.token, state.token)) {
-                                val session = sessionManager.get(id)
-                                if (session != null) synchronized(session) {
-                                    if (session.getJob() === run.job) session.messageQueue.pause()
-                                    run.job.cancel()
-                                } else run.job.cancel()
-                                run.job.join()
-                                if (session?.getJob() == null) finishInterruptedPendingTools(id)
+                                cancelPhoneTaskGeneration(id, run.job)
                             }
                         } catch (error: CancellationException) {
                             throw error
@@ -552,6 +546,7 @@ class ChatService(
 
                 // 开始补全
                 if (answer) {
+                    generationPhoneToken?.let { phoneController.setModelWorking(it, true) }
                     generationSucceeded = handleMessageComplete(
                         conversationId, phoneIntentBinding = intentBinding, expectedPhoneToken = generationPhoneToken,
                     )
@@ -580,6 +575,7 @@ class ChatService(
             }
         }
         job.invokeOnCompletion { cause ->
+            generationPhoneToken?.let { phoneController.setModelWorking(it, false) }
             intentBinding?.let { binding ->
                 if (cause == null && generationSucceeded) phoneIntentStore.complete(binding)
                 else phoneIntentStore.invalidate(binding)
@@ -1585,6 +1581,17 @@ class ChatService(
     /** UI calls this after synchronously pausing the phone controller. */
     suspend fun pausePhoneGeneration(conversationId: Uuid) {
         cancelGenerationOnly(conversationId)
+    }
+
+    /** Invoke after the phone grant is synchronously revoked, outside the controller gate. */
+    suspend fun cancelPhoneTaskGeneration(conversationId: Uuid, expectedJob: Job) {
+        val session = sessionManager.get(conversationId)
+        if (session != null) synchronized(session) {
+            if (session.getJob() === expectedJob) session.messageQueue.pause()
+            expectedJob.cancel()
+        } else expectedJob.cancel()
+        expectedJob.join()
+        if (session != null && session.getJob() == null) finishInterruptedPendingTools(conversationId)
     }
 
     private suspend fun cancelGenerationOnly(conversationId: Uuid) {
