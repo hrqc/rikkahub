@@ -4,7 +4,25 @@ import me.rerere.common.android.LogEntry
 import me.rerere.common.android.Logging
 import okhttp3.Interceptor
 import okhttp3.Response
-import okio.Buffer
+import okhttp3.Request
+
+/** Content can include screen text and credentials even after a phone session has stopped. */
+internal fun privateRequestLog(
+    request: Request,
+    responseCode: Int? = null,
+    durationMs: Long? = null,
+    error: Throwable? = null,
+) = LogEntry.RequestLog(
+    tag = "HTTP",
+    url = "${request.url.scheme}://${request.url.host}:${request.url.port}",
+    method = request.method,
+    requestHeaders = emptyMap(),
+    requestBody = null,
+    responseCode = responseCode,
+    responseHeaders = emptyMap(),
+    durationMs = durationMs,
+    error = error?.javaClass?.simpleName,
+)
 
 class RequestLoggingInterceptor : Interceptor {
     override fun intercept(chain: Interceptor.Chain): Response {
@@ -15,60 +33,19 @@ class RequestLoggingInterceptor : Interceptor {
         val request = chain.request()
         val startTime = System.currentTimeMillis()
 
-        val requestHeaders = request.headers.toMap()
-        val requestBody = request.body?.let { body ->
-            val buffer = Buffer()
-            body.writeTo(buffer)
-            buffer.readUtf8()
-        }
-
         val response: Response
-        var error: String? = null
 
         try {
             response = chain.proceed(request)
         } catch (e: Exception) {
-            error = e.message
-            Logging.logRequest(
-                LogEntry.RequestLog(
-                    tag = "HTTP",
-                    url = request.url.toString(),
-                    method = request.method,
-                    requestHeaders = requestHeaders,
-                    requestBody = requestBody,
-                    error = error
-                )
-            )
+            Logging.logRequest(privateRequestLog(request, error = e))
             throw e
         }
 
         val durationMs = System.currentTimeMillis() - startTime
-        val responseHeaders = response.headers.toMap()
-
-        Logging.logRequest(
-            LogEntry.RequestLog(
-                tag = "HTTP",
-                url = request.url.toString(),
-                method = request.method,
-                requestHeaders = requestHeaders,
-                requestBody = requestBody,
-                responseCode = response.code,
-                responseHeaders = responseHeaders,
-                durationMs = durationMs,
-                error = error
-            )
-        )
+        Logging.logRequest(privateRequestLog(request, responseCode = response.code, durationMs = durationMs))
 
         return response
     }
 
-    private fun okhttp3.Headers.toMap(): Map<String, String> {
-        return names().associateWith { name ->
-            if (name.equals("Proxy-Authorization", ignoreCase = true)) {
-                "██"
-            } else {
-                get(name) ?: ""
-            }
-        }
-    }
 }

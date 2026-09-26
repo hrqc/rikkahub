@@ -23,8 +23,8 @@ class DeviceCapabilityRepository internal constructor(
     private val rootProbe: RootProbe,
     private val now: () -> Long = System::currentTimeMillis,
 ) {
-    constructor(context: Context) : this(
-        AndroidPassiveDeviceProbe(context.applicationContext),
+    constructor(context: Context, phoneBackend: PhoneBackend) : this(
+        AndroidPassiveDeviceProbe(context.applicationContext, phoneBackend),
         RootCapabilityProbe(),
     )
 

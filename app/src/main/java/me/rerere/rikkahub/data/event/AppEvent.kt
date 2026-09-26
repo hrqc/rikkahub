@@ -12,6 +12,7 @@ sealed class AppEvent {
         val conversationId: Uuid,
         val lastMessage: UIMessage,
         val senderName: String,
+        val redactContent: Boolean = false,
     ) : AppEvent()
 
     /**
@@ -22,5 +23,6 @@ sealed class AppEvent {
         val conversationId: Uuid,
         val senderName: String,
         val contentPreview: String?,
+        val redactContent: Boolean = false,
     ) : AppEvent()
 }

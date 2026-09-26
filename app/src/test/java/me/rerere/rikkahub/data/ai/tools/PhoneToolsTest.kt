@@ -1,0 +1,169 @@
+package me.rerere.rikkahub.data.ai.tools
+
+import kotlinx.coroutines.CancellationException
+import kotlinx.coroutines.CoroutineScope
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.SupervisorJob
+import kotlinx.coroutines.flow.MutableStateFlow
+import kotlinx.coroutines.runBlocking
+import kotlinx.serialization.json.Json
+import kotlinx.serialization.json.JsonObject
+import kotlinx.serialization.json.buildJsonObject
+import kotlinx.serialization.json.jsonObject
+import kotlinx.serialization.json.jsonPrimitive
+import kotlinx.serialization.json.put
+import me.rerere.ai.ui.UIMessagePart
+import me.rerere.rikkahub.data.mobileagent.PhoneAction
+import me.rerere.rikkahub.data.mobileagent.PhoneBackend
+import me.rerere.rikkahub.data.mobileagent.PhoneBackendResult
+import me.rerere.rikkahub.data.mobileagent.PhoneBackendState
+import me.rerere.rikkahub.data.mobileagent.PhoneController
+import me.rerere.rikkahub.data.mobileagent.PhoneObservation
+import me.rerere.rikkahub.data.mobileagent.PhonePermit
+import me.rerere.rikkahub.data.mobileagent.PhoneSessionToken
+import org.junit.Assert.assertEquals
+import org.junit.Assert.assertFalse
+import org.junit.Assert.assertNotEquals
+import org.junit.Assert.assertTrue
+import org.junit.Test
+
+class PhoneToolsTest {
+    private val empty = JsonObject(emptyMap())
+
+    @Test
+    fun `resuming changes namespace and old tool closure cannot observe`() = runBlocking {
+        val backend = FakeBackend()
+        val controller = controller(backend)
+        try {
+            val original = controller.start("conversation", "assistant", "target")
+            val oldTools = createPhoneTools(controller, original, Json)
+            controller.pause()
+            val resumed = controller.resume()
+            val newTools = createPhoneTools(controller, resumed, Json)
+
+            assertNotEquals(phoneToolPrefix(original), phoneToolPrefix(resumed))
+            assertTrue(oldTools.map { it.name }.intersect(newTools.map { it.name }.toSet()).isEmpty())
+            val result = oldTools.first { it.name.endsWith("_observe") }.execute(empty)
+            assertEquals("SESSION_INVALID", errorCode(result))
+            assertEquals(0, backend.observations)
+
+            newTools.first { it.name.endsWith("_observe") }.execute(empty)
+            assertEquals(1, backend.observations)
+        } finally { controller.close() }
+    }
+
+    @Test
+    fun `stopping and starting never rebinds an old action to new session`() = runBlocking {
+        val backend = FakeBackend()
+        val controller = controller(backend)
+        try {
+            val original = controller.start("conversation", "assistant", "target")
+            val oldAction = createPhoneTools(controller, original, Json).first { it.name.endsWith("_open_app") }
+            controller.stop()
+            val fresh = controller.start("conversation", "assistant", "target")
+
+            assertNotEquals(original.sessionId, fresh.sessionId)
+            assertEquals("SESSION_INVALID", errorCode(oldAction.execute(empty)))
+            assertEquals(0, backend.actions)
+            assertEquals(fresh, controller.activeToken("conversation", "assistant"))
+            assertEquals(null, controller.activeToken("other-conversation", "assistant"))
+            assertEquals(null, controller.activeToken("conversation", "other-assistant"))
+        } finally { controller.close() }
+    }
+
+    @Test
+    fun `tool schema cannot grant or resume and accepted session avoids foreground breaking approval`() {
+        val controller = controller(FakeBackend())
+        try {
+            val token = controller.start("conversation", "assistant", "target")
+            val tools = createPhoneTools(controller, token, Json)
+            assertEquals(8, tools.size)
+            tools.forEach { tool ->
+                assertTrue(tool.name.matches(Regex("phone_[a-f0-9]{12}_[0-9]+_[a-z_]+")))
+                assertTrue(tool.name.length <= 64)
+                assertFalse(tool.needsApproval(empty))
+            }
+            assertFalse(tools.any { it.name.endsWith("_start") || it.name.endsWith("_resume") || it.name.endsWith("_screenshot") })
+        } finally { controller.close() }
+    }
+
+    @Test
+    fun `screenshot requires opt in and returns an image part without exposing local URI in text`() = runBlocking {
+        val controller = controller(FakeBackend())
+        try {
+            val token = controller.start("conversation", "assistant", "target", allowScreenshots = true)
+            val tools = createPhoneTools(controller, token, Json)
+            tools.first { it.name.endsWith("_observe") }.execute(empty)
+            val parts = tools.first { it.name.endsWith("_screenshot") }.execute(buildJsonObject { put("snapshot_id", "snapshot") })
+            assertEquals("file:///private/screen.png", parts.filterIsInstance<UIMessagePart.Image>().single().url)
+            assertFalse(parts.filterIsInstance<UIMessagePart.Text>().single().text.contains("file:///"))
+        } finally { controller.close() }
+    }
+
+    @Test
+    fun `invalid text arguments are never echoed in errors`() = runBlocking {
+        val backend = FakeBackend()
+        val controller = controller(backend)
+        try {
+            val token = controller.start("conversation", "assistant", "target")
+            val tool = createPhoneTools(controller, token, Json).first { it.name.endsWith("_input_text") }
+            val result = tool.execute(buildJsonObject {
+                put("node_id", "node")
+                put("text", buildJsonObject { put("private-input", "private-input") })
+            })
+            assertEquals("invalid_arguments", errorCode(result))
+            assertFalse(result.toString().contains("private-input"))
+            assertEquals(0, backend.actions)
+        } finally { controller.close() }
+    }
+
+    @Test
+    fun `tool cancellation propagates rather than returning an apparent result`() = runBlocking {
+        val backend = FakeBackend().apply { cancelObservation = true }
+        val controller = controller(backend)
+        try {
+            val token = controller.start("conversation", "assistant", "target")
+            val tool = createPhoneTools(controller, token, Json).first { it.name.endsWith("_observe") }
+            var cancelled = false
+            try { tool.execute(empty) } catch (_: CancellationException) { cancelled = true }
+            assertTrue(cancelled)
+        } finally { controller.close() }
+    }
+
+    private fun errorCode(parts: List<UIMessagePart>): String? = Json.parseToJsonElement(
+        parts.filterIsInstance<UIMessagePart.Text>().single().text,
+    ).jsonObject["code"]?.jsonPrimitive?.content
+
+    private fun controller(backend: FakeBackend): PhoneController {
+        var counter = 0
+        return PhoneController(
+            backend, "own", now = { 1_000L },
+            newId = { (++counter).toString(16).padEnd(32, 'a') },
+            scope = CoroutineScope(SupervisorJob() + Dispatchers.Unconfined),
+            settleMillis = 0,
+        )
+    }
+
+    private class FakeBackend : PhoneBackend {
+        override val state = MutableStateFlow(PhoneBackendState(true, 1L, "target", 1, false))
+        override val supportsScreenshot = true
+        var observations = 0
+        var actions = 0
+        var cancelObservation = false
+        override fun isTargetAllowed(packageName: String) = packageName == "target"
+        override fun showSessionNotice(token: PhoneSessionToken, targetPackage: String, onStop: () -> Unit) = true
+        override fun endSessionNotice() = Unit
+        override suspend fun observe(permit: PhonePermit): PhoneObservation {
+            check(permit.isValid())
+            observations++
+            if (cancelObservation) throw CancellationException()
+            return PhoneObservation("snapshot", "target", 1, 1, 1_000L, emptyList(), false, false, "fingerprint")
+        }
+        override suspend fun execute(permit: PhonePermit, observation: PhoneObservation?, action: PhoneAction): PhoneBackendResult {
+            check(permit.isValid())
+            actions++
+            return PhoneBackendResult(true, "accepted", if (action == PhoneAction.Screenshot) "file:///private/screen.png" else null)
+        }
+        override fun invalidate() = Unit
+    }
+}

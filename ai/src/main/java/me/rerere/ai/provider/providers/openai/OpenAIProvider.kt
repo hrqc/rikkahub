@@ -225,7 +225,7 @@ class OpenAIProvider(
                 .mergeCustomBody(params.customBody)
         )
 
-        Log.i(TAG, "generateImage: $requestBody")
+        Log.i(TAG, "Image request prepared")
 
         val request = Request.Builder()
             .url("${providerSetting.baseUrl}/images/generations")

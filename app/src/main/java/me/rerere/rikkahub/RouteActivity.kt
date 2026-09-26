@@ -89,6 +89,7 @@ import me.rerere.rikkahub.ui.pages.chat.ChatPage
 import me.rerere.rikkahub.ui.pages.debug.DebugPage
 import me.rerere.rikkahub.ui.pages.extensions.ExtensionsPage
 import me.rerere.rikkahub.ui.pages.extensions.agent.DeviceCapabilitiesPage
+import me.rerere.rikkahub.ui.pages.extensions.agent.MobileControlPage
 import me.rerere.rikkahub.ui.pages.extensions.PromptPage
 import me.rerere.rikkahub.ui.pages.extensions.QuickMessagesPage
 import me.rerere.rikkahub.ui.pages.extensions.skills.SkillDetailPage
@@ -490,6 +491,10 @@ class RouteActivity : ComponentActivity() {
                                 DeviceCapabilitiesPage()
                             }
 
+                            entry<Screen.MobileControl> { key ->
+                                MobileControlPage(key.conversationId, key.assistantId)
+                            }
+
                             entry<Screen.QuickMessages> {
                                 QuickMessagesPage()
                             }
@@ -708,6 +713,9 @@ sealed interface Screen : NavKey {
 
     @Serializable
     data object DeviceCapabilities : Screen
+
+    @Serializable
+    data class MobileControl(val conversationId: String, val assistantId: String) : Screen
 
     @Serializable
     data object QuickMessages : Screen

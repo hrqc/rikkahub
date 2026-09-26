@@ -80,6 +80,7 @@ val appModule = module {
             mcpManager = get(),
             skillManager = get(),
             workspaceRepository = get(),
+            phoneController = get(),
         )
     }
 
@@ -99,7 +100,8 @@ val appModule = module {
             mcpManager = get(),
             filesManager = get(),
             workspaceRepository = get(),
-            folderRepository = get()
+            folderRepository = get(),
+            phoneController = get(),
         )
     }
 

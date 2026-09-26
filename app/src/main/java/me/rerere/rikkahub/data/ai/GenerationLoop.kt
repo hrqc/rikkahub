@@ -32,6 +32,7 @@ import me.rerere.ai.ui.handleTextGenerationResult
 import me.rerere.ai.ui.limitContext
 import me.rerere.rikkahub.R
 import me.rerere.rikkahub.data.ai.transformers.InputMessageTransformer
+import me.rerere.rikkahub.data.ai.tools.isPhoneToolName
 import me.rerere.rikkahub.data.ai.transformers.MessageTransformer
 import me.rerere.rikkahub.data.ai.transformers.OutputMessageTransformer
 import me.rerere.rikkahub.data.files.FileFolders
@@ -258,22 +259,26 @@ class GenerationLoop(
                         // Auto or Approved - execute the tool
                         runCatching {
                             val toolDef = tools.find { toolDef -> toolDef.name == tool.toolName }
-                                ?: error("Tool ${tool.toolName} not found")
+                                ?: error(if (isPhoneToolName(tool.toolName)) {
+                                    "手机控制授权已失效，请由用户重新开启并重新观察"
+                                } else "Tool not found")
                             val args = runCatching {
                                 json.parseToJsonElement(tool.input.ifBlank { "{}" })
                             }.getOrElse {
-                                error("Invalid tool arguments JSON for ${tool.toolName}: ${it.message}")
+                                error("Invalid tool arguments JSON")
                             }
-                            Log.i(TAG, "generateText: executing tool ${toolDef.name} with args: $args")
+                            Log.i(TAG, "generateText: executing tool")
                             val result = toolDef.execute(args)
                             val hasShellAccess = tools.any { it.name == "workspace_shell" }
                             executedTools += tool.copy(
-                                output = maybeTruncateToolOutput(tool.toolCallId, result, hasShellAccess)
+                                output = if (isPhoneToolName(tool.toolName)) result else {
+                                    maybeTruncateToolOutput(tool.toolCallId, result, hasShellAccess)
+                                }
                             )
                         }.onFailure {
                             // 取消必须向上传播，否则停止生成会被误报为工具执行错误
                             if (it is CancellationException) throw it
-                            it.printStackTrace()
+                            Log.w(TAG, "Tool execution failed (${it.javaClass.simpleName})")
                             executedTools += tool.copy(
                                 output = listOf(
                                     UIMessagePart.Text(
@@ -282,8 +287,11 @@ class GenerationLoop(
                                                 put(
                                                     "error",
                                                     JsonPrimitive(buildString {
-                                                        append("[${it.javaClass.name}] ${it.message}")
-                                                        append("\n${it.stackTraceToString()}")
+                                                        if (isPhoneToolName(tool.toolName)) {
+                                                            append("手机控制工具不可用或授权已失效，请重新观察；如需新授权必须由用户开启")
+                                                        } else {
+                                                            append("Tool execution failed (${it.javaClass.simpleName})")
+                                                        }
                                                     })
                                                 )
                                             }
@@ -516,8 +524,7 @@ class GenerationLoop(
         Log.w(
             TAG,
             "Provider connection failed, retrying in ${retryDelay}ms " +
-                    "($nextRetryCount/$MAX_PROVIDER_NETWORK_RETRIES)",
-            error,
+                    "($nextRetryCount/$MAX_PROVIDER_NETWORK_RETRIES, ${error.javaClass.simpleName})",
         )
         delay(retryDelay)
         return nextRetryCount

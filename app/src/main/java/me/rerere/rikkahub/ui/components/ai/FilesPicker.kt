@@ -64,6 +64,7 @@ import me.rerere.hugeicons.stroke.MusicNote03
 import me.rerere.hugeicons.stroke.Package
 import me.rerere.hugeicons.stroke.Package01
 import me.rerere.hugeicons.stroke.Settings02
+import me.rerere.hugeicons.stroke.SmartPhone01
 import me.rerere.hugeicons.stroke.Video01
 import me.rerere.rikkahub.R
 import me.rerere.rikkahub.Screen
@@ -146,6 +147,19 @@ internal fun FilesPicker(
 
         HorizontalDivider(
             modifier = Modifier.fillMaxWidth()
+        )
+
+        ListItem(
+            leadingContent = { Icon(HugeIcons.SmartPhone01, contentDescription = null) },
+            headlineContent = { Text("手机控制") },
+            supportingContent = { Text("为当前聊天选择目标应用，开始、暂停或停止任务") },
+            colors = ListItemDefaults.colors(containerColor = MaterialTheme.colorScheme.surfaceContainer),
+            modifier = Modifier.clip(MaterialTheme.shapes.large).clickable {
+                onDismiss()
+                navController.navigate(
+                    Screen.MobileControl(conversation.id.toString(), conversation.assistantId.toString())
+                )
+            },
         )
 
         if (workspaces.isNotEmpty()) {

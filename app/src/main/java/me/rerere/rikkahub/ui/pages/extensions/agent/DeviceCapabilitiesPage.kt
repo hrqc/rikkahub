@@ -76,6 +76,12 @@ fun DeviceCapabilitiesPage(vm: DeviceCapabilitiesVM = koinViewModel()) {
             .onFailure { settingsError = "无法打开通知设置，请在系统设置中找到本应用并查看通知权限。" }
     }
 
+    fun openAccessibilitySettings() {
+        settingsError = null
+        runCatching { context.startActivity(Intent(Settings.ACTION_ACCESSIBILITY_SETTINGS)) }
+            .onFailure { settingsError = "无法打开无障碍设置，请在系统设置中找到本应用的无障碍服务并自行开启。" }
+    }
+
     Scaffold(
         topBar = {
             LargeFlexibleTopAppBar(
@@ -117,7 +123,7 @@ fun DeviceCapabilitiesPage(vm: DeviceCapabilitiesVM = koinViewModel()) {
                         headlineContent = { Text("能力检测") },
                         supportingContent = {
                             Column(verticalArrangement = Arrangement.spacedBy(4.dp)) {
-                                Text("当前仅检测设备环境，尚未接入手机操作工具。刷新不会申请 Root 或无障碍权限。")
+                                Text("本页显示设备与服务的实际状态。请从聊天的更多菜单进入手机控制面板，选择目标应用并开始任务。刷新不会申请 Root 或无障碍权限。")
                                 snapshot.refreshedAtEpochMillis?.let {
                                     Text("最近刷新：${formatCapabilityTime(it)}")
                                 }
@@ -186,6 +192,9 @@ fun DeviceCapabilitiesPage(vm: DeviceCapabilitiesVM = koinViewModel()) {
                                 Column(verticalArrangement = Arrangement.spacedBy(4.dp)) {
                                     Text(capability.status.label(), style = MaterialTheme.typography.labelLarge)
                                     Text(capability.detail)
+                                    if (capability.id == "accessibility") {
+                                        TextButton(onClick = ::openAccessibilitySettings) { Text("打开系统无障碍设置") }
+                                    }
                                     if (capability.id == "notifications" && capability.status in setOf(
                                             CapabilityStatus.AVAILABLE,
                                             CapabilityStatus.PERMISSION_REQUIRED,

@@ -20,6 +20,7 @@ import me.rerere.rikkahub.CHAT_LIVE_UPDATE_NOTIFICATION_CHANNEL_ID
 import me.rerere.rikkahub.R
 import me.rerere.rikkahub.RouteActivity
 import me.rerere.rikkahub.data.datastore.SettingsStore
+import me.rerere.rikkahub.data.ai.tools.isPhoneToolName
 import me.rerere.rikkahub.data.event.AppEvent
 import me.rerere.rikkahub.data.event.AppEventBus
 import me.rerere.rikkahub.utils.cancelNotification
@@ -79,7 +80,7 @@ class ChatNotificationManager(
         if (lastSentAt != null && now - lastSentAt < LIVE_UPDATE_NOTIFICATION_THROTTLE_MS) return
         liveUpdateLastSentAt[event.conversationId] = now
 
-        sendLiveUpdateNotification(event.conversationId, event.lastMessage, event.senderName)
+        sendLiveUpdateNotification(event.conversationId, event.lastMessage, event.senderName, event.redactContent)
     }
 
     private fun handleGenerationEnded(event: AppEvent.ChatGenerationEnded) {
@@ -88,7 +89,11 @@ class ChatNotificationManager(
         val contentPreview = event.contentPreview ?: return
         if (isForeground.value) return
         if (!settingsStore.settingsFlow.value.displaySetting.enableNotificationOnMessageGeneration) return
-        sendGenerationDoneNotification(event.conversationId, event.senderName, contentPreview)
+        sendGenerationDoneNotification(
+            event.conversationId,
+            if (event.redactContent) "手机控制" else event.senderName,
+            if (event.redactContent) "本次生成已结束，请打开应用查看结果" else contentPreview,
+        )
     }
 
     private fun sendGenerationDoneNotification(
@@ -112,17 +117,23 @@ class ChatNotificationManager(
     private fun sendLiveUpdateNotification(
         conversationId: Uuid,
         lastMessage: UIMessage,
-        senderName: String
+        senderName: String,
+        redactContent: Boolean,
     ) {
         // 确定当前状态
-        val (chipText, statusText, contentText) = determineNotificationContent(lastMessage.parts)
+        val shouldRedact = redactContent || lastMessage.getTools().any { isPhoneToolName(it.toolName) }
+        val (chipText, statusText, contentText) = if (shouldRedact) {
+            Triple("手机控制", "正在处理", "请打开应用查看进度或停止手机控制")
+        } else {
+            determineNotificationContent(lastMessage.parts)
+        }
 
         context.sendNotification(
             channelId = CHAT_LIVE_UPDATE_NOTIFICATION_CHANNEL_ID,
             // 更新前台服务正在使用的同一条通知，避免重复显示生成进度。
             notificationId = ChatGenerationForegroundService.NOTIFICATION_ID
         ) {
-            title = senderName
+            title = if (shouldRedact) "手机控制" else senderName
             content = contentText
             subText = statusText
             ongoing = true
@@ -148,7 +159,7 @@ class ChatNotificationManager(
                 Triple(
                     context.getString(R.string.notification_live_update_chip_tool),
                     context.getString(R.string.notification_live_update_tool, toolName),
-                    lastTool.input.take(100)
+                    context.getString(R.string.notification_live_update_chip_tool)
                 )
             }
             // 正在思考（Reasoning 未结束）

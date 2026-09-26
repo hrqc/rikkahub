@@ -5,21 +5,18 @@ import android.content.pm.PackageManager
 import android.os.Build
 import androidx.core.app.NotificationManagerCompat
 
-internal class AndroidPassiveDeviceProbe(private val context: Context) : PassiveDeviceProbe {
+internal class AndroidPassiveDeviceProbe(
+    private val context: Context,
+    private val phoneBackend: PhoneBackend,
+) : PassiveDeviceProbe {
     override suspend fun capture(): PassiveDeviceSnapshot = PassiveDeviceSnapshot(
         deviceManufacturer = Build.MANUFACTURER.orEmpty(),
         deviceModel = Build.MODEL.orEmpty(),
         androidRelease = Build.VERSION.RELEASE.orEmpty(),
         apiLevel = Build.VERSION.SDK_INT,
         capabilities = listOf(
-            DeviceCapability(
-                "accessibility", "无障碍手机控制", CapabilityStatus.NOT_IMPLEMENTED,
-                "本版本尚未接入无障碍服务，不能读取页面、点击或输入；不会自动打开系统设置。",
-            ),
-            DeviceCapability(
-                "screenshot", "屏幕截图", CapabilityStatus.NOT_IMPLEMENTED,
-                "截图后端尚未接入。系统版本或 Root 检查成功不代表已经能够截图。",
-            ),
+            accessibilityCapability(),
+            screenshotCapability(),
             DeviceCapability(
                 "shizuku", "Shizuku", CapabilityStatus.NOT_IMPLEMENTED,
                 "尚未接入 Shizuku，不会探测或申请其授权。",
@@ -30,11 +27,36 @@ internal class AndroidPassiveDeviceProbe(private val context: Context) : Passive
                 "已有 Workspace 功能；环境按工作区独立配置，本页未检查其就绪状态。请在工作区页面确认。",
             ),
             DeviceCapability(
-                "foreground_control", "前台接管与冲突保护", CapabilityStatus.NOT_IMPLEMENTED,
-                "手机接管流程尚未接入。聊天的后台生成服务不等于能在后台操作其他应用。",
+                "foreground_control", "前台接管与冲突保护",
+                if (phoneBackend.state.value.connected) CapabilityStatus.AVAILABLE else CapabilityStatus.PERMISSION_REQUIRED,
+                "从聊天的手机控制面板选择目标应用并手动开始。切换到未授权应用或锁屏时会暂停；可随时通过面板或通知 STOP 停止。",
             ),
             apkInstallCapability(),
         ),
+    )
+
+    private fun accessibilityCapability(): DeviceCapability = DeviceCapability(
+        "accessibility", "无障碍手机控制",
+        if (phoneBackend.state.value.connected) CapabilityStatus.AVAILABLE else CapabilityStatus.PERMISSION_REQUIRED,
+        if (phoneBackend.state.value.connected) {
+            "无障碍服务已实际连接。仅在你从聊天手动开始的任务中，读取和操作所选目标应用。"
+        } else {
+            "无障碍服务尚未连接。请在系统无障碍设置中自行开启本应用的服务；已开启但未连接时可关闭后重新开启。打开本页不会代你授权。"
+        },
+    )
+
+    private fun screenshotCapability(): DeviceCapability = DeviceCapability(
+        "screenshot", "屏幕截图",
+        when {
+            !phoneBackend.supportsScreenshot -> CapabilityStatus.UNAVAILABLE
+            !phoneBackend.state.value.connected -> CapabilityStatus.PERMISSION_REQUIRED
+            else -> CapabilityStatus.AVAILABLE
+        },
+        when {
+            !phoneBackend.supportsScreenshot -> "当前系统不支持此截图后端，手机控制仍可使用页面结构。"
+            !phoneBackend.state.value.connected -> "截图需要无障碍服务实际连接，并在每次任务中单独允许。"
+            else -> "截图后端可用，默认关闭。只有你为本次任务勾选允许截图，模型才可请求必要画面。"
+        },
     )
 
     private fun notificationCapability(): DeviceCapability = try {

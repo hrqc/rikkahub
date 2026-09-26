@@ -1,0 +1,7 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+  <string name="mobile_agent_accessibility_label">Mobile Agent 手机控制</string>
+  <string name="mobile_agent_accessibility_description">仅在你为指定聊天和目标应用明确开启会话后，读取该应用的界面并执行受控操作。界面内容可能交给该聊天配置的模型服务处理。密码与敏感认证页面交由你操作；可随时通过通知中的 STOP 停止。开启此系统权限不会自动开启控制会话。</string>
+  <string name="mobile_agent_notification_channel">手机控制与 STOP</string>
+  <string name="mobile_agent_notification_title">手机控制会话已开启</string>
+</resources>

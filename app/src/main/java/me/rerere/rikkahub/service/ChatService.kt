@@ -21,6 +21,7 @@ import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asSharedFlow
 import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.flow.first
+import kotlinx.coroutines.flow.distinctUntilChangedBy
 import kotlinx.coroutines.flow.onCompletion
 import kotlinx.coroutines.flow.update
 import kotlinx.coroutines.launch
@@ -46,6 +47,7 @@ import me.rerere.rikkahub.data.ai.TranslationHandler
 import me.rerere.rikkahub.data.ai.mcp.McpManager
 import me.rerere.rikkahub.data.ai.tools.ChatToolFactory
 import me.rerere.rikkahub.data.ai.tools.InvalidMcpServerNamesException
+import me.rerere.rikkahub.data.ai.tools.isPhoneToolName
 import me.rerere.rikkahub.data.ai.tools.shouldUseExternalWebSearch
 import me.rerere.rikkahub.data.ai.transformers.Base64ImageToLocalFileTransformer
 import me.rerere.rikkahub.data.ai.transformers.DocumentAsPromptTransformer
@@ -68,6 +70,8 @@ import me.rerere.rikkahub.data.datastore.getCurrentChatModel
 import me.rerere.rikkahub.data.files.FilesManager
 import me.rerere.rikkahub.data.model.Conversation
 import me.rerere.rikkahub.data.model.Assistant
+import me.rerere.rikkahub.data.mobileagent.PhoneController
+import me.rerere.rikkahub.data.mobileagent.PhoneSessionStatus
 import me.rerere.rikkahub.data.model.AssistantAffectScope
 import me.rerere.rikkahub.data.model.MessageNode
 import me.rerere.rikkahub.data.model.localFileUrls
@@ -162,6 +166,7 @@ class ChatService(
     private val filesManager: FilesManager,
     private val workspaceRepository: WorkspaceRepository,
     private val folderRepository: FolderRepository,
+    private val phoneController: PhoneController,
 ) {
     // workspace 系统提示注入 (依赖 workspaceRepository, 故在类内构造)
     private val workspaceReminderTransformer = WorkspaceReminderTransformer(workspaceRepository)
@@ -173,6 +178,32 @@ class ChatService(
         },
         onGenerationFinished = ::onSessionGenerationFinished,
     )
+
+    init {
+        appScope.launch {
+            phoneController.state.distinctUntilChangedBy { it.token to it.status }.collect { state ->
+                if (state.status in setOf(
+                        PhoneSessionStatus.PAUSED,
+                        PhoneSessionStatus.WAITING_FOR_FOREGROUND,
+                        PhoneSessionStatus.STOPPED,
+                        PhoneSessionStatus.EXPIRED,
+                    )) {
+                    val id = state.token?.conversationId?.let { runCatching { Uuid.parse(it) }.getOrNull() }
+                    if (id != null && phoneController.state.value.let { it.token == state.token && it.status == state.status }) {
+                        // The controller revoked the permit before publishing this state.
+                        // Do not call stopGeneration here: a pause must remain resumable by the user.
+                        try {
+                            cancelGenerationOnly(id)
+                        } catch (error: CancellationException) {
+                            throw error
+                        } catch (error: Exception) {
+                            Log.w(TAG, "Phone generation cancellation failed (${error.javaClass.simpleName})")
+                        }
+                    }
+                }
+            }
+        }
+    }
 
     // 错误状态
     private val _errors = MutableStateFlow<List<ChatError>>(emptyList())
@@ -423,7 +454,7 @@ class ChatService(
                 if (queued.reply == null) _generationDoneFlow.emit(conversationId)
             } catch (e: Exception) {
                 queued.reply?.completeExceptionally(e)
-                e.printStackTrace()
+                Log.w(TAG, "Sending message failed (${e.javaClass.simpleName})")
                 if (e is CancellationException) throw e
                 session.messageQueue.pause()
                 addError(e, conversationId, title = context.getString(R.string.error_title_send_message))
@@ -604,6 +635,13 @@ class ChatService(
             model.displayName
         }
         val useExternalWebSearch = shouldUseExternalWebSearch(assistant, model)
+        // Keep this per-run marker after STOP; looking up the current grant at notification time
+        // would expose late provider chunks. Existing phone history also remains private on later turns.
+        var redactNotificationContent =
+            phoneController.state.value.token?.conversationId == conversationId.toString() ||
+                initialConversation.currentMessages.any { message ->
+                    message.getTools().any { isPhoneToolName(it.toolName) }
+                }
 
         runCatching {
 
@@ -631,6 +669,7 @@ class ChatService(
                     assistant = assistant,
                     model = model,
                     workspaceCwd = conversation.workspaceCwd,
+                    conversationId = conversationId.toString(),
                 )
             } catch (error: InvalidMcpServerNamesException) {
                 sessionManager.get(conversationId)?.messageQueue?.pause()
@@ -647,6 +686,7 @@ class ChatService(
             }
 
             // start generating
+            redactNotificationContent = redactNotificationContent || tools.any { isPhoneToolName(it.name) }
             val session = sessionManager.getOrCreate(conversationId)
             generationLoop.generateText(
                 settings = settings,
@@ -688,8 +728,10 @@ class ChatService(
                     AppEvent.ChatGenerationEnded(
                         conversationId = conversationId,
                         senderName = senderName,
-                        contentPreview = updatedConversation.currentMessages.lastOrNull()
-                            ?.toText()?.take(50)?.trim() ?: "",
+                        contentPreview = if (redactNotificationContent) "本次生成已结束" else {
+                            updatedConversation.currentMessages.lastOrNull()?.toText()?.take(50)?.trim() ?: ""
+                        },
+                        redactContent = redactNotificationContent,
                     )
                 )
             }.collect { chunk ->
@@ -702,8 +744,12 @@ class ChatService(
                         // 通知等边缘副作用由 ChatNotificationManager 消费；
                         // tryEmit 不挂起，事件丢失只影响单次通知更新，不能反压生成链
                         chunk.messages.lastOrNull()?.let { lastMessage ->
+                            redactNotificationContent = redactNotificationContent ||
+                                lastMessage.getTools().any { isPhoneToolName(it.toolName) }
                             appEventBus.tryEmit(
-                                AppEvent.ChatGenerationUpdate(conversationId, lastMessage, senderName)
+                                AppEvent.ChatGenerationUpdate(
+                                    conversationId, lastMessage, senderName, redactNotificationContent,
+                                )
                             )
                         }
                     }
@@ -711,14 +757,13 @@ class ChatService(
             }
         }.onFailure {
             // 兜底取消 Live Update 通知（生成开始前失败时 onCompletion 不会执行）
-            appEventBus.tryEmit(AppEvent.ChatGenerationEnded(conversationId, senderName, null))
+            appEventBus.tryEmit(AppEvent.ChatGenerationEnded(conversationId, senderName, null, redactNotificationContent))
             if (it is CancellationException) throw it
             sessionManager.get(conversationId)?.messageQueue?.pause()
 
-            it.printStackTrace()
+            Log.w(TAG, "Generation failed (${it.javaClass.simpleName})")
             addError(it, conversationId, title = context.getString(R.string.error_title_generation))
-            Logging.log(TAG, "handleMessageComplete: $it")
-            Logging.log(TAG, it.stackTraceToString())
+            Logging.log(TAG, "Generation failed (${it.javaClass.simpleName})")
         }.onSuccess {
             val finalConversation = getConversationFlow(conversationId).value
 
@@ -852,7 +897,7 @@ class ChatService(
                 )
             }
         }.onFailure {
-            it.printStackTrace()
+            Log.w(TAG, "Title generation failed (${it.javaClass.simpleName})")
             addError(
                 error = it,
                 conversationId = conversationId,
@@ -911,7 +956,7 @@ class ChatService(
                 )
             )
         }.onFailure {
-            it.printStackTrace()
+            Log.w(TAG, "Suggestion generation failed (${it.javaClass.simpleName})")
         }
     }
 
@@ -1378,12 +1423,21 @@ class ChatService(
 
     // 停止当前会话生成任务（不清理会话缓存）
     suspend fun stopGeneration(conversationId: Uuid) {
+        phoneController.stopForConversation(conversationId.toString())
+        cancelGenerationOnly(conversationId)
+    }
+
+    /** UI calls this after synchronously pausing the phone controller. */
+    suspend fun pausePhoneGeneration(conversationId: Uuid) {
+        cancelGenerationOnly(conversationId)
+    }
+
+    private suspend fun cancelGenerationOnly(conversationId: Uuid) {
         val session = sessionManager.get(conversationId) ?: return
         val jobs = synchronized(session) {
             session.messageQueue.pause()
             session.cancelJobs()
         }
-        if (jobs.isEmpty()) return
         jobs.forEach { it.join() }
         finishInterruptedPendingTools(conversationId)
     }

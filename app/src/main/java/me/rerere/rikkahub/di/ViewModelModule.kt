@@ -14,6 +14,7 @@ import me.rerere.rikkahub.ui.pages.imggen.ImgGenVM
 import me.rerere.rikkahub.ui.pages.extensions.PromptVM
 import me.rerere.rikkahub.ui.pages.extensions.QuickMessagesVM
 import me.rerere.rikkahub.ui.pages.extensions.agent.DeviceCapabilitiesVM
+import me.rerere.rikkahub.ui.pages.extensions.agent.MobileControlVM
 import me.rerere.rikkahub.ui.pages.extensions.skills.SkillDetailVM
 import me.rerere.rikkahub.ui.pages.extensions.skills.SkillsVM
 import me.rerere.rikkahub.ui.pages.extensions.workspace.WorkspaceDetailVM
@@ -69,6 +70,18 @@ val viewModelModule = module {
     viewModelOf(::SkillDetailVM)
     viewModelOf(::WorkspaceVM)
     viewModelOf(::DeviceCapabilitiesVM)
+    viewModel<MobileControlVM> { params ->
+        MobileControlVM(
+            conversationId = params.get(0),
+            assistantId = params.get(1),
+            context = get(),
+            settingsStore = get(),
+            chatService = get(),
+            controller = get(),
+            backend = get(),
+            capabilityRepository = get(),
+        )
+    }
     viewModel<WorkspaceDetailVM> {
         WorkspaceDetailVM(
             id = it.get(),

@@ -6,11 +6,15 @@ import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.asStateFlow
+import kotlinx.coroutines.flow.distinctUntilChanged
+import kotlinx.coroutines.flow.map
 import kotlinx.coroutines.launch
 import me.rerere.rikkahub.data.mobileagent.DeviceCapabilityRepository
+import me.rerere.rikkahub.data.mobileagent.PhoneBackend
 
 class DeviceCapabilitiesVM(
     private val repository: DeviceCapabilityRepository,
+    phoneBackend: PhoneBackend,
 ) : ViewModel() {
     val capabilities = repository.capabilities
 
@@ -21,14 +25,25 @@ class DeviceCapabilitiesVM(
     val message = _message.asStateFlow()
 
     private var refreshJob: Job? = null
+    private var refreshPending = false
     private var rootJob: Job? = null
 
+    init {
+        viewModelScope.launch {
+            phoneBackend.state.map { it.connected }.distinctUntilChanged().collect { refresh() }
+        }
+    }
+
     fun refresh() {
+        refreshPending = true
         if (refreshJob?.isActive == true) return
         refreshJob = viewModelScope.launch {
             _refreshing.value = true
             try {
-                repository.refresh()
+                do {
+                    refreshPending = false
+                    repository.refresh()
+                } while (refreshPending)
             } catch (error: CancellationException) {
                 throw error
             } catch (error: Exception) {
