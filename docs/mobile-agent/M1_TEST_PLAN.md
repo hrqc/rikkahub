@@ -20,13 +20,17 @@ Press the explicit Root button. If `su` is absent, show `ROOT_UNAVAILABLE` witho
 
 ## OnePlus Ace 5 Pro (root)
 
+First inspect the actual Root manager. SukiSU Ultra can hide the `su` entry from an app that is not in its allowlist, so no permission dialog and `ROOT_UNAVAILABLE` are valid before manual authorization. The user must enable superuser access for `me.rerere.rikkahub.debug` in the manager, then retry the app's explicit probe. Manager renaming and spoofed boot properties must not be used to infer that Root is absent. See the [SukiSU su compatibility implementation](https://github.com/SukiSU-Ultra/SukiSU-Ultra/blob/main/kernel/feature/sucompat.c).
+
 - Grant the Root manager request: only a successful command returning UID 0 may show `ROOT_GRANTED`.
-- Revoke/deny in the Root manager and retry: an explicit refusal must show `ROOT_DENIED`; ambiguous errors remain `UNKNOWN`.
+- Revoke/deny in the Root manager and retry: an explicit refusal must show `ROOT_DENIED`; if the manager hides `su`, `ROOT_UNAVAILABLE` is expected instead. Ambiguous errors remain `UNKNOWN`.
 - Leave the request pending: timeout must return `UNKNOWN` and end the probe.
 - Cancel and navigate away while the request is pending: no late success or stuck progress indicator; returning allows a fresh request.
 - Restart the app: the page starts unverified and does not trust a persisted Root grant. Revalidation is explicit.
 
 Record actual Android version, Root manager/version, result and any screenshot or logs. The Root manager owns its permission dialog; cancelling the app's probe does not revoke previously granted Root permission.
+
+An allowlist-only manager may not expose a pending permission dialog. Do not claim physical timeout/cancellation coverage unless a request actually remained pending; retain the host subprocess tests as separate evidence.
 
 ## Automated checks
 

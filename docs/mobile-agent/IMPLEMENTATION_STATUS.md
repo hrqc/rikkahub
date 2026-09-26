@@ -23,6 +23,7 @@ V1 only. V2 remains out of scope until the user explicitly accepts all V1 core t
 - [x] Initialize the pinned color utilities submodule.
 - [x] Provision project build dependencies and record the unmodified baseline configuration failure (missing Firebase configuration).
 - [x] M1 implementation and host validation: capability detection, explicit root request and device capability panel. Real-device acceptance remains pending.
+- [x] M1.1: disable upstream update checks/downloads and remove upstream promotional entry points; 22 targeted tests passed and installed on the connected OnePlus.
 - [ ] M2: accessibility observation/actions, compressed UI tree and foreground coordination.
 - [ ] M3: controlled root actions, screenshots, action verification, stop and loop/budget protection.
 - [ ] Shopping comparison, discount calculation and payment guard.
@@ -42,12 +43,15 @@ M1 capability detection and the settings page are implemented, compiled and cove
 
 The fork can build without private Firebase credentials; analytics and crash uploads are disabled by default. An upstream-style telemetry build requires explicit `-PenableFirebase=true` and the developer's own ignored `app/google-services.json`.
 
-The project-local Gradle 9.6.0, SDK 37.0 / 37.2, CMake 3.22.1 and locked web dependencies are provisioned. The original web component and M1 Android APK build successfully. After an initial cached-compiler check, all 17 targeted tests also passed under the repository's Kotlin 2.4.10 / Core 1.19.0 Gradle build, including real subprocess pipe timeout/cancellation. APK signature, version and default disabled Firebase collection flags were verified. No real-device test has passed yet; the complete V1 is not ready for acceptance.
+The project-local Gradle 9.6.0, SDK 37.0 / 37.2, CMake 3.22.1 and locked web dependencies are provisioned. The original web component and Android APK build successfully. M1.1 passes 22 targeted tests, including real subprocess pipe timeout/cancellation and disabled upstream update requests. APK signature, version and default disabled Firebase collection flags were verified. OnePlus installation, startup, cleaned settings/about pages and the initial capability panel have passed a device smoke check. The complete V1 is not ready for acceptance.
+
+Latest built source checkpoint: `mobile-agent-v1-m1.1-cleanup` (`8c2863489a77e290970ed34225376b6e20e69bb3`). The user requested removal of upstream updates, repository promotion and community/donation entries. Current-project source and license attribution remain available. See `M1_1_BUILD_REPORT.md` for evidence and limits.
 
 Acceptance devices supplied by the user:
 
 - Non-root: OPPO Find X6 Pro.
 - Root: OnePlus Ace 5 Pro.
-- Android versions and installed Root manager remain to be read from the devices during testing.
+- Connected OnePlus: PKR110, Android 16 / API 36, SukiSU Ultra v4.0.0 (manager 40114). Before manual manager authorization, the app could not find runnable `su`. After the user allowed this app, its explicit probe confirmed UID 0. Passive refresh did not rerun the probe; restarting the process reset Root to unverified, and explicit revalidation succeeded. Denial/pending-request cancellation/timeout coverage remains separate from these successful device checks.
+- OPPO Android version and real-device tests remain pending.
 
 See `V1_BASELINE_REPORT.md` for the source baseline.
