@@ -11,3 +11,9 @@ local.properties
 .cursor
 .history
 .kotlin
+*.jks
+*.keystore
+*.p12
+*.pfx
+.env
+.env.local

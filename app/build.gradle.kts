@@ -9,9 +9,19 @@ plugins {
     alias(libs.plugins.kotlin.compose)
     alias(libs.plugins.kotlin.serialization)
     alias(libs.plugins.ksp)
-    alias(libs.plugins.google.services)
-    alias(libs.plugins.firebase.crashlytics)
+    alias(libs.plugins.google.services) apply false
+    alias(libs.plugins.firebase.crashlytics) apply false
     alias(libs.plugins.baselineprofile)
+}
+
+// Fork builds work without private Google project credentials. Telemetry is opt-in.
+val firebaseEnabled = providers.gradleProperty("enableFirebase").orNull == "true"
+if (firebaseEnabled) {
+    require(file("google-services.json").isFile) {
+        "enableFirebase requires app/google-services.json for your own Firebase project."
+    }
+    apply(plugin = "com.google.gms.google-services")
+    apply(plugin = "com.google.firebase.crashlytics")
 }
 
 android {
@@ -28,6 +38,10 @@ android {
         targetSdk = 37
         versionCode = 189
         versionName = "2.5.4"
+
+        buildConfigField("boolean", "FIREBASE_ENABLED", firebaseEnabled.toString())
+        manifestPlaceholders["firebaseAnalyticsDeactivated"] = (!firebaseEnabled).toString()
+        manifestPlaceholders["firebaseCrashlyticsEnabled"] = firebaseEnabled.toString()
 
         testInstrumentationRunner = "androidx.test.runner.AndroidJUnitRunner"
 
@@ -84,7 +98,8 @@ android {
         }
         debug {
             applicationIdSuffix = ".debug"
-            buildConfigField("String", "VERSION_NAME", "\"${android.defaultConfig.versionName}\"")
+            versionNameSuffix = "-mobile-agent-v1-m1"
+            buildConfigField("String", "VERSION_NAME", "\"${android.defaultConfig.versionName}${versionNameSuffix}\"")
             buildConfigField("String", "VERSION_CODE", "\"${android.defaultConfig.versionCode}\"")
         }
     }

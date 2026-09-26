@@ -4,6 +4,7 @@ import android.content.Context
 import me.rerere.rikkahub.data.files.FileFolders
 import me.rerere.rikkahub.data.files.FilesManager
 import me.rerere.rikkahub.data.files.SkillManager
+import me.rerere.rikkahub.data.mobileagent.DeviceCapabilityRepository
 import me.rerere.rikkahub.data.repository.ConversationRepository
 import me.rerere.rikkahub.data.repository.FavoriteRepository
 import me.rerere.rikkahub.data.repository.FolderRepository
@@ -19,6 +20,8 @@ import org.koin.dsl.module
 import java.io.File
 
 val repositoryModule = module {
+    single { DeviceCapabilityRepository(get()) }
+
     single {
         ConversationRepository(get(), get(), get(), get(), get(), get())
     }
