@@ -13,6 +13,8 @@ import kotlinx.coroutines.async
 import kotlinx.coroutines.awaitAll
 import kotlinx.coroutines.coroutineScope
 import kotlinx.coroutines.completeWith
+import kotlinx.coroutines.currentCoroutineContext
+import kotlinx.coroutines.ensureActive
 import kotlinx.coroutines.flow.Flow
 import kotlinx.coroutines.flow.MutableSharedFlow
 import kotlinx.coroutines.flow.MutableStateFlow
@@ -71,6 +73,9 @@ import me.rerere.rikkahub.data.files.FilesManager
 import me.rerere.rikkahub.data.model.Conversation
 import me.rerere.rikkahub.data.model.Assistant
 import me.rerere.rikkahub.data.mobileagent.PhoneController
+import me.rerere.rikkahub.data.mobileagent.PhoneIntentBinding
+import me.rerere.rikkahub.data.mobileagent.PhoneIntentStore
+import me.rerere.rikkahub.data.mobileagent.PhoneSessionToken
 import me.rerere.rikkahub.data.mobileagent.PhoneSessionStatus
 import me.rerere.rikkahub.data.model.AssistantAffectScope
 import me.rerere.rikkahub.data.model.MessageNode
@@ -85,9 +90,16 @@ import me.rerere.rikkahub.web.BadRequestException
 import me.rerere.rikkahub.web.NotFoundException
 import me.rerere.rikkahub.utils.applyPlaceholders
 import java.util.Locale
+import java.util.concurrent.ConcurrentHashMap
 import kotlin.uuid.Uuid
 
 private const val TAG = "ChatService"
+
+private data class PhoneGenerationRun(val token: PhoneSessionToken, val job: Job)
+
+internal fun isRevokedPhoneGeneration(run: PhoneSessionToken, state: PhoneSessionToken): Boolean =
+    run.conversationId == state.conversationId && run.assistantId == state.assistantId &&
+        run.sessionId == state.sessionId && run.epoch < state.epoch
 
 internal fun backgroundTextGenerationParams(
     model: Model,
@@ -167,7 +179,10 @@ class ChatService(
     private val workspaceRepository: WorkspaceRepository,
     private val folderRepository: FolderRepository,
     private val phoneController: PhoneController,
+    private val phoneIntentStore: PhoneIntentStore,
 ) {
+    private val phoneGenerationRuns = ConcurrentHashMap<Uuid, PhoneGenerationRun>()
+    private val latestFreshInputs = ConcurrentHashMap<Uuid, Uuid>()
     // workspace 系统提示注入 (依赖 workspaceRepository, 故在类内构造)
     private val workspaceReminderTransformer = WorkspaceReminderTransformer(workspaceRepository)
 
@@ -190,10 +205,18 @@ class ChatService(
                     )) {
                     val id = state.token?.conversationId?.let { runCatching { Uuid.parse(it) }.getOrNull() }
                     if (id != null && phoneController.state.value.let { it.token == state.token && it.status == state.status }) {
-                        // The controller revoked the permit before publishing this state.
-                        // Do not call stopGeneration here: a pause must remain resumable by the user.
+                        // A delayed STOP must cancel its phone run, never a later ordinary chat job.
                         try {
-                            cancelGenerationOnly(id)
+                            val run = phoneGenerationRuns[id]
+                            if (run != null && state.token != null && isRevokedPhoneGeneration(run.token, state.token)) {
+                                val session = sessionManager.get(id)
+                                if (session != null) synchronized(session) {
+                                    if (session.getJob() === run.job) session.messageQueue.pause()
+                                    run.job.cancel()
+                                } else run.job.cancel()
+                                run.job.join()
+                                if (session?.getJob() == null) finishInterruptedPendingTools(id)
+                            }
                         } catch (error: CancellationException) {
                             throw error
                         } catch (error: Exception) {
@@ -236,7 +259,14 @@ class ChatService(
     fun cleanup() = runCatching { sessionManager.cleanup() }
 
     private fun onSessionGenerationFinished(session: ConversationSession, cause: Throwable?) {
-        if (cause != null) session.messageQueue.pause()
+        if (cause != null) {
+            // A fresh user send can intentionally replace a revoked phone run. Its queued
+            // message must not be paused later by that old run's cancellation callback.
+            val replacement = session.messageQueue.state.value.messages.firstOrNull()
+            if (replacement != null && latestFreshInputs[session.id] == replacement.id) {
+                session.messageQueue.resume()
+            } else session.messageQueue.pause()
+        }
         if (session.state.value.currentMessages.any { message ->
                 message.parts.any { it is UIMessagePart.Tool && it.isPending }
             }) {
@@ -365,22 +395,79 @@ class ChatService(
         dispatchNextQueuedMessage(conversationId)
     }
 
-    fun sendMessage(conversationId: Uuid, content: List<UIMessagePart>, answer: Boolean = true) {
+    fun sendMessage(
+        conversationId: Uuid,
+        content: List<UIMessagePart>,
+        answer: Boolean = true,
+        allowPhoneIntent: Boolean = false,
+    ) {
         if (content.isEmptyInputMessage()) return
+        invalidatePhoneContext(conversationId)
         val session = sessionManager.getOrCreate(conversationId)
         synchronized(session) {
             if (session.messageQueue.state.value.messages.isEmpty()) session.messageQueue.resume()
-            session.messageQueue.enqueue(content, answer)
+            val queued = session.messageQueue.enqueue(content, answer, allowPhoneIntent = allowPhoneIntent)
+            if (queued != null) latestFreshInputs[conversationId] = queued.id
             dispatchNextQueuedMessage(conversationId)
+        }
+    }
+
+    /** Fresh input, editing, and regeneration must not inherit an earlier device grant. */
+    fun invalidatePhoneContext(conversationId: Uuid) {
+        val session = sessionManager.getOrCreate(conversationId)
+        synchronized(session) {
+            latestFreshInputs.remove(conversationId)
+            phoneIntentStore.invalidate(conversationId.toString())
+            phoneController.stopForConversation(conversationId.toString())
+        }
+    }
+
+    /** A confirmed phone task is never silently queued behind another model request. */
+    fun sendPhoneContinuation(
+        conversationId: Uuid,
+        binding: PhoneIntentBinding,
+        token: PhoneSessionToken,
+        content: List<UIMessagePart>,
+    ): Job? = sendAuthorizedPhoneTask(conversationId, token, content, binding)
+
+    /** The advanced panel must explicitly provide its grant, just like the chat coordinator. */
+    fun sendPhoneTask(
+        conversationId: Uuid,
+        token: PhoneSessionToken,
+        content: List<UIMessagePart>,
+    ): Job? = sendAuthorizedPhoneTask(conversationId, token, content)
+
+    private fun sendAuthorizedPhoneTask(
+        conversationId: Uuid,
+        token: PhoneSessionToken,
+        content: List<UIMessagePart>,
+        binding: PhoneIntentBinding? = null,
+    ): Job? {
+        if (content.isEmptyInputMessage()) return null
+        val session = sessionManager.getOrCreate(conversationId)
+        synchronized(session) {
+            if (binding != null && (!phoneIntentStore.isCurrent(binding) || binding.conversationId != token.conversationId ||
+                    binding.assistantId != token.assistantId)
+            ) return null
+            if (token.conversationId != conversationId.toString() ||
+                session.state.value.assistantId.toString() != token.assistantId ||
+                phoneController.activeToken(token.conversationId, token.assistantId) != token ||
+                session.getJob() != null || session.messageQueue.state.value.messages.isNotEmpty() ||
+                session.state.value.currentMessages.any { message -> message.getTools().any { it.isPending } }
+            ) return null
+            val queued = QueuedMessage(parts = content.toList())
+            session.submittingMessage = queued
+            return sendQueuedMessage(session, queued, token, binding)
         }
     }
 
     /** Enqueue immediately; the result belongs to this item even after edits or later turns. */
     fun enqueueVoiceMessage(conversationId: Uuid, text: String): Deferred<String?> {
+        check(text.isNotBlank()) { context.getString(R.string.chat_page_voice_empty) }
+        invalidatePhoneContext(conversationId)
         val session = sessionManager.getOrCreate(conversationId)
         val reply = CompletableDeferred<String?>()
         synchronized(session) {
-            check(text.isNotBlank()) { context.getString(R.string.chat_page_voice_empty) }
             check(!session.messageQueue.state.value.paused || session.messageQueue.state.value.messages.isEmpty()) {
                 context.getString(R.string.chat_page_voice_resume_queue)
             }
@@ -388,7 +475,9 @@ class ChatService(
                 message.parts.any { it is UIMessagePart.Tool && it.isPending }
             }) { context.getString(R.string.chat_page_voice_tools_before_resume) }
             if (session.messageQueue.state.value.messages.isEmpty()) session.messageQueue.resume()
-            session.messageQueue.enqueue(listOf(UIMessagePart.Text(text)), reply = reply)
+            session.messageQueue.enqueue(listOf(UIMessagePart.Text(text)), reply = reply)?.let {
+                latestFreshInputs[conversationId] = it.id
+            }
             dispatchNextQueuedMessage(conversationId)
         }
         return reply
@@ -407,15 +496,29 @@ class ChatService(
         }
     }
 
-    private fun sendQueuedMessage(session: ConversationSession, queued: QueuedMessage): Job {
+    private fun sendQueuedMessage(
+        session: ConversationSession,
+        queued: QueuedMessage,
+        expectedPhoneToken: PhoneSessionToken? = null,
+        continuationBinding: PhoneIntentBinding? = null,
+    ): Job {
         val conversationId = session.id
         val content = queued.parts
         val answer = queued.answer
+        // Capture before saving the message: a STOP during that suspend point must not
+        // turn a phone task into an ordinary model request without its original grant.
+        val generationPhoneToken = expectedPhoneToken
+        var intentBinding: PhoneIntentBinding? = null
+        var generationSucceeded = false
         val job = launchGenerationJob(
             conversationId = conversationId,
             keepAliveInBackground = answer,
         ) {
             try {
+                if (generationPhoneToken != null &&
+                    (phoneController.activeToken(generationPhoneToken.conversationId, generationPhoneToken.assistantId) != generationPhoneToken ||
+                        continuationBinding?.let { !phoneIntentStore.isCurrent(it) } == true)
+                ) throw CancellationException("Phone task authorization is no longer current")
                 finishInterruptedPendingTools(conversationId)
 
                 val currentConversation = session.state.value
@@ -425,18 +528,33 @@ class ChatService(
                 val processedContent = preprocessUserInputParts(content, assistant)
 
                 // 添加消息到列表
+                val userMessage = UIMessage(role = MessageRole.USER, parts = processedContent)
                 val newConversation = currentConversation.copy(
-                    messageNodes = currentConversation.messageNodes + UIMessage(
-                        role = MessageRole.USER,
-                        parts = processedContent,
-                    ).toMessageNode(),
+                    messageNodes = currentConversation.messageNodes + userMessage.toMessageNode(),
                 )
                 saveConversation(conversationId, newConversation)
                 session.submittingMessage = null
 
+                if (queued.allowPhoneIntent && answer) {
+                    val originalText = content.filterIsInstance<UIMessagePart.Text>().joinToString("\n") { it.text }
+                    if (originalText.isNotBlank()) synchronized(session) {
+                        if (latestFreshInputs[conversationId] == queued.id) {
+                            intentBinding = PhoneIntentBinding(
+                                id = Uuid.random().toString(),
+                                conversationId = conversationId.toString(),
+                                assistantId = currentConversation.assistantId.toString(),
+                                userMessageId = userMessage.id.toString(),
+                                originalText = originalText,
+                            ).also(phoneIntentStore::begin)
+                        }
+                    }
+                }
+
                 // 开始补全
                 if (answer) {
-                    handleMessageComplete(conversationId)
+                    generationSucceeded = handleMessageComplete(
+                        conversationId, phoneIntentBinding = intentBinding, expectedPhoneToken = generationPhoneToken,
+                    )
                 }
 
                 queued.reply?.completeWith(runCatching {
@@ -453,6 +571,7 @@ class ChatService(
                 // The ordinary autoplay collector must not read a late voice reply again.
                 if (queued.reply == null) _generationDoneFlow.emit(conversationId)
             } catch (e: Exception) {
+                generationSucceeded = false
                 queued.reply?.completeExceptionally(e)
                 Log.w(TAG, "Sending message failed (${e.javaClass.simpleName})")
                 if (e is CancellationException) throw e
@@ -461,10 +580,19 @@ class ChatService(
             }
         }
         job.invokeOnCompletion { cause ->
+            intentBinding?.let { binding ->
+                if (cause == null && generationSucceeded) phoneIntentStore.complete(binding)
+                else phoneIntentStore.invalidate(binding)
+            }
             if (cause != null) queued.reply?.completeExceptionally(cause)
             synchronized(session) {
                 if (session.submittingMessage?.id == queued.id) session.submittingMessage = null
             }
+        }
+        if (generationPhoneToken != null) {
+            val run = PhoneGenerationRun(generationPhoneToken, job)
+            phoneGenerationRuns[conversationId] = run
+            job.invokeOnCompletion { phoneGenerationRuns.remove(conversationId, run) }
         }
         session.setJob(job)
         return job
@@ -495,6 +623,7 @@ class ChatService(
         message: UIMessage,
         regenerateAssistantMsg: Boolean = true
     ) = synchronized(sessionManager.getOrCreate(conversationId)) {
+        invalidatePhoneContext(conversationId)
         val session = sessionManager.getOrCreate(conversationId)
         val previousJob = session.getJob()
 
@@ -620,14 +749,27 @@ class ChatService(
 
     private suspend fun handleMessageComplete(
         conversationId: Uuid,
-        messageRange: ClosedRange<Int>? = null
-    ) {
+        messageRange: ClosedRange<Int>? = null,
+        phoneIntentBinding: PhoneIntentBinding? = null,
+        expectedPhoneToken: PhoneSessionToken? = null,
+    ): Boolean {
         val settings = settingsStore.settingsFlow.first()
         val initialConversation = getConversationFlow(conversationId).value
         val assistant = settings.getAssistantById(initialConversation.assistantId)
             ?: settings.getCurrentAssistant()
         val model = settings.findModelById(assistant.chatModelId ?: settings.chatModelId)
             ?: throw IllegalStateException("No chat model selected")
+        val generationPhoneToken = expectedPhoneToken
+        if (generationPhoneToken != null) {
+            if (generationPhoneToken.conversationId != conversationId.toString() ||
+                generationPhoneToken.assistantId != assistant.id.toString() || phoneIntentBinding != null ||
+                phoneController.activeToken(generationPhoneToken.conversationId, generationPhoneToken.assistantId) != generationPhoneToken
+            ) return false
+            val job = checkNotNull(currentCoroutineContext()[Job])
+            val run = PhoneGenerationRun(generationPhoneToken, job)
+            phoneGenerationRuns[conversationId] = run
+            job.invokeOnCompletion { phoneGenerationRuns.remove(conversationId, run) }
+        }
 
         val senderName = if (assistant.useAssistantAvatar) {
             assistant.name.ifEmpty { context.getString(R.string.assistant_page_default_assistant) }
@@ -643,7 +785,7 @@ class ChatService(
                     message.getTools().any { isPhoneToolName(it.toolName) }
                 }
 
-        runCatching {
+        val result = runCatching {
 
             // reset suggestions
             updateConversation(conversationId, initialConversation.copy(chatSuggestions = emptyList()))
@@ -670,6 +812,8 @@ class ChatService(
                     model = model,
                     workspaceCwd = conversation.workspaceCwd,
                     conversationId = conversationId.toString(),
+                    phoneIntentBinding = phoneIntentBinding,
+                    phoneSessionToken = generationPhoneToken,
                 )
             } catch (error: InvalidMcpServerNamesException) {
                 sessionManager.get(conversationId)?.messageQueue?.pause()
@@ -682,7 +826,16 @@ class ChatService(
                     ),
                     conversationId = conversationId,
                 )
-                return
+                return false
+            }
+
+            currentCoroutineContext().ensureActive()
+            if (generationPhoneToken != null && phoneController.activeToken(
+                    generationPhoneToken.conversationId, generationPhoneToken.assistantId,
+                ) != generationPhoneToken
+            ) throw CancellationException("Phone task authorization is no longer current")
+            if (phoneIntentBinding != null && !phoneIntentStore.isCurrent(phoneIntentBinding)) {
+                throw CancellationException("Phone proposal request is no longer current")
             }
 
             // start generating
@@ -774,6 +927,7 @@ class ChatService(
                 generateSuggestion(conversationId, finalConversation)
             }
         }
+        return result.isSuccess
     }
 
     // ---- 检查无效消息 ----
@@ -1236,6 +1390,7 @@ class ChatService(
         parts: List<UIMessagePart>
     ) {
         if (parts.isEmptyInputMessage()) return
+        invalidatePhoneContext(conversationId)
 
         val currentConversation = getConversationFlow(conversationId).value
         val settings = settingsStore.settingsFlow.first()
@@ -1423,7 +1578,7 @@ class ChatService(
 
     // 停止当前会话生成任务（不清理会话缓存）
     suspend fun stopGeneration(conversationId: Uuid) {
-        phoneController.stopForConversation(conversationId.toString())
+        invalidatePhoneContext(conversationId)
         cancelGenerationOnly(conversationId)
     }
 

@@ -1,0 +1,10 @@
+<?xml version="1.0" encoding="utf-8"?>
+<manifest xmlns:android="http://schemas.android.com/apk/res/android"
+    package="me.rerere.rikkahub.debug.inputdriver" android:versionCode="1" android:versionName="1.0">
+    <uses-sdk android:minSdkVersion="26" android:targetSdkVersion="36" />
+    <instrumentation
+        android:name="me.rerere.rikkahub.data.mobileagent.fixture.PhoneTestInputDriver"
+        android:targetPackage="me.rerere.rikkahub.debug.inputdriver"
+        android:label="Mobile Agent USB test input" />
+    <application android:label="Mobile Agent USB test input" android:debuggable="true" />
+</manifest>

@@ -5,6 +5,8 @@ import me.rerere.rikkahub.AppScope
 import me.rerere.rikkahub.data.ai.tools.local.LocalTools
 import me.rerere.rikkahub.data.ai.tools.ChatToolFactory
 import me.rerere.rikkahub.data.event.AppEventBus
+import me.rerere.rikkahub.data.mobileagent.PhoneIntentStore
+import me.rerere.rikkahub.data.mobileagent.PhoneTargetAppRepository
 import me.rerere.rikkahub.service.ChatNotificationManager
 import me.rerere.rikkahub.service.ChatService
 import me.rerere.rikkahub.ui.pages.extensions.workspace.WorkspaceTerminalSessionManager
@@ -20,6 +22,8 @@ import org.koin.dsl.module
 
 val appModule = module {
     single<Json> { JsonInstant }
+    single { PhoneIntentStore() }
+    single { PhoneTargetAppRepository(get(), get()) }
 
     single {
         AppEventBus()
@@ -81,6 +85,7 @@ val appModule = module {
             skillManager = get(),
             workspaceRepository = get(),
             phoneController = get(),
+            phoneIntentStore = get(),
         )
     }
 
@@ -102,6 +107,7 @@ val appModule = module {
             workspaceRepository = get(),
             folderRepository = get(),
             phoneController = get(),
+            phoneIntentStore = get(),
         )
     }
 

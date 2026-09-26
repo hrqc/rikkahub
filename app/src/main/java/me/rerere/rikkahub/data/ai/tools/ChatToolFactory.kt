@@ -12,6 +12,9 @@ import me.rerere.rikkahub.data.datastore.Settings
 import me.rerere.rikkahub.data.files.SkillManager
 import me.rerere.rikkahub.data.model.Assistant
 import me.rerere.rikkahub.data.mobileagent.PhoneController
+import me.rerere.rikkahub.data.mobileagent.PhoneIntentBinding
+import me.rerere.rikkahub.data.mobileagent.PhoneIntentStore
+import me.rerere.rikkahub.data.mobileagent.PhoneSessionToken
 import me.rerere.rikkahub.data.repository.ConversationRepository
 import me.rerere.rikkahub.data.repository.MemoryRepository
 import me.rerere.rikkahub.data.repository.WorkspaceRepository
@@ -26,6 +29,16 @@ internal fun shouldUseExternalWebSearch(assistant: Assistant, model: Model): Boo
 class InvalidMcpServerNamesException(val names: List<String>) :
     IllegalStateException("Invalid MCP server names: ${names.joinToString(", ")}")
 
+internal fun authorizedPhoneToolToken(
+    expected: PhoneSessionToken?,
+    active: PhoneSessionToken?,
+    conversationId: String?,
+    assistantId: String,
+    proposing: Boolean,
+): PhoneSessionToken? = expected?.takeIf {
+    !proposing && it == active && it.conversationId == conversationId && it.assistantId == assistantId
+}
+
 /** Creates the complete tool set for one generation run, including approval resumption. */
 class ChatToolFactory(
     private val json: Json,
@@ -36,6 +49,7 @@ class ChatToolFactory(
     private val skillManager: SkillManager,
     private val workspaceRepository: WorkspaceRepository,
     private val phoneController: PhoneController,
+    private val phoneIntentStore: PhoneIntentStore,
 ) {
     suspend fun createTools(
         settings: Settings,
@@ -43,12 +57,20 @@ class ChatToolFactory(
         model: Model,
         workspaceCwd: String? = null,
         conversationId: String? = null,
+        phoneIntentBinding: PhoneIntentBinding? = null,
+        phoneSessionToken: PhoneSessionToken? = null,
     ): List<Tool> = buildList {
-        conversationId?.let { id ->
-            phoneController.activeToken(id, assistant.id.toString())?.let { token ->
-                addAll(createPhoneTools(phoneController, token, json))
-            }
-        }
+        phoneIntentBinding?.takeIf {
+            it.conversationId == conversationId && it.assistantId == assistant.id.toString() &&
+                phoneIntentStore.isCurrent(it)
+        }?.let { add(createPhoneIntentTool(phoneIntentStore, it)) }
+        authorizedPhoneToolToken(
+            expected = phoneSessionToken,
+            active = phoneSessionToken?.let { phoneController.activeToken(it.conversationId, it.assistantId) },
+            conversationId = conversationId,
+            assistantId = assistant.id.toString(),
+            proposing = phoneIntentBinding != null,
+        )?.let { addAll(createPhoneTools(phoneController, it, json)) }
         if (assistant.enableMemory) {
             val memoryAssistantId = if (assistant.useGlobalMemory) {
                 MemoryRepository.GLOBAL_MEMORY_ID

@@ -226,7 +226,9 @@ class MobileControlVM(
                     return@launch
                 }
                 taskLauncher.requireReady(token)
-                chatService.sendMessage(conversationUuid, listOf(UIMessagePart.Text(task)))
+                if (chatService.sendPhoneTask(conversationUuid, token, listOf(UIMessagePart.Text(task))) == null) {
+                    throw PhoneControlException("CHAT_BUSY", "聊天或控制授权状态已变化，未发送模型请求，请检查后恢复。")
+                }
                 if (pendingModelTask?.first == token.sessionId) pendingModelTask = null
             } catch (cancelled: CancellationException) {
                 throw cancelled

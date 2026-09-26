@@ -16,6 +16,8 @@ data class QueuedMessage(
     val isEditing: Boolean = false,
     // Optional in-memory observer; null result means the queued message was withdrawn.
     val reply: CompletableDeferred<String?>? = null,
+    // Set only by a fresh, local chat send. Old-message edits and API callers default to false.
+    val allowPhoneIntent: Boolean = false,
 )
 
 data class MessageQueueState(
@@ -42,18 +44,26 @@ class MessageQueue {
     val state = mutableState.asStateFlow()
 
     @Synchronized
-    fun enqueue(parts: List<UIMessagePart>, answer: Boolean = true, reply: CompletableDeferred<String?>? = null) {
+    fun enqueue(
+        parts: List<UIMessagePart>,
+        answer: Boolean = true,
+        reply: CompletableDeferred<String?>? = null,
+        allowPhoneIntent: Boolean = false,
+    ): QueuedMessage? {
         if (parts.isEmptyInputMessage()) {
             reply?.complete(null)
-            return
+            return null
         }
-        mutableState.value = state.value.copy(
-            messages = state.value.messages + QueuedMessage(
-                parts = parts.toList(),
-                answer = answer,
-                reply = reply,
-            ),
+        val message = QueuedMessage(
+            parts = parts.toList(),
+            answer = answer,
+            reply = reply,
+            allowPhoneIntent = allowPhoneIntent,
         )
+        mutableState.value = state.value.copy(
+            messages = state.value.messages + message,
+        )
+        return message
     }
 
     @Synchronized

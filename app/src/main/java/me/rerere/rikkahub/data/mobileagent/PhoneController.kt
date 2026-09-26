@@ -81,8 +81,12 @@ class PhoneController(
         targetPackage: String,
         useRoot: Boolean = false,
         allowScreenshots: Boolean = false,
+        replaceExisting: Boolean = true,
     ): PhoneSessionToken = synchronized(gate) {
         require(conversationId.isNotBlank() && assistantId.isNotBlank())
+        if (!replaceExisting && state.value.status in setOf(PhoneSessionStatus.RUNNING, PhoneSessionStatus.PAUSED, PhoneSessionStatus.WAITING_FOR_FOREGROUND)) {
+            fail("SESSION_ALREADY_ACTIVE", "已有手机控制任务，请先停止当前任务")
+        }
         if (targetPackage == ownPackageName || !backend.isTargetAllowed(targetPackage)) {
             fail("TARGET_NOT_ALLOWED", "请选择允许打开的其他应用，不能控制本应用或系统授权界面")
         }
@@ -166,6 +170,10 @@ class PhoneController(
     }
 
     fun stop(reason: String = "用户停止") = end(PhoneSessionStatus.STOPPED, reason)
+
+    fun stopIfCurrent(token: PhoneSessionToken, reason: String = "用户停止") = synchronized(gate) {
+        if (state.value.token == token) end(PhoneSessionStatus.STOPPED, reason, token.sessionId)
+    }
 
     private fun stopFromBackend(token: PhoneSessionToken, reason: PhoneBackendStopReason) = end(
         PhoneSessionStatus.STOPPED,

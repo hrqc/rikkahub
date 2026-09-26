@@ -38,6 +38,10 @@ val viewModelModule = module {
             analytics = get(),
             filesManager = get(),
             favoriteRepository = get(),
+            phoneController = get(),
+            phoneBackend = get(),
+            phoneIntents = get(),
+            phoneTargets = get(),
         )
     }
     viewModelOf(::ChatDrawerVM)

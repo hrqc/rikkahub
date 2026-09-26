@@ -33,6 +33,8 @@ import me.rerere.ai.ui.limitContext
 import me.rerere.rikkahub.R
 import me.rerere.rikkahub.data.ai.transformers.InputMessageTransformer
 import me.rerere.rikkahub.data.ai.tools.isPhoneToolName
+import me.rerere.rikkahub.data.ai.tools.isSuccessfulPhoneIntentProposal
+import me.rerere.rikkahub.data.ai.tools.tryCompletePhoneIntentBatch
 import me.rerere.rikkahub.data.ai.tools.stalePhoneToolResult
 import me.rerere.rikkahub.data.ai.transformers.MessageTransformer
 import me.rerere.rikkahub.data.ai.transformers.OutputMessageTransformer
@@ -171,6 +173,18 @@ class GenerationLoop(
                     break
                 }
 
+                // A proposal has no device effect. Do not let a parallel ask_user/approval
+                // consume this fresh-input binding before the proposal can be staged.
+                val intentBatch = tryCompletePhoneIntentBatch(toolCalls, tools)
+                if (intentBatch != null) {
+                    val lastMessage = messages.last()
+                    messages = messages.dropLast(1) + lastMessage.copy(parts = lastMessage.parts.map { part ->
+                        if (part is UIMessagePart.Tool) intentBatch.find { it.toolCallId == part.toolCallId } ?: part else part
+                    })
+                    emit(GenerationChunk.Messages(messages))
+                    break
+                }
+
                 // Check for tools that need approval
                 var hasPendingApproval = false
                 val updatedTools = toolCalls.map { tool ->
@@ -221,7 +235,14 @@ class GenerationLoop(
 
             // Handle tools (execute approved tools, handle denied tools)
             val executedTools = arrayListOf<UIMessagePart.Tool>()
+            var phoneIntentProposed = false
             toolsToProcess.forEach { tool ->
+                if (phoneIntentProposed) {
+                    executedTools += tool.copy(output = listOf(UIMessagePart.Text(
+                        """{"accepted":false,"code":"phone_intent_pending","detail":"手机操作提议正在等待本地确认，本轮后续工具未执行。"}""",
+                    )))
+                    return@forEach
+                }
                 when (tool.approvalState) {
                     is ToolApprovalState.Denied -> {
                         // Tool was denied by user
@@ -272,6 +293,7 @@ class GenerationLoop(
                             }
                             Log.i(TAG, "generateText: executing tool")
                             val result = availableTool.execute(args)
+                            phoneIntentProposed = isSuccessfulPhoneIntentProposal(tool.toolName, result)
                             val hasShellAccess = tools.any { it.name == "workspace_shell" }
                             executedTools += tool.copy(
                                 output = if (isPhoneToolName(tool.toolName)) result else {
@@ -331,6 +353,7 @@ class GenerationLoop(
                     )
                 )
             )
+            if (phoneIntentProposed) break
         }
 
     }.flowOn(Dispatchers.IO)

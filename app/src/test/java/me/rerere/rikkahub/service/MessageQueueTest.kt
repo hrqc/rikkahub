@@ -13,6 +13,24 @@ class MessageQueueTest {
     private fun text(value: String) = listOf(UIMessagePart.Text(value))
 
     @Test
+    fun `ordinary callers never acquire phone intent eligibility by default`() {
+        val queue = MessageQueue()
+        queue.enqueue(text("打开计算器"))
+        assertFalse(queue.takeNext()!!.allowPhoneIntent)
+    }
+
+    @Test
+    fun `fresh chat eligibility belongs to its own queued input only`() {
+        val queue = MessageQueue()
+        val fresh = queue.enqueue(text("打开计算器"), allowPhoneIntent = true)!!
+        queue.enqueue(text("another caller"))
+        val dispatched = queue.takeNext()!!
+        assertEquals(fresh.id, dispatched.id)
+        assertTrue(dispatched.allowPhoneIntent)
+        assertFalse(queue.takeNext()!!.allowPhoneIntent)
+    }
+
+    @Test
     fun `editing a voice message preserves its reply observer and queue position`() {
         val queue = MessageQueue()
         val reply = CompletableDeferred<String?>()

@@ -15,19 +15,23 @@ import kotlinx.coroutines.Job
 import kotlinx.coroutines.flow.SharedFlow
 import kotlinx.coroutines.flow.SharingStarted
 import kotlinx.coroutines.flow.StateFlow
+import kotlinx.coroutines.flow.combine
 import kotlinx.coroutines.flow.distinctUntilChanged
 import kotlinx.coroutines.flow.flatMapLatest
+import kotlinx.coroutines.flow.first
 import kotlinx.coroutines.flow.flowOf
 import kotlinx.coroutines.flow.map
 import kotlinx.coroutines.flow.stateIn
 import kotlinx.coroutines.launch
 import me.rerere.ai.provider.Model
+import me.rerere.ai.provider.ModelAbility
 import me.rerere.ai.ui.UIMessage
 import me.rerere.ai.ui.UIMessagePart
 import me.rerere.ai.ui.isEmptyInputMessage
 import me.rerere.rikkahub.R
 import me.rerere.rikkahub.data.datastore.Settings
 import me.rerere.rikkahub.data.datastore.SettingsStore
+import me.rerere.rikkahub.data.datastore.findModelById
 import me.rerere.rikkahub.data.datastore.getCurrentAssistant
 import me.rerere.rikkahub.data.datastore.getCurrentChatModel
 import me.rerere.rikkahub.data.files.FilesManager
@@ -36,10 +40,19 @@ import me.rerere.rikkahub.data.model.Avatar
 import me.rerere.rikkahub.data.model.Conversation
 import me.rerere.rikkahub.data.model.MessageNode
 import me.rerere.rikkahub.data.model.NodeFavoriteTarget
+import me.rerere.rikkahub.data.mobileagent.PhoneBackend
+import me.rerere.rikkahub.data.mobileagent.PhoneController
+import me.rerere.rikkahub.data.mobileagent.PhoneIntentBinding
+import me.rerere.rikkahub.data.mobileagent.PhoneIntentStore
+import me.rerere.rikkahub.data.mobileagent.PhoneSessionToken
+import me.rerere.rikkahub.data.mobileagent.PhoneTargetAppRepository
 import me.rerere.rikkahub.data.repository.ConversationRepository
 import me.rerere.rikkahub.data.repository.FavoriteRepository
 import me.rerere.rikkahub.service.ChatError
 import me.rerere.rikkahub.service.ChatService
+import me.rerere.rikkahub.service.PhoneChatContext
+import me.rerere.rikkahub.service.PhoneChatCoordinator
+import me.rerere.rikkahub.service.PhoneChatHost
 import me.rerere.rikkahub.ui.hooks.writeStringPreference
 import me.rerere.rikkahub.ui.hooks.ChatInputState
 import me.rerere.rikkahub.utils.UiState
@@ -60,6 +73,10 @@ class ChatVM(
     private val analytics: AppAnalytics,
     private val filesManager: FilesManager,
     private val favoriteRepository: FavoriteRepository,
+    private val phoneController: PhoneController,
+    private val phoneBackend: PhoneBackend,
+    private val phoneIntents: PhoneIntentStore,
+    private val phoneTargets: PhoneTargetAppRepository,
 ) : ViewModel() {
     private val _conversationId: Uuid = Uuid.parse(id)
     val conversation: StateFlow<Conversation> = chatService.getConversationFlow(_conversationId)
@@ -69,6 +86,7 @@ class ChatVM(
     val inputState = ChatInputState()
 
     val voiceSession = VoiceSessionController(viewModelScope, context::getString) {
+        invalidatePhoneContext()
         chatService.enqueueVoiceMessage(_conversationId, it)
     }
 
@@ -100,6 +118,8 @@ class ChatVM(
     }
 
     override fun onCleared() {
+        phoneControl.setVisible(false)
+        phoneControl.abandonCurrent("聊天已关闭，手机控制已停止")
         voiceSession.stop()
         super.onCleared()
         // 移除对话引用
@@ -109,6 +129,44 @@ class ChatVM(
     // 用户设置
     val settings: StateFlow<Settings> =
         settingsStore.settingsFlow.stateIn(viewModelScope, SharingStarted.Eagerly, Settings.dummy())
+
+    private val phoneContext = combine(conversation, settingsStore.settingsFlow) { chat, preferences ->
+        val assistant = preferences.assistants.firstOrNull { it.id == chat.assistantId }
+        val model = preferences.findModelById(assistant?.chatModelId ?: preferences.chatModelId)
+        PhoneChatContext(
+            _conversationId.toString(), chat.assistantId.toString(), preferences.assistantId.toString(),
+            assistant != null && model?.abilities?.contains(ModelAbility.TOOL) == true,
+        )
+    }.stateIn(
+        viewModelScope, SharingStarted.Eagerly,
+        PhoneChatContext(_conversationId.toString(), conversation.value.assistantId.toString(), settingsStore.settingsFlow.value.assistantId.toString(), false),
+    )
+
+    val phoneControl = PhoneChatCoordinator(
+        scope = viewModelScope,
+        host = object : PhoneChatHost {
+            override val context = phoneContext
+            override suspend fun awaitGenerationIdle() {
+                chatService.getGenerationJobStateFlow(_conversationId).first { it == null }
+            }
+            override fun invalidatePendingInputs() { chatService.invalidatePhoneContext(_conversationId) }
+            override fun sendExecution(binding: PhoneIntentBinding, token: PhoneSessionToken): Job? =
+                chatService.sendPhoneContinuation(
+                    _conversationId, binding, token,
+                    listOf(UIMessagePart.Text("继续执行我刚才提出的手机操作请求。目标应用已在本地打开，请先观察当前页面。任务原文：\n${binding.originalText}")),
+                )
+        },
+        controller = phoneController,
+        backend = phoneBackend,
+        intents = phoneIntents,
+        loadTargets = phoneTargets::load,
+        resolveTargets = phoneTargets::resolve,
+    )
+
+    private fun invalidatePhoneContext() {
+        phoneControl.abandonCurrent()
+        chatService.invalidatePhoneContext(_conversationId)
+    }
 
     // 网络搜索(每个助手独立)
     val enableWebSearch = settings.map {
@@ -206,13 +264,15 @@ class ChatVM(
      */
     fun handleMessageSend(content: List<UIMessagePart>,answer: Boolean = true) {
         if (content.isEmptyInputMessage()) return
+        invalidatePhoneContext()
         analytics.logEvent("ai_send_message")
 
-        chatService.sendMessage(_conversationId, content, answer)
+        chatService.sendMessage(_conversationId, content, answer, allowPhoneIntent = answer)
     }
 
     fun handleMessageEdit(parts: List<UIMessagePart>, messageId: Uuid) {
         if (parts.isEmptyInputMessage()) return
+        invalidatePhoneContext()
         analytics.logEvent("ai_edit_message")
 
         viewModelScope.launch {
@@ -256,6 +316,7 @@ class ChatVM(
         message: UIMessage,
         regenerateAssistantMsg: Boolean = true
     ) {
+        invalidatePhoneContext()
         analytics.logEvent("ai_regenerate_at_message")
         chatService.regenerateAtMessage(_conversationId, message, regenerateAssistantMsg)
     }
@@ -278,6 +339,7 @@ class ChatVM(
     }
 
     fun stopGeneration() {
+        phoneControl.stop()
         viewModelScope.launch {
             chatService.stopGeneration(_conversationId)
         }
