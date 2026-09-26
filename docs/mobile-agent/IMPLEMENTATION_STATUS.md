@@ -21,8 +21,8 @@ V1 only. V2 remains out of scope until the user explicitly accepts all V1 core t
 - [x] Push baseline backup branch and annotated tag.
 - [x] Create and track `feature/mobile-agent-v1`.
 - [x] Initialize the pinned color utilities submodule.
-- [ ] Provision project build dependencies and validate the unmodified baseline.
-- [ ] M1: capability detection, explicit root request and device capability panel.
+- [x] Provision project build dependencies and record the unmodified baseline configuration failure (missing Firebase configuration).
+- [x] M1 implementation and host validation: capability detection, explicit root request and device capability panel. Real-device acceptance remains pending.
 - [ ] M2: accessibility observation/actions, compressed UI tree and foreground coordination.
 - [ ] M3: controlled root actions, screenshots, action verification, stop and loop/budget protection.
 - [ ] Shopping comparison, discount calculation and payment guard.
@@ -36,11 +36,13 @@ V1 only. V2 remains out of scope until the user explicitly accepts all V1 core t
 
 Baseline: `mobile-agent-v1-baseline` (`8b696c0cfc301754689c0bb04e965fe60af6277c`).
 
-M1 capability detection and the settings page are implemented and under validation. Root is requested only by an explicit button, uses a fixed read-only UID command, and is never inferred from the device model or the Workspace PRoot environment. Unimplemented phone controls are shown as unavailable to this milestone.
+Built M1 source checkpoint: `mobile-agent-v1-m1-capabilities` (`7c5f2491d6329380a7c240ea2161341a7e6188b3`), pushed to origin. This is not the user-accepted V1 stable tag.
+
+M1 capability detection and the settings page are implemented, compiled and covered by 17 passing targeted Gradle unit tests. Root is requested only by an explicit button, uses a fixed read-only UID command, and is never inferred from the device model or the Workspace PRoot environment. Unimplemented phone controls are shown as unavailable to this milestone.
 
 The fork can build without private Firebase credentials; analytics and crash uploads are disabled by default. An upstream-style telemetry build requires explicit `-PenableFirebase=true` and the developer's own ignored `app/google-services.json`.
 
-The project-local Gradle 9.6.0, SDK 37.0 / 37.2, CMake 3.22.1 and locked web dependencies are provisioned. Android build validation is in progress. No V1 APK or real-device test has passed yet.
+The project-local Gradle 9.6.0, SDK 37.0 / 37.2, CMake 3.22.1 and locked web dependencies are provisioned. The original web component and M1 Android APK build successfully. After an initial cached-compiler check, all 17 targeted tests also passed under the repository's Kotlin 2.4.10 / Core 1.19.0 Gradle build, including real subprocess pipe timeout/cancellation. APK signature, version and default disabled Firebase collection flags were verified. No real-device test has passed yet; the complete V1 is not ready for acceptance.
 
 Acceptance devices supplied by the user:
 

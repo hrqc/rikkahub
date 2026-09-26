@@ -28,6 +28,12 @@ The backup branch, baseline tag and development branch were pushed successfully 
 
 ## Validation status
 
-Baseline source and Git recovery references verified. Original application build is pending local dependency provisioning; no successful build or device test is claimed.
+Baseline source and Git recovery references verified. In the unchanged baseline worktree, `:app:processDebugGoogleServices` was actually executed and failed because the public repository does not contain `google-services.json`. This is a baseline configuration failure, not a Mobile Agent regression. No successful original APK build or device test is claimed.
+
+Local build preparation completed with Gradle 9.6.0 (official archive SHA-256 `bbaeb2fef8710818cf0e261201dab964c572f92b942812df0c3620d62a529a01`), Android Studio JBR 21.0.10, SDK platforms 37.0 / 37.2 and CMake 3.22.1. All added tools and dependency caches are project-local. Existing accepted SDK licenses were reused; no new terms were automatically accepted.
+
+For this Windows machine, an external local Gradle init script selects already-installed NDK 29.0.14206865 and Build Tools 37.0.0 instead of AGP's defaults (NDK 28.2.13676358 and Build Tools 36.0.0). Automatic SDK downloads are disabled. This toolchain deviation must be retained with the APK validation record; it is not an exact reproduction of the default upstream toolchain.
+
+The fork defaults to disabled Firebase analytics/crash collection and does not require the private configuration file. Explicit opt-in is documented in the M1 test plan. The M1 Android APK build and 17 targeted Gradle unit tests passed; see `docs/mobile-agent/M1_BUILD_REPORT.md`. Real-device acceptance remains pending.
 
 V1 work and validation are tracked in `docs/mobile-agent/IMPLEMENTATION_STATUS.md`.
