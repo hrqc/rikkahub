@@ -9,6 +9,8 @@ import androidx.compose.foundation.layout.heightIn
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.items
+import androidx.compose.foundation.rememberScrollState
+import androidx.compose.foundation.verticalScroll
 import androidx.compose.material3.AlertDialog
 import androidx.compose.material3.Button
 import androidx.compose.material3.ButtonDefaults
@@ -41,6 +43,7 @@ fun ChatPhoneControlCard(
     if (state.phase == PhoneChatPhase.HIDDEN) return
     var selectedPackage by remember(state.proposalId) { mutableStateOf(state.candidates.singleOrNull()?.packageName.orEmpty()) }
     var choosing by remember(state.proposalId) { mutableStateOf(false) }
+    var showingTask by remember(state.proposalId) { mutableStateOf(false) }
     val selected = state.candidates.firstOrNull { it.packageName == selectedPackage }
     Card(Modifier.fillMaxWidth().padding(horizontal = 12.dp, vertical = 6.dp)) {
         Column(Modifier.padding(12.dp), verticalArrangement = Arrangement.spacedBy(6.dp)) {
@@ -58,7 +61,8 @@ fun ChatPhoneControlCard(
             if (state.targetLabel.isNotBlank()) Text("目标：${state.targetLabel}", style = MaterialTheme.typography.bodySmall)
             Text(state.detail, style = MaterialTheme.typography.bodySmall, maxLines = 3, overflow = TextOverflow.Ellipsis)
             if (state.phase == PhoneChatPhase.CONFIRM) {
-                Text(state.originalText, style = MaterialTheme.typography.bodySmall, maxLines = 2, overflow = TextOverflow.Ellipsis)
+                Text("我理解你要：${state.interpretedTask}", style = MaterialTheme.typography.bodySmall, maxLines = 2, overflow = TextOverflow.Ellipsis)
+                TextButton(onClick = { showingTask = true }) { Text("查看原文与完整任务") }
                 OutlinedButton(onClick = { choosing = true }, enabled = state.candidates.isNotEmpty()) {
                     Text(selected?.label ?: "选择目标应用")
                 }
@@ -87,6 +91,23 @@ fun ChatPhoneControlCard(
                 }
             }
         }
+    }
+    if (showingTask && state.phase == PhoneChatPhase.CONFIRM) {
+        AlertDialog(
+            onDismissRequest = { showingTask = false },
+            title = { Text("确认任务内容") },
+            text = {
+                Column(Modifier.heightIn(max = 360.dp).verticalScroll(rememberScrollState()), verticalArrangement = Arrangement.spacedBy(8.dp)) {
+                    Text("你的原文", style = MaterialTheme.typography.titleSmall)
+                    Text(state.originalText)
+                    Text("模型理解", style = MaterialTheme.typography.titleSmall)
+                    Text(state.interpretedTask)
+                    Text("目标应用：${selected?.label ?: "尚未选择"}")
+                    Text("理解有误时请取消，并在聊天里纠正。", style = MaterialTheme.typography.bodySmall)
+                }
+            },
+            confirmButton = { TextButton(onClick = { showingTask = false }) { Text("关闭") } },
+        )
     }
     if (choosing) {
         AlertDialog(

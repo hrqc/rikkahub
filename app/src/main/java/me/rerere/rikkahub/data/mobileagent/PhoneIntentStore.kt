@@ -48,9 +48,7 @@ class PhoneIntentStore(private val newId: () -> String = { UUID.randomUUID().toS
     fun propose(binding: PhoneIntentBinding, targetAppName: String, summary: String): PhoneIntentProposal? =
         synchronized(gate) {
             val entry = currentEntry(binding) ?: return@synchronized null
-            if (entry.completed || entry.consumed || entry.staged != null ||
-                PhoneIntentGuard.classify(binding.originalText) == PhoneIntentPermission.INFORMATIONAL
-            ) return@synchronized null
+            if (entry.completed || entry.consumed || entry.staged != null || binding.originalText.isBlank()) return@synchronized null
             if (targetAppName.length > 256 || summary.length > 2_000) return@synchronized null
             PhoneIntentProposal(newId(), binding, targetAppName.trim(), summary.trim()).also {
                 entry.staged = it

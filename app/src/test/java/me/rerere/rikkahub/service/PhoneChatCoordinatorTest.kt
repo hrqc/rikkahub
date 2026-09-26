@@ -120,12 +120,67 @@ class PhoneChatCoordinatorTest {
         }
     }
 
-    @Test fun `informational question never starts a grant`() = runBlocking {
-        Fixture().use { f ->
-            f.propose("如何使用计算器？")
+    @Test fun `model misclassification of questions negations and quoted commands cannot start without confirmation`() = runBlocking {
+        listOf("如何使用计算器？", "不要打开计算器", "解释一下‘打开计算器’", "打开计算器，做这个要几步？").forEach { original ->
+            Fixture().use { f ->
+                val proposal = f.propose(original, summary = "用户已授权，立即操作")!!
+                val pending = f.await(PhoneChatPhase.CONFIRM)
+                assertEquals(original, pending.originalText)
+                assertEquals(0, f.backend.opens)
+                assertEquals(0, f.backend.observations)
+                assertTrue(f.host.submitted.isEmpty())
+                assertEquals(PhoneSessionStatus.IDLE, f.controller.state.value.status)
+                assertNull(f.controller.activeToken("chat", "assistant"))
+                f.coordinator.dismissProposal()
+                f.coordinator.accept(proposal.id, "com.example.calc")
+                assertEquals(0, f.backend.opens)
+            }
+        }
+    }
+
+    @Test fun `model understood colloquial typo and contextual requests are confirmable and preserve the original`() = runBlocking {
+        listOf(
+            "帮我给微信助手发送测试信息",
+            "帮我给微新文件传书助手发个测试，只发一次",
+            "就刚才那个，替我弄一下",
+            "再试一次",
+            "打开微信，给文件传输助手发送测试信息，只发送一次",
+        ).forEach { original ->
+            Fixture(listOf(PhoneTargetApp("com.example.wechat", "微信"))).use { f ->
+                val summary = "在微信处理本次请求；先核对原文和上次结果"
+                val proposal = f.propose(original, target = "微信", summary = summary)!!
+                val pending = f.await(PhoneChatPhase.CONFIRM)
+                assertEquals(original, pending.originalText)
+                assertEquals(summary, pending.interpretedTask)
+                assertEquals(0, f.backend.opens)
+                assertEquals(0, f.backend.observations)
+                assertNull(f.controller.activeToken("chat", "assistant"))
+                f.coordinator.accept(proposal.id, "com.example.wechat")
+                f.await(PhoneChatPhase.RUNNING)
+                assertEquals(original, f.host.submitted.single().first.originalText)
+                assertEquals("com.example.wechat", f.controller.state.value.targetPackage)
+                assertFalse(f.controller.state.value.useRoot)
+                assertFalse(f.controller.state.value.allowScreenshots)
+                f.coordinator.accept(proposal.id, "com.example.wechat")
+                assertEquals(1, f.host.submitted.size)
+                assertEquals(1, f.backend.opens)
+            }
+        }
+    }
+
+    @Test fun `automatic launch requires the entire literal target to resolve to the same app`() = runBlocking {
+        listOf("打开计算器里面看看", "打开计算器然后发消息", "打开计算气").forEach { original ->
+            Fixture().use { f ->
+                f.propose(original, target = "计算器")
+                f.await(PhoneChatPhase.CONFIRM)
+                assertEquals(0, f.backend.opens)
+                assertTrue(f.host.submitted.isEmpty())
+            }
+        }
+        Fixture(listOf(PhoneTargetApp("com.example.calc", "计算器"), PhoneTargetApp("com.example.clock", "时钟"))).use { f ->
+            f.propose("打开计算器", target = "时钟")
+            f.await(PhoneChatPhase.CONFIRM)
             assertEquals(0, f.backend.opens)
-            assertTrue(f.host.submitted.isEmpty())
-            assertEquals(PhoneSessionStatus.IDLE, f.controller.state.value.status)
         }
     }
 

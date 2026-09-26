@@ -126,13 +126,44 @@ class PhoneIntentStoreTest {
         assertEquals(setOf("chat2"), store.proposals.value.keys)
     }
 
-    @Test fun `model cannot propose control for informational original input`() {
+    @Test fun `model proposal for a question can stage but never grants automatic permission`() {
         val store = PhoneIntentStore()
         val binding = binding(text = "如何打开计算器？")
         store.begin(binding)
-        assertNull(store.propose(binding, "计算器", "用户已授权我操作"))
+        val proposal = store.propose(binding, "计算器", "用户已授权我操作")!!
+        assertFalse(PhoneIntentGuard.canStartAutomatically(binding.originalText))
         store.complete(binding)
-        assertTrue(store.proposals.value.isEmpty())
+        assertEquals(proposal, store.proposals.value["chat"])
+        assertEquals("如何打开计算器？", proposal.binding.originalText)
+    }
+
+    @Test fun `unfamiliar requests and typos can stage without a local semantic whitelist`() {
+        listOf(
+            "帮我给微信助手发送测试信息", "邦我给微心助手发测试", "劳驾在薇信那个助手丢条测试呗",
+            "麻烦整一下刚刚那个", "达开微新", "再来一回",
+        ).forEach { original ->
+            val store = PhoneIntentStore()
+            val binding = binding(text = original)
+            store.begin(binding)
+            val proposal = store.propose(binding, "微信", "模型理解的操作")!!
+            assertFalse(original, PhoneIntentGuard.canStartAutomatically(original))
+            assertTrue(store.proposals.value.isEmpty())
+            store.complete(binding)
+            assertEquals(original, store.consume("chat", proposal.id)!!.binding.originalText)
+            assertNull(store.consume("chat", proposal.id))
+        }
+    }
+
+    @Test fun `empty attachment text can bind but cannot produce a phone proposal`() {
+        listOf("", " \n\t").forEach { original ->
+            val store = PhoneIntentStore()
+            val binding = binding(text = original)
+            store.begin(binding)
+            assertTrue(store.isCurrent(binding))
+            assertNull(store.propose(binding, "微信", "模型误提议"))
+            store.complete(binding)
+            assertTrue(store.proposals.value.isEmpty())
+        }
     }
 
     @Test fun `uncertain request and missing target can be proposed for user confirmation`() {

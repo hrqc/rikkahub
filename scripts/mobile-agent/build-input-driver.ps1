@@ -16,9 +16,10 @@ $dex = Join-Path $output 'dex'
 New-Item -ItemType Directory -Force -Path $output,$classes,$dex | Out-Null
 $env:JAVA_HOME = $JdkPath
 function Assert-Command { if ($LASTEXITCODE -ne 0) { throw "Build command failed ($LASTEXITCODE)" } }
-& (Join-Path $JdkPath 'bin/javac.exe') -source 17 -target 17 -classpath $androidJar -d $classes (Join-Path $source 'PhoneTestInputDriver.java')
+& (Join-Path $JdkPath 'bin/javac.exe') -encoding UTF-8 -source 17 -target 17 -classpath $androidJar -d $classes (Join-Path $source 'PhoneTestInputDriver.java')
 Assert-Command
-& (Join-Path $buildTools 'd8.bat') --min-api 26 --lib $androidJar --output $dex (Join-Path $classes 'me/rerere/rikkahub/data/mobileagent/fixture/PhoneTestInputDriver.class')
+$compiledClasses = @(Get-ChildItem -LiteralPath $classes -Recurse -Filter '*.class' | Select-Object -ExpandProperty FullName)
+& (Join-Path $buildTools 'd8.bat') --min-api 26 --lib $androidJar --output $dex @compiledClasses
 Assert-Command
 $unsigned = Join-Path $output 'input-driver-unsigned.apk'
 & (Join-Path $buildTools 'aapt2.exe') link --manifest (Join-Path $source 'AndroidManifest.xml') -I $androidJar -o $unsigned

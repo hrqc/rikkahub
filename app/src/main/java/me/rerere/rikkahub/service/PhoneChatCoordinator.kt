@@ -13,13 +13,11 @@ import me.rerere.rikkahub.data.mobileagent.PhoneControlException
 import me.rerere.rikkahub.data.mobileagent.PhoneController
 import me.rerere.rikkahub.data.mobileagent.PhoneIntentBinding
 import me.rerere.rikkahub.data.mobileagent.PhoneIntentGuard
-import me.rerere.rikkahub.data.mobileagent.PhoneIntentPermission
 import me.rerere.rikkahub.data.mobileagent.PhoneIntentProposal
 import me.rerere.rikkahub.data.mobileagent.PhoneIntentStore
 import me.rerere.rikkahub.data.mobileagent.PhoneSessionStatus
 import me.rerere.rikkahub.data.mobileagent.PhoneSessionToken
 import me.rerere.rikkahub.data.mobileagent.PhoneTargetApp
-import me.rerere.rikkahub.data.mobileagent.PhoneTargetAppRepository
 import me.rerere.rikkahub.data.mobileagent.PhoneTaskLauncher
 import java.util.concurrent.atomic.AtomicReference
 
@@ -42,6 +40,7 @@ data class PhoneChatControlState(
     val originalText: String = "",
     val proposalId: String? = null,
     val candidates: List<PhoneTargetApp> = emptyList(),
+    val interpretedTask: String = "",
 )
 
 /** Owns only this visible chat's proposal and grant; model output never creates a grant by itself. */
@@ -155,10 +154,6 @@ class PhoneChatCoordinator(
 
     private fun consider(incoming: PhoneIntentProposal) {
         if (!isCurrent(incoming.binding)) return
-        if (PhoneIntentGuard.classify(incoming.binding.originalText) == PhoneIntentPermission.INFORMATIONAL) {
-            intents.invalidate(incoming.binding)
-            return
-        }
         proposalWork?.cancel()
         val expected = ++sequence
         proposal = incoming
@@ -168,17 +163,21 @@ class PhoneChatCoordinator(
                 if (expected != sequence || !isCurrent(incoming.binding)) return@launch
                 val matches = resolveTargets(incoming.targetAppName, allApps)
                 val candidates = matches.ifEmpty { allApps }
-                val automatic = PhoneIntentGuard.classify(incoming.binding.originalText) == PhoneIntentPermission.EXPLICIT_ACTION &&
-                    matches.size == 1 && PhoneTargetAppRepository.isMentionedIn(incoming.binding.originalText, matches.single())
+                // The model interprets intent. Local parsing only permits the small shortcut
+                // for opening an exactly named app; every other proposal remains confirmable.
+                val literalTarget = PhoneIntentGuard.automaticTargetName(incoming.binding.originalText)
+                    ?.let { resolveTargets(it, allApps).singleOrNull() }
+                val automatic = matches.size == 1 && literalTarget?.packageName == matches.single().packageName
                 if (automatic) {
                     accept(incoming.id, matches.single().packageName)
                 } else {
                     mutableState.value = PhoneChatControlState(
                         phase = PhoneChatPhase.CONFIRM,
-                        detail = if (matches.isEmpty()) "请选择这次要操作的应用。" else "请确认这次要操作的应用。",
+                        detail = if (matches.isEmpty()) "请确认任务，并选择本次要操作的应用。" else "请确认任务和目标应用。",
                         originalText = incoming.binding.originalText,
                         proposalId = incoming.id,
                         candidates = candidates,
+                        interpretedTask = incoming.summary,
                     )
                 }
             } catch (cancelled: CancellationException) {

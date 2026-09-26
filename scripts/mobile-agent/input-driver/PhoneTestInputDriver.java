@@ -3,12 +3,14 @@ package me.rerere.rikkahub.data.mobileagent.fixture;
 import android.app.Activity;
 import android.app.Instrumentation;
 import android.app.UiAutomation;
+import android.graphics.Rect;
 import android.os.Bundle;
 import android.os.SystemClock;
 import android.util.Base64;
 import android.view.accessibility.AccessibilityNodeInfo;
 import java.nio.charset.StandardCharsets;
 import java.util.ArrayDeque;
+import java.util.ArrayList;
 import java.util.List;
 
 /** USB test APK only. Inserts bounded test text into an empty, focused field of the main debug app. */
@@ -23,6 +25,11 @@ public final class PhoneTestInputDriver extends Instrumentation {
     @Override public void onStart() {
         Bundle result = new Bundle();
         try {
+            if ("assert_filehelper".equals(arguments.getString("operation"))) {
+                assertFilehelper(result);
+                finish(Activity.RESULT_OK, result);
+                return;
+            }
             if ("stop_fixture_notification".equals(arguments.getString("operation"))) {
                 stopFixtureNotification();
                 result.putString("notification_stop", "clicked");
@@ -82,9 +89,110 @@ public final class PhoneTestInputDriver extends Instrumentation {
             result.putInt("characters", value.length());
             finish(Activity.RESULT_OK, result);
         } catch (Exception error) {
+            if (arguments != null && "assert_filehelper".equals(arguments.getString("operation"))) {
+                result.clear();
+                result.putString("filehelper_message", "failed");
+                result.putString("reason", "File helper verification failed");
+                finish(Activity.RESULT_CANCELED, result);
+                return;
+            }
             result.putString("test_input", "failed");
             result.putString("reason", error.getClass().getSimpleName() + ": " + error.getMessage());
             finish(Activity.RESULT_CANCELED, result);
+        }
+    }
+
+    private void assertFilehelper(Bundle result) {
+        String encoded = arguments.getString("expected_b64", "");
+        if (encoded.length() > 1024) throw new IllegalArgumentException("Invalid synthetic text");
+        String expected = new String(Base64.decode(encoded, Base64.DEFAULT), StandardCharsets.UTF_8);
+        if (!expected.startsWith("Mobile Agent V1 测试") || expected.codePointCount(0, expected.length()) > 160) {
+            throw new IllegalArgumentException("Invalid synthetic text");
+        }
+        UiAutomation automation = getUiAutomation(UiAutomation.FLAG_DONT_SUPPRESS_ACCESSIBILITY_SERVICES);
+        AccessibilityNodeInfo root = automation.getRootInActiveWindow();
+        if (root == null) throw new IllegalStateException("Verification unavailable");
+        if (!isWechatNode(root)) {
+            root.recycle();
+            throw new IllegalStateException("Verification unavailable");
+        }
+        Rect window = new Rect();
+        root.getBoundsInScreen(window);
+        if (window.isEmpty()) {
+            root.recycle();
+            throw new IllegalStateException("Verification unavailable");
+        }
+        ArrayDeque<VerificationNode> pending = new ArrayDeque<>();
+        pending.add(new VerificationNode(root, false, 0));
+        List<Rect> titles = new ArrayList<>();
+        List<Rect> backButtons = new ArrayList<>();
+        int matches = 0;
+        int visited = 0;
+        try {
+            while (!pending.isEmpty()) {
+                if (++visited > 512) throw new IllegalStateException("Verification unavailable");
+                VerificationNode current = pending.removeFirst();
+                AccessibilityNodeInfo node = current.node;
+                try {
+                    if (!isWechatNode(node)) continue;
+                    boolean editable = current.editableAncestor || node.isEditable() || node.isPassword() ||
+                            "android.widget.EditText".contentEquals(node.getClassName() == null ? "" : node.getClassName());
+                    Rect bounds = new Rect();
+                    node.getBoundsInScreen(bounds);
+                    boolean visible = node.isVisibleToUser() && !bounds.isEmpty() && Rect.intersects(bounds, window);
+                    if (visible && !editable) {
+                        CharSequence text = node.getText();
+                        if (expected.contentEquals(text == null ? "" : text)) matches++;
+                        // Only an actual small text node can be the toolbar title. A root or
+                        // container's aggregated contentDescription is never title evidence.
+                        boolean toolbarNode = current.depth > 0 && node.getChildCount() == 0 &&
+                                bounds.height() <= window.height() / 8 && bounds.width() <= window.width() * 4 / 5 &&
+                                bounds.centerY() < window.top + window.height() / 5;
+                        if (toolbarNode && "android.widget.TextView".contentEquals(node.getClassName() == null ? "" : node.getClassName()) &&
+                                "文件传输助手".contentEquals(text == null ? "" : text)) {
+                            titles.add(bounds);
+                        }
+                        // A nearby back affordance distinguishes a chat toolbar from the
+                        // same contact name and message preview on the conversation list.
+                        if (toolbarNode && "返回".contentEquals(node.getContentDescription() == null ? "" : node.getContentDescription())) {
+                            backButtons.add(bounds);
+                        }
+                    }
+                    int children = node.getChildCount();
+                    if (children > 64 || (children > 0 && current.depth >= 32)) throw new IllegalStateException("Verification unavailable");
+                    for (int child = 0; child < children; child++) {
+                        if (pending.size() >= 512) throw new IllegalStateException("Verification unavailable");
+                        AccessibilityNodeInfo entry = node.getChild(child);
+                        if (entry != null) pending.addLast(new VerificationNode(entry, editable, current.depth + 1));
+                    }
+                } finally { node.recycle(); }
+            }
+        } finally { while (!pending.isEmpty()) pending.removeFirst().node.recycle(); }
+        boolean titleVerified = false;
+        for (Rect title : titles) {
+            for (Rect back : backButtons) {
+                if (back.centerX() < title.left && Math.abs(back.centerY() - title.centerY()) <= Math.max(back.height(), title.height())) {
+                    titleVerified = true;
+                }
+            }
+        }
+        if (!titleVerified || matches < 1) throw new IllegalStateException("Verification unavailable");
+        result.putString("filehelper_message", "verified");
+        result.putInt("matches", matches);
+    }
+
+    private static boolean isWechatNode(AccessibilityNodeInfo node) {
+        return "com.tencent.mm".contentEquals(node.getPackageName() == null ? "" : node.getPackageName());
+    }
+
+    private static final class VerificationNode {
+        final AccessibilityNodeInfo node;
+        final boolean editableAncestor;
+        final int depth;
+        VerificationNode(AccessibilityNodeInfo node, boolean editableAncestor, int depth) {
+            this.node = node;
+            this.editableAncestor = editableAncestor;
+            this.depth = depth;
         }
     }
 
