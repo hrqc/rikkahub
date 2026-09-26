@@ -36,9 +36,11 @@ android {
         applicationId = "me.rerere.rikkahub"
         minSdk = 26
         targetSdk = 37
-        versionCode = 189
+        versionCode = 190
         versionName = "2.5.4"
 
+        // This fork must not replace its Mobile Agent features with an official upstream APK.
+        buildConfigField("boolean", "UPSTREAM_UPDATES_ENABLED", "false")
         buildConfigField("boolean", "FIREBASE_ENABLED", firebaseEnabled.toString())
         manifestPlaceholders["firebaseAnalyticsDeactivated"] = (!firebaseEnabled).toString()
         manifestPlaceholders["firebaseCrashlyticsEnabled"] = firebaseEnabled.toString()
@@ -98,7 +100,7 @@ android {
         }
         debug {
             applicationIdSuffix = ".debug"
-            versionNameSuffix = "-mobile-agent-v1-m1"
+            versionNameSuffix = "-mobile-agent-v1-m1.1"
             buildConfigField("String", "VERSION_NAME", "\"${android.defaultConfig.versionName}${versionNameSuffix}\"")
             buildConfigField("String", "VERSION_CODE", "\"${android.defaultConfig.versionCode}\"")
         }

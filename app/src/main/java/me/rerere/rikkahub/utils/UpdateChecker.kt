@@ -5,6 +5,7 @@ import android.content.Context
 import android.os.Environment
 import android.widget.Toast
 import androidx.core.net.toUri
+import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.flow.Flow
 import kotlinx.coroutines.flow.SharingStarted
@@ -22,6 +23,8 @@ import okhttp3.OkHttpClient
 import okhttp3.Request
 
 private const val API_URL = "https://updates.rikka-ai.com/"
+const val UPSTREAM_UPDATES_DISABLED_MESSAGE =
+    "当前 Mobile Agent 构建不使用官方上游更新源，也不会下载官方 APK。请使用本项目提供的安装包更新；此状态不表示已是最新版。"
 
 class UpdateChecker(
     private val client: OkHttpClient,
@@ -32,39 +35,35 @@ class UpdateChecker(
     val updateState: StateFlow<UiState<UpdateInfo>> = checkUpdate().stateIn(
         scope = appScope,
         started = SharingStarted.Lazily,
-        initialValue = UiState.Loading,
+        initialValue = if (BuildConfig.UPSTREAM_UPDATES_ENABLED) UiState.Loading else UiState.Idle,
     )
 
-    private fun checkUpdate(): Flow<UiState<UpdateInfo>> = flow {
-        emit(UiState.Loading)
-        emit(
-            UiState.Success(
-                data = try {
-                    val response = client.newCall(
-                        Request.Builder()
-                            .url(API_URL)
-                            .get()
-                            .addHeader(
-                                "User-Agent",
-                                "RikkaHub ${BuildConfig.VERSION_NAME} #${BuildConfig.VERSION_CODE}"
-                            )
-                            .build()
-                    ).await()
-                    if (response.isSuccessful) {
-                        json.decodeFromString<UpdateInfo>(response.body.string())
-                    } else {
-                        throw Exception("Failed to fetch update info")
-                    }
-                } catch (e: Exception) {
-                    throw Exception("Failed to fetch update info", e)
-                }
-            )
-        )
-    }.catch {
-        emit(UiState.Error(it))
+    private fun checkUpdate(): Flow<UiState<UpdateInfo>> = updateCheckFlow(
+        upstreamUpdatesEnabled = BuildConfig.UPSTREAM_UPDATES_ENABLED,
+    ) {
+        client.newCall(
+            Request.Builder()
+                .url(API_URL)
+                .get()
+                .addHeader(
+                    "User-Agent",
+                    "RikkaHub ${BuildConfig.VERSION_NAME} #${BuildConfig.VERSION_CODE}"
+                )
+                .build()
+        ).await().use { response ->
+            if (response.isSuccessful) {
+                json.decodeFromString<UpdateInfo>(response.body.string())
+            } else {
+                throw Exception("Failed to fetch update info")
+            }
+        }
     }.flowOn(Dispatchers.IO)
 
     fun downloadUpdate(context: Context, download: UpdateDownload) {
+        if (!BuildConfig.UPSTREAM_UPDATES_ENABLED) {
+            Toast.makeText(context, UPSTREAM_UPDATES_DISABLED_MESSAGE, Toast.LENGTH_LONG).show()
+            return
+        }
         runCatching {
             val request = DownloadManager.Request(download.url.toUri()).apply {
                 // 设置下载时通知栏的标题和描述
@@ -88,6 +87,22 @@ class UpdateChecker(
             context.openUrl(download.url) // 跳转到下载页面
         }
     }
+}
+
+/** Disabled means no feed was checked, not that the installed APK is the newest release. */
+internal fun updateCheckFlow(
+    upstreamUpdatesEnabled: Boolean,
+    fetchUpdate: suspend () -> UpdateInfo,
+): Flow<UiState<UpdateInfo>> = flow {
+    if (!upstreamUpdatesEnabled) {
+        emit(UiState.Idle)
+        return@flow
+    }
+    emit(UiState.Loading)
+    emit(UiState.Success(fetchUpdate()))
+}.catch {
+    if (it is CancellationException) throw it
+    emit(UiState.Error(it))
 }
 
 @Serializable

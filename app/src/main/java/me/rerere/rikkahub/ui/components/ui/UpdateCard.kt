@@ -53,6 +53,7 @@ import kotlin.time.toJavaInstant
 @OptIn(ExperimentalTime::class)
 @Composable
 fun UpdateCard(vm: ChatVM) {
+    if (!BuildConfig.UPSTREAM_UPDATES_ENABLED) return
     val state by vm.updateState.collectAsStateWithLifecycle()
     val context = LocalContext.current
     val toaster = LocalToaster.current
