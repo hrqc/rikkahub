@@ -28,6 +28,9 @@ internal data class AndroidNodeSignature(
     val password: Boolean,
     val sensitive: Boolean,
     val truncated: Boolean,
+    val inspectionIncomplete: Boolean,
+    val requiresUserConfirmation: Boolean,
+    val contentFingerprint: String,
 )
 
 internal data class AndroidNodeHandle(val path: List<Int>, val signature: AndroidNodeSignature)
@@ -38,18 +41,22 @@ internal data class AndroidTreeCapture(
     val truncated: Boolean,
     val sensitive: Boolean,
     val fingerprint: String,
+    val previewTruncated: Boolean,
+    val inspectionIssues: List<String>,
 )
 
 /** Reads only the already authorized root supplied by the backend. Never queries windows itself. */
 internal class AccessibilityTreeReader {
     companion object {
-        const val MAX_CHILDREN = 64
+        const val MAX_CHILDREN = 128
     }
 
     fun capture(root: AccessibilityNodeInfo, targetPackage: String, isValid: () -> Boolean): AndroidTreeCapture {
         val nodes = mutableListOf<PhoneNode>()
         val handles = linkedMapOf<String, AndroidNodeHandle>()
         val budget = PhoneTreeReadBudget(SystemClock.elapsedRealtime())
+        val restrictedPaths = mutableListOf<List<Int>>()
+        val inspectedSignatures = mutableListOf<AndroidNodeSignature>()
         var sensitive = false
 
         fun check() {
@@ -61,19 +68,20 @@ internal class AccessibilityTreeReader {
             if (!budget.visit(depth, SystemClock.elapsedRealtime())) return
             // Embedded nodes from a different package are never included or descended into.
             if (node.packageName?.toString() != targetPackage) {
-                budget.markTruncated()
+                budget.markTruncated("foreign_node")
                 return
             }
             val signature = signature(node)
+            inspectedSignatures += signature
             sensitive = sensitive || signature.sensitive
-            if (signature.truncated) budget.markTruncated()
+            if (signature.truncated) budget.markPreviewTruncated()
+            if (signature.inspectionIncomplete) budget.markTruncated("text_limit")
+            if (signature.requiresUserConfirmation) restrictedPaths += path
             val hasContent = signature.text.isNotBlank() || signature.description.isNotBlank()
             val include = node.isVisibleToUser && (hasContent || signature.clickable || signature.longClickable ||
                 signature.editable || signature.scrollable || signature.password || depth == 0)
             var effectiveParent = parentId
-            if (include) {
-                val textSize = signature.text.length + signature.description.length
-                if (!budget.include(textSize)) return
+            if (include && budget.include(signature.text.length + signature.description.length)) {
                 val id = "n${nodes.size}"
                 effectiveParent = id
                 nodes += PhoneNode(
@@ -90,17 +98,22 @@ internal class AccessibilityTreeReader {
                     scrollable = signature.scrollable,
                     enabled = signature.enabled,
                     password = signature.password,
+                    requiresUserConfirmation = signature.requiresUserConfirmation,
                 )
                 handles[id] = AndroidNodeHandle(path, signature)
             }
             // Descendants may repeat the password text without setting isPassword themselves.
             if (signature.sensitive) return
             val children = node.childCount
-            if (children > MAX_CHILDREN) budget.markTruncated()
+            if (children > MAX_CHILDREN) budget.markTruncated("children_limit")
             for (index in 0 until minOf(children, MAX_CHILDREN)) {
                 check()
                 if (!budget.canContinue(SystemClock.elapsedRealtime())) break
-                val child = child(node, index) ?: continue
+                val child = child(node, index)
+                if (child == null) {
+                    budget.markTruncated("unavailable_child")
+                    continue
+                }
                 try {
                     visit(child, path + index, effectiveParent, depth + 1)
                 } finally {
@@ -111,8 +124,15 @@ internal class AccessibilityTreeReader {
 
         visit(root, emptyList(), null, 0)
         check()
-        val fingerprint = digest(nodes.joinToString("\n") { it.toString() })
-        return AndroidTreeCapture(nodes, handles, budget.truncated, sensitive, fingerprint)
+        val guardedNodes = nodes.map { node ->
+            val path = handles.getValue(node.id).path
+            node.copy(requiresUserConfirmation = node.requiresUserConfirmation ||
+                ((node.clickable || node.longClickable || node.editable) && isPhonePurchasePathRestricted(path, restrictedPaths)))
+        }
+        // Preview omission must not omit safety inspection or freshness of the remaining tree.
+        val fingerprint = digest(inspectedSignatures.joinToString("\n") { it.toString() })
+        return AndroidTreeCapture(guardedNodes, handles, budget.truncated, sensitive, fingerprint,
+            budget.previewTruncated, budget.issues.toList())
     }
 
     /** Returns an owned fresh node; the caller must recycle it on API < 33. */
@@ -164,6 +184,9 @@ internal class AccessibilityTreeReader {
             password = password,
             sensitive = sensitive,
             truncated = text.truncated || description.truncated,
+            inspectionIncomplete = text.inspectionIncomplete || description.inspectionIncomplete,
+            requiresUserConfirmation = text.requiresUserConfirmation || description.requiresUserConfirmation,
+            contentFingerprint = text.contentFingerprint + ":" + description.contentFingerprint,
         )
     }
 

@@ -25,6 +25,11 @@ public final class PhoneTestInputDriver extends Instrumentation {
     @Override public void onStart() {
         Bundle result = new Bundle();
         try {
+            if ("inspect_test_ui".equals(arguments.getString("operation"))) {
+                inspectTestUi(result);
+                finish(Activity.RESULT_OK, result);
+                return;
+            }
             if ("assert_filehelper".equals(arguments.getString("operation"))) {
                 assertFilehelper(result);
                 finish(Activity.RESULT_OK, result);
@@ -100,6 +105,54 @@ public final class PhoneTestInputDriver extends Instrumentation {
             result.putString("reason", error.getClass().getSimpleName() + ": " + error.getMessage());
             finish(Activity.RESULT_CANCELED, result);
         }
+    }
+
+    /** Local USB diagnostics for this task's foreground apps, without suppressing accessibility. */
+    private void inspectTestUi(Bundle result) {
+        String expected = arguments.getString("package", "me.rerere.rikkahub.debug");
+        if (!List.of("me.rerere.rikkahub.debug", "com.heytap.browser", "com.jingdong.app.mall",
+                "com.taobao.taobao", "com.xunmeng.pinduoduo", "com.sankuai.meituan").contains(expected)) {
+            throw new IllegalArgumentException("Package is outside test scope");
+        }
+        AccessibilityNodeInfo root = getUiAutomation(UiAutomation.FLAG_DONT_SUPPRESS_ACCESSIBILITY_SERVICES).getRootInActiveWindow();
+        if (root == null) throw new IllegalStateException("No active window");
+        if (!expected.contentEquals(root.getPackageName() == null ? "" : root.getPackageName())) {
+            root.recycle();
+            throw new IllegalStateException("Expected test app is not active");
+        }
+        ArrayDeque<AccessibilityNodeInfo> pending = new ArrayDeque<>();
+        pending.add(root);
+        StringBuilder output = new StringBuilder();
+        int visits = 0;
+        long deadline = SystemClock.elapsedRealtime() + 2500;
+        try {
+            while (!pending.isEmpty() && visits++ < 768 && output.length() < 18000 && SystemClock.elapsedRealtime() < deadline) {
+                AccessibilityNodeInfo node = pending.removeFirst();
+                try {
+                    if (!expected.contentEquals(node.getPackageName() == null ? "" : node.getPackageName())) continue;
+                    if (node.isPassword() || (android.os.Build.VERSION.SDK_INT >= 34 && node.isAccessibilityDataSensitive())) continue;
+                    if (node.isVisibleToUser()) {
+                        Rect bounds = new Rect();
+                        node.getBoundsInScreen(bounds);
+                        CharSequence text = node.isEditable() ? null : node.getText();
+                        CharSequence description = node.isEditable() ? null : node.getContentDescription();
+                        if (text != null || description != null || node.isClickable() || node.isEditable() || node.isScrollable()) {
+                            output.append(bounds.toShortString()).append(" click=").append(node.isClickable())
+                                .append(" edit=").append(node.isEditable()).append(" scroll=").append(node.isScrollable()).append(" ");
+                            if (text != null) output.append(text.subSequence(0, Math.min(text.length(), 900)));
+                            if (description != null) output.append(" [").append(description.subSequence(0, Math.min(description.length(), 400))).append("]");
+                            output.append('\n');
+                        }
+                    }
+                    for (int child = 0; child < Math.min(node.getChildCount(), 128) && pending.size() < 768; child++) {
+                        AccessibilityNodeInfo next = node.getChild(child);
+                        if (next != null) pending.addLast(next);
+                    }
+                } finally { node.recycle(); }
+            }
+            result.putBoolean("partial", !pending.isEmpty());
+        } finally { while (!pending.isEmpty()) pending.removeFirst().recycle(); }
+        result.putString("ui_b64", Base64.encodeToString(output.toString().getBytes(StandardCharsets.UTF_8), Base64.NO_WRAP));
     }
 
     private void assertFilehelper(Bundle result) {

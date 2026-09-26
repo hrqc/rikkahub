@@ -45,7 +45,6 @@ import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import me.rerere.rikkahub.Screen
 import me.rerere.rikkahub.data.datastore.findModelById
 import me.rerere.rikkahub.data.mobileagent.PhoneSessionStatus
-import me.rerere.rikkahub.data.mobileagent.RootState
 import me.rerere.rikkahub.ui.components.nav.BackButton
 import me.rerere.rikkahub.ui.components.ui.CardGroup
 import me.rerere.rikkahub.ui.context.LocalNavController
@@ -79,7 +78,7 @@ fun MobileControlPage(conversationId: String, assistantId: String) {
 
     var task by rememberSaveable(conversationId, assistantId) { mutableStateOf("") }
     var targetPackage by rememberSaveable(conversationId, assistantId) { mutableStateOf("") }
-    var useRoot by rememberSaveable(conversationId, assistantId) { mutableStateOf(false) }
+    val useRoot = capabilities.rootUsage.enabled
     var allowScreenshots by rememberSaveable(conversationId, assistantId) { mutableStateOf(false) }
     var showAppPicker by remember { mutableStateOf(false) }
     var showPrepareConfirmation by remember { mutableStateOf(false) }
@@ -285,11 +284,13 @@ fun MobileControlPage(conversationId: String, assistantId: String) {
                         supportingContent = {
                             Column {
                                 ControlOption(
-                                    checked = if (ownsSession && activeSession) session.useRoot else useRoot,
-                                    onCheckedChange = { useRoot = it },
-                                    enabled = !activeSession && capabilities.root.state == RootState.ROOT_GRANTED,
-                                    title = "Root 增强",
-                                    detail = if (capabilities.root.state == RootState.ROOT_GRANTED) "仅授权本次任务使用已接入的固定 Root 动作。" else "默认关闭；需先在设备能力页手动验证 Root。",
+                                    checked = useRoot,
+                                    onCheckedChange = vm::setRootUsageEnabled,
+                                    enabled = !activeSession && !busy,
+                                    title = "自动使用可用 Root",
+                                    detail = if (ownsSession && activeSession) {
+                                        if (session.useRoot) "本次可在必要时使用已验证 Root；优先 API 和无障碍节点。" else "本次使用标准能力。"
+                                    } else "记住此选择。曾授权成功后自动短时验证；不可用时使用标准能力，无需每次选择。",
                                 )
                                 ControlOption(
                                     checked = if (ownsSession && activeSession) session.allowScreenshots else allowScreenshots,
@@ -374,7 +375,7 @@ fun MobileControlPage(conversationId: String, assistantId: String) {
             onDismissRequest = { showPrepareConfirmation = false },
             title = { Text("授权本次本地控制") },
             text = {
-                Text("目标应用：${selectedApp?.label ?: targetPackage}\n\n确认后仅建立本次控制授权与 STOP 通知，不读取屏幕、不自动操作，也不调用模型。另行点击“打开目标应用”才会打开应用并在本地读取页面确认，内容不会发送给模型。Root 增强和截图仅按本页勾选项授权。")
+                Text("目标应用：${selectedApp?.label ?: targetPackage}\n\n确认后仅建立本次控制授权与 STOP 通知，不读取屏幕、不自动操作，也不调用模型。另行点击“打开目标应用”才会打开应用并在本地读取页面确认，内容不会发送给模型。Root 按已保存偏好自动验证可用性，截图按本页选项授权。")
             },
             confirmButton = {
                 TextButton(

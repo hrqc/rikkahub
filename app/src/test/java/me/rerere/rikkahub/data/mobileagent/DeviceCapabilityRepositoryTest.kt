@@ -121,4 +121,109 @@ class DeviceCapabilityRepositoryTest {
             assertEquals(RootState.UNKNOWN, repository.capabilities.value.root.state)
         }
     }
+
+    @Test fun `automatic task selection never probes a device without verified history`() = runBlocking {
+        var calls = 0
+        val repository = DeviceCapabilityRepository(PassiveDeviceProbe { snapshot }, RootProbe {
+            calls++
+            RootCapability(RootState.ROOT_GRANTED)
+        })
+        repeat(3) { assertFalse(repository.ensureRootForTask()) }
+        assertEquals(0, calls)
+        assertFalse(repository.canUseRootNow())
+    }
+
+    @Test fun `successful verification is reused briefly but a process restart must recheck`() = runBlocking {
+        val preferences = MemoryRootUsagePreferences()
+        var clock = 1_000L
+        var calls = 0
+        val probe = RootProbe { calls++; RootCapability(RootState.ROOT_GRANTED) }
+        val repository = DeviceCapabilityRepository(PassiveDeviceProbe { snapshot }, probe, { clock }, preferences)
+        repository.requestRoot()
+        repeat(3) { assertTrue(repository.ensureRootForTask()) }
+        assertEquals(1, calls)
+        clock += 60_000
+        assertTrue(repository.ensureRootForTask())
+        assertEquals(2, calls)
+        val restarted = DeviceCapabilityRepository(PassiveDeviceProbe { snapshot }, probe, { clock }, preferences)
+        assertEquals(RootState.UNKNOWN, restarted.capabilities.value.root.state)
+        assertFalse(restarted.canUseRootNow())
+        assertTrue(restarted.ensureRootForTask())
+        assertEquals(3, calls)
+    }
+
+    @Test fun `explicit off preference persists and never launches an automatic probe`() = runBlocking {
+        val preferences = MemoryRootUsagePreferences()
+        var calls = 0
+        val probe = RootProbe { calls++; RootCapability(RootState.ROOT_GRANTED) }
+        val repository = DeviceCapabilityRepository(PassiveDeviceProbe { snapshot }, probe, rootUsagePreferences = preferences)
+        repository.requestRoot()
+        repository.setRootUsageEnabled(false)
+        assertFalse(repository.canUseRootNow())
+        assertFalse(repository.ensureRootForTask())
+        val restarted = DeviceCapabilityRepository(PassiveDeviceProbe { snapshot }, probe, rootUsagePreferences = preferences)
+        assertFalse(restarted.capabilities.value.rootUsage.enabled)
+        assertFalse(restarted.ensureRootForTask())
+        assertEquals(1, calls)
+    }
+
+    @Test fun `failed recheck stops automatic su calls even across restart until explicit verification`() = runBlocking {
+        val preferences = MemoryRootUsagePreferences(RootUsageSettings(previouslyVerified = true, autoVerificationAllowed = true))
+        var calls = 0
+        var granted = false
+        val probe = RootProbe { calls++; RootCapability(if (granted) RootState.ROOT_GRANTED else RootState.ROOT_DENIED) }
+        val repository = DeviceCapabilityRepository(PassiveDeviceProbe { snapshot }, probe, rootUsagePreferences = preferences)
+        repeat(3) { assertFalse(repository.ensureRootForTask()) }
+        assertEquals(1, calls)
+        val restarted = DeviceCapabilityRepository(PassiveDeviceProbe { snapshot }, probe, rootUsagePreferences = preferences)
+        assertFalse(restarted.ensureRootForTask())
+        assertEquals(1, calls)
+        granted = true
+        restarted.requestRoot()
+        assertTrue(restarted.ensureRootForTask())
+        assertEquals(2, calls)
+    }
+
+    @Test fun `backend root failure immediately clears positive cache and suppresses repeated attempts`() = runBlocking {
+        var calls = 0
+        val repository = DeviceCapabilityRepository(PassiveDeviceProbe { snapshot }, RootProbe {
+            calls++
+            RootCapability(RootState.ROOT_GRANTED)
+        })
+        repository.requestRoot()
+        assertTrue(repository.canUseRootNow())
+        repository.reportRootUnavailable()
+        assertFalse(repository.canUseRootNow())
+        repeat(3) { assertFalse(repository.ensureRootForTask()) }
+        assertTrue(repository.capabilities.value.rootUsage.enabled)
+        assertFalse(repository.capabilities.value.rootUsage.autoVerificationAllowed)
+        assertEquals(1, calls)
+    }
+
+    @Test fun `automatic task check uses the short probe and does not queue concurrent su requests`() = runBlocking {
+        withTimeout(5_000) {
+            val entered = CompletableDeferred<Unit>()
+            val release = CompletableDeferred<Unit>()
+            var manualCalls = 0
+            var automaticCalls = 0
+            val repository = DeviceCapabilityRepository(
+                PassiveDeviceProbe { snapshot },
+                RootProbe { manualCalls++; RootCapability(RootState.ROOT_GRANTED) },
+                rootUsagePreferences = MemoryRootUsagePreferences(RootUsageSettings(previouslyVerified = true, autoVerificationAllowed = true)),
+                automaticRootProbe = RootProbe {
+                    automaticCalls++
+                    entered.complete(Unit)
+                    release.await()
+                    RootCapability(RootState.ROOT_GRANTED)
+                },
+            )
+            val first = async { repository.ensureRootForTask() }
+            entered.await()
+            assertFalse(repository.ensureRootForTask())
+            assertEquals(1, automaticCalls)
+            assertEquals(0, manualCalls)
+            release.complete(Unit)
+            assertTrue(first.await())
+        }
+    }
 }

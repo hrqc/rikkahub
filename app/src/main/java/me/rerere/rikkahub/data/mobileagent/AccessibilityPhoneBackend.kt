@@ -40,7 +40,11 @@ import kotlin.math.max
 import kotlin.math.min
 
 /** The only Android bridge that can read nodes or dispatch phone actions. */
-class AccessibilityPhoneBackend(context: Context) : PhoneBackend {
+class AccessibilityPhoneBackend(
+    context: Context,
+    private val rootAllowed: () -> Boolean = { false },
+    private val onRootUnavailable: () -> Unit = {},
+) : PhoneBackend {
     private val context = context.applicationContext
     private val keyguard = this.context.getSystemService(KeyguardManager::class.java)
     private val power = this.context.getSystemService(PowerManager::class.java)
@@ -223,6 +227,8 @@ class AccessibilityPhoneBackend(context: Context) : PhoneBackend {
                                 truncated = tree.truncated,
                                 sensitive = tree.sensitive,
                                 fingerprint = tree.fingerprint,
+                                previewTruncated = tree.previewTruncated,
+                                inspectionIssues = tree.inspectionIssues,
                             )
                             Snapshot(permit.token, observation, tree)
                         } catch (_: TreeReadAborted) {
@@ -270,29 +276,50 @@ class AccessibilityPhoneBackend(context: Context) : PhoneBackend {
                         if (latest.fingerprint != stored.tree.fingerprint) {
                             throw PhoneControlException("STALE_WINDOW", "页面内容已改变，请重新观察后操作。")
                         }
+                        val actionNodeId = when (action) {
+                            is PhoneAction.Click -> action.nodeId
+                            is PhoneAction.LongClick -> action.nodeId
+                            is PhoneAction.InputText -> action.nodeId
+                            else -> null
+                        }
+                        if (actionNodeId != null && latest.nodes.any { it.id == actionNodeId && it.requiresUserConfirmation }) {
+                            fail("PURCHASE_CONFIRMATION_REQUIRED", "该动作涉及下单、付款或账户权益变更，请用户亲自确认。")
+                        }
                         requireRevision(permit, stored.observation.windowRevision)
                         when (action) {
                             PhoneAction.Screenshot -> takeTargetScreenshot(permit, stored.observation)
-                            PhoneAction.Back -> {
-                                if (permit.useRoot) runRoot(permit, RootInputAction.Back)
-                                else accepted(service.get()!!.performGlobalAction(AccessibilityService.GLOBAL_ACTION_BACK))
-                            }
+                            PhoneAction.Back -> standardActionThenRoot(
+                                standard = { service.get()!!.performGlobalAction(AccessibilityService.GLOBAL_ACTION_BACK) },
+                                rootEligible = { canUseRoot(permit) },
+                                validateFresh = { requireRootFallbackSnapshot(permit, stored) },
+                                root = { runRoot(permit, RootInputAction.Back, stored.observation.windowRevision) },
+                            )
                             is PhoneAction.Swipe -> swipe(permit, action.direction, activeWindowBounds())
                             is PhoneAction.Click -> withNode(root, stored, action.nodeId, permit) { node ->
                                 if (!node.isClickable) fail("ACTION_UNSUPPORTED", "该节点不支持点击。")
-                                if (permit.useRoot) {
-                                    val point = nodeCenter(node)
-                                    requireGestureRegion(point.first, point.second, point.first, point.second)
-                                    runRoot(permit, RootInputAction.Tap(point.first, point.second))
-                                } else accepted(node.performAction(AccessibilityNodeInfo.ACTION_CLICK))
+                                standardActionThenRoot(
+                                    standard = { node.performAction(AccessibilityNodeInfo.ACTION_CLICK) },
+                                    rootEligible = { canUseRoot(permit) },
+                                    validateFresh = { requireRootFallbackSnapshot(permit, stored) },
+                                    root = {
+                                        val point = nodeCenter(node)
+                                        requireGestureRegion(point.first, point.second, point.first, point.second)
+                                        runRoot(permit, RootInputAction.Tap(point.first, point.second), stored.observation.windowRevision)
+                                    },
+                                )
                             }
                             is PhoneAction.LongClick -> withNode(root, stored, action.nodeId, permit) { node ->
                                 if (!node.isLongClickable) fail("ACTION_UNSUPPORTED", "该节点不支持长按。")
-                                if (permit.useRoot) {
-                                    val point = nodeCenter(node)
-                                    requireGestureRegion(point.first, point.second, point.first, point.second)
-                                    runRoot(permit, RootInputAction.LongPress(point.first, point.second))
-                                } else accepted(node.performAction(AccessibilityNodeInfo.ACTION_LONG_CLICK))
+                                standardActionThenRoot(
+                                    standard = { node.performAction(AccessibilityNodeInfo.ACTION_LONG_CLICK) },
+                                    rootEligible = { canUseRoot(permit) },
+                                    validateFresh = { requireRootFallbackSnapshot(permit, stored) },
+                                    root = {
+                                        val point = nodeCenter(node)
+                                        requireGestureRegion(point.first, point.second, point.first, point.second)
+                                        runRoot(permit, RootInputAction.LongPress(point.first, point.second), stored.observation.windowRevision)
+                                    },
+                                )
                             }
                             is PhoneAction.InputText -> withNode(root, stored, action.nodeId, permit) { node ->
                                 if (!node.isEditable || action.text.length > 2_000) fail("ACTION_UNSUPPORTED", "该节点不可编辑或输入长度超限。")
@@ -303,11 +330,16 @@ class AccessibilityPhoneBackend(context: Context) : PhoneBackend {
                             }
                             is PhoneAction.Scroll -> withNode(root, stored, action.nodeId, permit) { node ->
                                 if (!node.isScrollable) fail("ACTION_UNSUPPORTED", "该节点不支持滚动。")
-                                if (permit.useRoot) {
-                                    val bounds = Rect().also(node::getBoundsInScreen)
-                                    if (!bounds.intersect(activeWindowBounds())) fail("STALE_WINDOW", "节点已离开目标窗口。")
-                                    swipe(permit, if (action.forward) PhoneSwipeDirection.UP else PhoneSwipeDirection.DOWN, bounds)
-                                } else accepted(node.performAction(if (action.forward) AccessibilityNodeInfo.ACTION_SCROLL_FORWARD else AccessibilityNodeInfo.ACTION_SCROLL_BACKWARD))
+                                standardActionThenRoot(
+                                    standard = { node.performAction(if (action.forward) AccessibilityNodeInfo.ACTION_SCROLL_FORWARD else AccessibilityNodeInfo.ACTION_SCROLL_BACKWARD) },
+                                    rootEligible = { canUseRoot(permit) },
+                                    validateFresh = { requireRootFallbackSnapshot(permit, stored) },
+                                    root = {
+                                        val bounds = Rect().also(node::getBoundsInScreen)
+                                        if (!bounds.intersect(activeWindowBounds())) fail("STALE_WINDOW", "节点已离开目标窗口。")
+                                        swipe(permit, if (action.forward) PhoneSwipeDirection.UP else PhoneSwipeDirection.DOWN, bounds)
+                                    },
+                                )
                             }
                             PhoneAction.OpenApp -> error("Handled above")
                         }
@@ -434,16 +466,43 @@ class AccessibilityPhoneBackend(context: Context) : PhoneBackend {
         return PhoneBackendResult(true, "已请求打开目标应用，请等待前台切换后观察。")
     }
 
-    private suspend fun runRoot(permit: PhonePermit, action: RootInputAction): PhoneBackendResult {
-        requirePermit(permit)
-        val result = rootExecutor.execute(action) {
+    private fun canUseRoot(permit: PhonePermit): Boolean = permit.useRoot && rootAllowed()
+
+    /** A false node result does not entitle us to reuse a changed or incompletely inspected page. */
+    private suspend fun requireRootFallbackSnapshot(permit: PhonePermit, stored: Snapshot) {
+        requireRevision(permit, stored.observation.windowRevision)
+        val root = authorizedRoot(permit)
+        try {
+            val latest = withContext(Dispatchers.Default) {
+                reader.capture(root, permit.targetPackage) { validAtRevision(permit, stored.observation.windowRevision) }
+            }
+            if (latest.sensitive || latest.truncated) fail("USER_REQUIRED", "页面需要用户接手，未使用 Root 后备动作。")
+            if (latest.fingerprint != stored.tree.fingerprint) fail("STALE_WINDOW", "页面已经变化，未使用 Root 重复动作。")
+            requireRevision(permit, stored.observation.windowRevision)
+        } finally { recycleNode(root) }
+    }
+
+    private suspend fun runRoot(permit: PhonePermit, action: RootInputAction, expectedRevision: Long = revision.get()): PhoneBackendResult {
+        requireRevision(permit, expectedRevision)
+        if (!canUseRoot(permit)) return PhoneBackendResult(false, "Root 当前不可用，未执行 Root 动作；请重新观察。")
+        val result = rootExecutor.execute(action, canStart = { canUseRoot(permit) && validAtRevision(permit, expectedRevision) }) {
             permit.isValid() && activeNotice.get()?.token == permit.token && !isLocked() &&
-                mutableState.value.foregroundPackage == permit.targetPackage
+                mutableState.value.foregroundPackage == permit.targetPackage && canUseRoot(permit)
+        }
+        if (!result.accepted && permit.isValid() && result.failure in setOf(
+                RootInputFailure.COMMAND_FAILED, RootInputFailure.TIMEOUT, RootInputFailure.UNAVAILABLE, RootInputFailure.OUTPUT_LIMIT,
+            )
+        ) onRootUnavailable()
+        if (result.failure in setOf(RootInputFailure.COMMAND_FAILED, RootInputFailure.TIMEOUT, RootInputFailure.OUTPUT_LIMIT)) {
+            fail("ACTION_RESULT_UNKNOWN", "Root 动作已尝试但未能确认结果，请重新观察核对；不要重复提交。")
         }
         return PhoneBackendResult(result.accepted, result.detail)
     }
 
     private suspend fun swipe(permit: PhonePermit, direction: PhoneSwipeDirection, bounds: Rect): PhoneBackendResult {
+        if (snapshot.get()?.tree?.nodes?.any { it.requiresUserConfirmation } == true) {
+            fail("PURCHASE_CONFIRMATION_REQUIRED", "当前页面包含需要用户确认的交易动作，未执行坐标滑动；请使用安全节点滚动或由用户接手。")
+        }
         if (bounds.width() < 24 || bounds.height() < 24) fail("ACTION_UNSUPPORTED", "目标区域太小，无法安全滑动。")
         val centerX = bounds.centerX()
         val centerY = bounds.centerY()
@@ -459,7 +518,7 @@ class AccessibilityPhoneBackend(context: Context) : PhoneBackend {
         }
         requireGestureRegion(points[0], points[1], points[2], points[3])
         requirePermit(permit)
-        if (permit.useRoot) return runRoot(permit, RootInputAction.Swipe(points[0], points[1], points[2], points[3]))
+        if (canUseRoot(permit)) return runRoot(permit, RootInputAction.Swipe(points[0], points[1], points[2], points[3]))
         val path = Path().apply { moveTo(points[0].toFloat(), points[1].toFloat()); lineTo(points[2].toFloat(), points[3].toFloat()) }
         val gesture = GestureDescription.Builder().addStroke(GestureDescription.StrokeDescription(path, 0, 350)).build()
         val completed = withTimeoutOrNull(2_000) {

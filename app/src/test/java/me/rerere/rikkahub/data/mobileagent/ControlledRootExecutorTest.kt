@@ -36,7 +36,24 @@ class ControlledRootExecutorTest {
     @Test
     fun `invalid permit never starts a process`() = runBlocking {
         val executor = ControlledRootExecutor(startProcess = { error("Must not start") })
-        assertFalse(executor.execute(RootInputAction.Back) { false }.accepted)
+        val result = executor.execute(RootInputAction.Back) { false }
+        assertFalse(result.accepted)
+        assertEquals(RootInputFailure.STALE_OR_CANCELLED, result.failure)
+    }
+
+    @Test fun `stale page before dispatch never starts su even while the session is valid`() = runBlocking {
+        val executor = ControlledRootExecutor(startProcess = { error("Must not start from an old page") })
+        val result = executor.execute(RootInputAction.Back, canStart = { false }) { true }
+        assertEquals(RootInputFailure.STALE_OR_CANCELLED, result.failure)
+    }
+
+    @Test fun `failed process launch is unavailable while a failed running command is uncertain`() = runBlocking {
+        val unavailable = ControlledRootExecutor(startProcess = { throw java.io.IOException("missing") })
+            .execute(RootInputAction.Back) { true }
+        assertEquals(RootInputFailure.UNAVAILABLE, unavailable.failure)
+        val failed = ControlledRootExecutor(startProcess = { CompletedProcess(exit = 1) })
+            .execute(RootInputAction.Back) { true }
+        assertEquals(RootInputFailure.COMMAND_FAILED, failed.failure)
     }
 
     @Test
@@ -47,7 +64,9 @@ class ControlledRootExecutorTest {
             executor.cancel()
             child
         })
-        assertFalse(executor.execute(RootInputAction.Back) { true }.accepted)
+        val result = executor.execute(RootInputAction.Back) { true }
+        assertFalse(result.accepted)
+        assertEquals(RootInputFailure.STALE_OR_CANCELLED, result.failure)
         assertTrue(child.destroyed)
     }
 
@@ -55,7 +74,9 @@ class ControlledRootExecutorTest {
     fun `oversize unexpected output cannot count as a successful action`() = runBlocking {
         val child = CompletedProcess("x".repeat(8_192))
         val executor = ControlledRootExecutor(startProcess = { child })
-        assertFalse(executor.execute(RootInputAction.Back) { true }.accepted)
+        val result = executor.execute(RootInputAction.Back) { true }
+        assertFalse(result.accepted)
+        assertEquals(RootInputFailure.OUTPUT_LIMIT, result.failure)
         assertTrue(child.destroyed)
     }
 
@@ -67,6 +88,7 @@ class ControlledRootExecutorTest {
                 val result = ControlledRootExecutor(timeoutMillis = 250, startProcess = { child })
                     .execute(RootInputAction.Back) { true }
                 assertFalse(result.accepted)
+                assertEquals(RootInputFailure.TIMEOUT, result.failure)
                 assertTrue(runInterruptible(Dispatchers.IO) { child.waitFor(2, TimeUnit.SECONDS) })
             } finally { child.destroyForcibly() }
         }
@@ -142,13 +164,13 @@ class ControlledRootExecutorTest {
         return ProcessBuilder(java.absolutePath, "-cp", classpath, RootInputBlockingChild::class.java.name).start()
     }
 
-    private class CompletedProcess(private val output: String = "") : Process() {
+    private class CompletedProcess(private val output: String = "", private val exit: Int = 0) : Process() {
         var destroyed = false
         override fun getInputStream() = ByteArrayInputStream(output.toByteArray())
         override fun getErrorStream() = ByteArrayInputStream(ByteArray(0))
         override fun getOutputStream() = ByteArrayOutputStream()
-        override fun waitFor() = 0
-        override fun exitValue() = 0
+        override fun waitFor() = exit
+        override fun exitValue() = exit
         override fun isAlive() = false
         override fun destroy() { destroyed = true }
     }

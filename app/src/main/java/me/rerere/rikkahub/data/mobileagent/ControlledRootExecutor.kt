@@ -20,7 +20,8 @@ internal sealed interface RootInputAction {
     data object Back : RootInputAction
 }
 
-internal data class RootInputResult(val accepted: Boolean, val detail: String)
+internal enum class RootInputFailure { STALE_OR_CANCELLED, BUSY, COMMAND_FAILED, TIMEOUT, UNAVAILABLE, OUTPUT_LIMIT }
+internal data class RootInputResult(val accepted: Boolean, val detail: String, val failure: RootInputFailure? = null)
 
 internal fun rootInputCommand(action: RootInputAction): String {
     fun coordinate(value: Int): Int = value.also { require(it in 0..65_535) }
@@ -60,31 +61,33 @@ internal class ControlledRootExecutor(
         }
     }
 
-    suspend fun execute(action: RootInputAction, isValid: () -> Boolean): RootInputResult = withContext(Dispatchers.IO) {
+    suspend fun execute(action: RootInputAction, canStart: (() -> Boolean)? = null, isValid: () -> Boolean): RootInputResult = withContext(Dispatchers.IO) {
         val command = rootInputCommand(action)
         val startEpoch = epoch.get()
+        var processStarted = false
         fun allowed() = startEpoch == epoch.get() && isValid()
-        if (!allowed()) return@withContext RootInputResult(false, "执行许可已失效。")
+        if (!allowed() || canStart?.invoke() == false) return@withContext RootInputResult(false, "执行许可或页面已失效。", RootInputFailure.STALE_OR_CANCELLED)
         try {
             withTimeoutOrNull(timeoutMillis) {
                 coroutineScope {
-                    if (!allowed()) return@coroutineScope RootInputResult(false, "执行许可已失效。")
+                    if (!allowed() || canStart?.invoke() == false) return@coroutineScope RootInputResult(false, "执行许可或页面已失效。", RootInputFailure.STALE_OR_CANCELLED)
                     val process = startProcess(command)
+                    processStarted = true
                     if (!activeProcess.compareAndSet(null, process)) {
                         destroy(process)
-                        return@coroutineScope RootInputResult(false, "已有 Root 动作正在执行。")
+                        return@coroutineScope RootInputResult(false, "已有 Root 动作正在执行。", RootInputFailure.BUSY)
                     }
                     try {
                         // Covers STOP between the last check, Process.start(), and registration.
-                        if (!allowed()) return@coroutineScope RootInputResult(false, "执行许可已失效。")
+                        if (!allowed()) return@coroutineScope RootInputResult(false, "执行许可已失效。", RootInputFailure.STALE_OR_CANCELLED)
                         val stdout = async(Dispatchers.IO) { runInterruptible { drainBounded(process.inputStream) } }
                         val stderr = async(Dispatchers.IO) { runInterruptible { drainBounded(process.errorStream) } }
                         val exit = runInterruptible { process.waitFor() }
                         val outputWithinLimit = stdout.await() && stderr.await()
                         when {
-                            !allowed() -> RootInputResult(false, "执行期间会话已停止或窗口已改变。")
-                            !outputWithinLimit -> RootInputResult(false, "Root 动作输出超限，需重新观察。")
-                            exit != 0 -> RootInputResult(false, "Root 动作未成功完成；请检查管理器授权并重新观察。")
+                            !allowed() -> RootInputResult(false, "执行期间会话已停止或窗口已改变。", RootInputFailure.STALE_OR_CANCELLED)
+                            !outputWithinLimit -> RootInputResult(false, "Root 动作输出超限，可能已执行；请先观察，不要直接重试。", RootInputFailure.OUTPUT_LIMIT)
+                            exit != 0 -> RootInputResult(false, "Root 动作未正常完成；先检查页面结果，不要直接重复动作。", RootInputFailure.COMMAND_FAILED)
                             else -> RootInputResult(true, "Root 输入命令已完成，仍需重新观察确认界面结果。")
                         }
                     } finally {
@@ -92,11 +95,12 @@ internal class ControlledRootExecutor(
                         destroy(process)
                     }
                 }
-            } ?: RootInputResult(false, "Root 动作超时，已停止等待并终止命令进程。")
+            } ?: RootInputResult(false, "Root 动作超时，已终止命令进程；可能已部分执行，先观察再判断，不要直接重试。", RootInputFailure.TIMEOUT)
         } catch (cancelled: CancellationException) {
             throw cancelled
         } catch (_: Exception) {
-            RootInputResult(false, "Root 输入后端不可用；未改用其他执行方式。")
+            if (processStarted) RootInputResult(false, "Root 动作已尝试但结果未知；请先观察，不要直接重试。", RootInputFailure.COMMAND_FAILED)
+            else RootInputResult(false, "Root 输入后端不可用，未启动 Root 动作。", RootInputFailure.UNAVAILABLE)
         }
     }
 

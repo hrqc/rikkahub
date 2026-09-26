@@ -68,6 +68,14 @@ class DeviceCapabilitiesVM(
         }
     }
 
+    fun setRootUsageEnabled(enabled: Boolean) {
+        try {
+            repository.setRootUsageEnabled(enabled)
+        } catch (_: Exception) {
+            _message.value = "未能保存 Root 使用偏好，请重试。"
+        }
+    }
+
     fun cancelRootProbe(showMessage: Boolean = true) {
         val wasRunning = rootJob?.isActive == true || capabilities.value.rootProbeRunning
         rootJob?.cancel()

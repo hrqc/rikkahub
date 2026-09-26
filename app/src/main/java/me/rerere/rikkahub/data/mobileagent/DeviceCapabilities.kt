@@ -9,7 +9,7 @@ enum class RootState {
 
 data class RootCapability(
     val state: RootState = RootState.UNKNOWN,
-    val detail: String = "尚未检查 Root 授权。仅在点击检查后运行固定的只读命令。",
+    val detail: String = "尚未验证 Root。首次验证需要你明确申请；曾验证成功后可自动短时复核。",
     val checkedAtEpochMillis: Long? = null,
 )
 
@@ -28,7 +28,7 @@ data class DeviceCapability(
     val detail: String,
 )
 
-/** Observations for this process only; neither permissions nor Root grants are persisted. */
+/** Observations and grants remain process-local; rootUsage stores a choice and history only. */
 data class DeviceCapabilities(
     val deviceManufacturer: String = "",
     val deviceModel: String = "",
@@ -36,6 +36,7 @@ data class DeviceCapabilities(
     val apiLevel: Int = 0,
     val root: RootCapability = RootCapability(),
     val rootProbeRunning: Boolean = false,
+    val rootUsage: RootUsageSettings = RootUsageSettings(),
     val capabilities: List<DeviceCapability> = emptyList(),
     val refreshedAtEpochMillis: Long? = null,
 )

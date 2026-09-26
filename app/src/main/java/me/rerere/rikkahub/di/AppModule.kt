@@ -86,6 +86,7 @@ val appModule = module {
             workspaceRepository = get(),
             phoneController = get(),
             phoneIntentStore = get(),
+            researchRepository = get(),
         )
     }
 

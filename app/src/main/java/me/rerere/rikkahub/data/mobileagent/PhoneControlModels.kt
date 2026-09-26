@@ -71,6 +71,7 @@ data class PhoneNode(
     val scrollable: Boolean = false,
     val enabled: Boolean = true,
     val password: Boolean = false,
+    val requiresUserConfirmation: Boolean = false,
 )
 
 @Serializable
@@ -84,6 +85,8 @@ data class PhoneObservation(
     val truncated: Boolean,
     val sensitive: Boolean,
     val fingerprint: String,
+    val previewTruncated: Boolean = false,
+    val inspectionIssues: List<String> = emptyList(),
 )
 
 enum class PhoneSwipeDirection { UP, DOWN, LEFT, RIGHT }

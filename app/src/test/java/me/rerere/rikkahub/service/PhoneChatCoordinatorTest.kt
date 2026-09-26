@@ -3,6 +3,7 @@ package me.rerere.rikkahub.service
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.CoroutineDispatcher
 import kotlinx.coroutines.CompletableJob
+import kotlinx.coroutines.CompletableDeferred
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.SupervisorJob
@@ -21,6 +22,7 @@ class PhoneChatCoordinatorTest {
     private class Fixture(
         val apps: List<PhoneTargetApp> = listOf(PhoneTargetApp("com.example.calc", "计算器")),
         dispatcher: CoroutineDispatcher = Dispatchers.Unconfined,
+        selectRoot: suspend () -> Boolean = { false },
     ) : AutoCloseable {
         val scope = CoroutineScope(SupervisorJob() + dispatcher)
         val backend = Backend()
@@ -31,6 +33,7 @@ class PhoneChatCoordinatorTest {
             scope, host, controller, backend, intents,
             loadTargets = { apps }, resolveTargets = { name, available -> PhoneTargetAppRepository.resolve(name, available) },
             preparationTimeoutMillis = 1_000,
+            selectRootForTask = selectRoot,
         )
         private var sequence = 0
         init {
@@ -94,6 +97,42 @@ class PhoneChatCoordinatorTest {
             opens++
             state.value = state.value.copy(foregroundPackage = permit.targetPackage, windowId = 2)
             return PhoneBackendResult(true, "opened")
+        }
+    }
+
+    @Test fun `confirmed chat task automatically selects verified root and reselects on resume`() = runBlocking {
+        var rootAvailable = true
+        var checks = 0
+        Fixture(selectRoot = { checks++; rootAvailable }).use { f ->
+            val proposal = f.propose("帮我在计算器里算一下")!!
+            f.await(PhoneChatPhase.CONFIRM)
+            assertEquals(0, checks)
+            f.coordinator.accept(proposal.id, "com.example.calc")
+            f.await(PhoneChatPhase.RUNNING)
+            assertTrue(f.controller.state.value.useRoot)
+            assertFalse(f.controller.state.value.allowScreenshots)
+            f.coordinator.pause()
+            f.await(PhoneChatPhase.PAUSED)
+            rootAvailable = false
+            f.coordinator.resume()
+            f.await(PhoneChatPhase.RUNNING)
+            assertFalse(f.controller.state.value.useRoot)
+            assertEquals(2, checks)
+        }
+    }
+
+    @Test fun `stop during root availability check cannot launch the delayed task`() = runBlocking {
+        val checked = CompletableDeferred<Boolean>()
+        Fixture(selectRoot = { checked.await() }).use { f ->
+            f.propose("打开计算器")
+            f.await(PhoneChatPhase.PREPARING)
+            f.coordinator.stop()
+            checked.complete(true)
+            yield()
+            assertEquals(0, f.backend.opens)
+            assertTrue(f.host.submitted.isEmpty())
+            assertNull(f.controller.activeToken("chat", "assistant"))
+            assertEquals(PhoneChatPhase.ENDED, f.coordinator.state.value.phase)
         }
     }
 

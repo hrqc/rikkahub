@@ -24,7 +24,6 @@ import me.rerere.rikkahub.data.mobileagent.PhoneController
 import me.rerere.rikkahub.data.mobileagent.PhoneSessionStatus
 import me.rerere.rikkahub.data.mobileagent.PhoneSessionToken
 import me.rerere.rikkahub.data.mobileagent.PhoneTaskLauncher
-import me.rerere.rikkahub.data.mobileagent.RootState
 import me.rerere.rikkahub.service.ChatService
 import kotlin.uuid.Uuid
 
@@ -74,6 +73,9 @@ class MobileControlVM(
     private var preparationToken: PhoneSessionToken? = null
     private var preparationSequence = 0L
     private var pendingModelTask: Pair<String, String>? = null
+    private var rootSelectionJob: Job? = null
+    private var selectingRoot = false
+    private var cancellingGeneration = false
     private val taskControlOwner = Any()
 
     init {
@@ -149,26 +151,33 @@ class MobileControlVM(
             _message.value = "请从列表明确选择一个目标应用。"
             return
         }
-        if (useRoot && capabilities.value.root.state != RootState.ROOT_GRANTED) {
-            _message.value = "请先在设备能力页手动验证 Root，或关闭本次 Root 增强。"
-            return
-        }
         if (allowScreenshots && !backend.supportsScreenshot) {
             _message.value = "当前截图后端不可用，请关闭允许截图后继续。"
             return
         }
-        var startedToken: PhoneSessionToken? = null
-        try {
-            val token = controller.start(conversationId, assistantId, targetPackage, useRoot, allowScreenshots)
-            startedToken = token
-            _preparedSessionId.value = token.sessionId.takeIf { prepareOnly }
-            _modelSessionId.value = token.sessionId.takeUnless { prepareOnly }
-            pendingModelTask = (token.sessionId to task.trim()).takeUnless { prepareOnly }
-            registerTaskControls(token)
-            if (!prepareOnly) prepareAndSend(token, task.trim())
-        } catch (error: Exception) {
-            startedToken?.let { controller.pauseIfCurrent(it, "未能准备模型任务，请检查后恢复") }
-            _message.value = safeMessage(error, "未能开始手机任务，请检查状态后重试。")
+        selectingRoot = true
+        updateBusy()
+        rootSelectionJob = viewModelScope.launch {
+            var startedToken: PhoneSessionToken? = null
+            try {
+                val rootAvailable = useRoot && capabilityRepository.ensureRootForTask()
+                if (!validateConversation(requireModel = !prepareOnly)) return@launch
+                val token = controller.start(conversationId, assistantId, targetPackage, rootAvailable, allowScreenshots, replaceExisting = false)
+                startedToken = token
+                _preparedSessionId.value = token.sessionId.takeIf { prepareOnly }
+                _modelSessionId.value = token.sessionId.takeUnless { prepareOnly }
+                pendingModelTask = (token.sessionId to task.trim()).takeUnless { prepareOnly }
+                registerTaskControls(token)
+                if (!prepareOnly) prepareAndSend(token, task.trim())
+            } catch (cancelled: CancellationException) {
+                throw cancelled
+            } catch (error: Exception) {
+                startedToken?.let { controller.pauseIfCurrent(it, "未能准备模型任务，请检查后恢复") }
+                _message.value = safeMessage(error, "未能开始手机任务，请检查状态后重试。")
+            } finally {
+                selectingRoot = false
+                updateBusy()
+            }
         }
     }
 
@@ -192,22 +201,34 @@ class MobileControlVM(
         }
         if (!ownsSession() || _busy.value || _openingTarget.value || !validateConversation(requireModel = !prepareOnly)) return
         _message.value = null
-        var resumedToken: PhoneSessionToken? = null
-        try {
-            val token = controller.resume()
-            resumedToken = token
-            registerTaskControls(token)
-            if (prepareOnly) {
-                _preparedSessionId.value = token.sessionId
-            } else {
-                _modelSessionId.value = token.sessionId
-                val task = pendingModelTask?.takeIf { it.first == token.sessionId }?.second
-                    ?: "继续刚才未完成的手机操作任务。目标应用已在本地打开，请先重新读取当前页面，再决定下一步操作。"
-                prepareAndSend(token, task)
+        val expectedToken = session.value.token ?: return
+        selectingRoot = true
+        updateBusy()
+        rootSelectionJob = viewModelScope.launch {
+            var resumedToken: PhoneSessionToken? = null
+            try {
+                val rootAvailable = capabilityRepository.ensureRootForTask()
+                if (session.value.token != expectedToken || !validateConversation(requireModel = !prepareOnly)) return@launch
+                val token = controller.resume(useRoot = rootAvailable)
+                resumedToken = token
+                registerTaskControls(token)
+                if (prepareOnly) {
+                    _preparedSessionId.value = token.sessionId
+                } else {
+                    _modelSessionId.value = token.sessionId
+                    val task = pendingModelTask?.takeIf { it.first == token.sessionId }?.second
+                        ?: "继续刚才未完成的手机操作任务。目标应用已在本地打开，请先重新读取当前页面，再决定下一步操作。"
+                    prepareAndSend(token, task)
+                }
+            } catch (cancelled: CancellationException) {
+                throw cancelled
+            } catch (error: Exception) {
+                resumedToken?.let { controller.pauseIfCurrent(it, "未能准备恢复任务，请检查后恢复") }
+                _message.value = safeMessage(error, "未能恢复任务，请检查状态后重试。")
+            } finally {
+                selectingRoot = false
+                updateBusy()
             }
-        } catch (error: Exception) {
-            resumedToken?.let { controller.pauseIfCurrent(it, "未能准备恢复任务，请检查后恢复") }
-            _message.value = safeMessage(error, "未能恢复任务，请检查状态后重试。")
         }
     }
 
@@ -215,6 +236,7 @@ class MobileControlVM(
         // Revocation is synchronous: STOP must not wait for network cancellation or a UI coroutine.
         controller.taskControls.unregister(taskControlOwner)
         controller.stopForConversation(conversationId)
+        rootSelectionJob?.cancel()
         cancelPreparation()
         cancelGeneration()
     }
@@ -291,7 +313,8 @@ class MobileControlVM(
     private fun cancelGeneration() {
         if (cancelGenerationJob?.isActive == true) return
         val captured = modelGenerationJob ?: return
-        _busy.value = true
+        cancellingGeneration = true
+        updateBusy()
         cancelGenerationJob = viewModelScope.launch(Dispatchers.Main) {
             try {
                 chatService.cancelPhoneTaskGeneration(conversationUuid, captured)
@@ -301,7 +324,8 @@ class MobileControlVM(
                 _message.value = "设备操作已撤销，但尚未确认聊天生成结束。请返回聊天检查并停止生成。"
             } finally {
                 if (modelGenerationJob === captured) modelGenerationJob = null
-                _busy.value = false
+                cancellingGeneration = false
+                updateBusy()
             }
         }
     }
@@ -329,6 +353,16 @@ class MobileControlVM(
     } == true
 
     fun dismissMessage() { _message.value = null }
+
+    private fun updateBusy() { _busy.value = selectingRoot || cancellingGeneration }
+
+    fun setRootUsageEnabled(enabled: Boolean) {
+        try {
+            capabilityRepository.setRootUsageEnabled(enabled)
+        } catch (_: Exception) {
+            _message.value = "未能保存 Root 使用偏好，请重试。"
+        }
+    }
 
     override fun onCleared() {
         controller.taskControls.unregister(taskControlOwner)

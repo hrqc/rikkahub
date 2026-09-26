@@ -54,6 +54,7 @@ class PhoneChatCoordinator(
     private val loadTargets: suspend () -> List<PhoneTargetApp>,
     private val resolveTargets: (String, List<PhoneTargetApp>) -> List<PhoneTargetApp>,
     private val preparationTimeoutMillis: Long = 60_000,
+    private val selectRootForTask: suspend () -> Boolean = { false },
 ) {
     private val launcher = PhoneTaskLauncher(controller, backend, preparationTimeoutMillis)
     private val visible = MutableStateFlow(false)
@@ -212,9 +213,12 @@ class PhoneChatCoordinator(
                     ?: throw PhoneControlException("TARGET_UNAVAILABLE", "所选应用已不可用，请重新发送任务。")
                 if (expected != sequence || !isCurrent(accepted.binding)) return@launch
                 requireModel()
+                val useRoot = selectRootForTask()
+                if (expected != sequence || !isCurrent(accepted.binding)) return@launch
+                requireModel()
                 val token = controller.start(
                     accepted.binding.conversationId, accepted.binding.assistantId, target.packageName,
-                    useRoot = false, allowScreenshots = false, replaceExisting = false,
+                    useRoot = useRoot, allowScreenshots = false, replaceExisting = false,
                 )
                 val task = Task(accepted.binding, target, token)
                 pendingLaunch = null
@@ -270,7 +274,10 @@ class PhoneChatCoordinator(
                 previous.generation?.join()
                 if (expected != sequence || !isCurrent(previous.binding) || matchingToken(previous) == null) return@launch
                 requireModel()
-                val task = Task(previous.binding, previous.target, controller.resume())
+                val useRoot = selectRootForTask()
+                if (expected != sequence || !isCurrent(previous.binding) || matchingToken(previous) == null) return@launch
+                requireModel()
+                val task = Task(previous.binding, previous.target, controller.resume(useRoot = useRoot))
                 currentTask = task
                 registerTaskControls(task)
                 runTask(task)

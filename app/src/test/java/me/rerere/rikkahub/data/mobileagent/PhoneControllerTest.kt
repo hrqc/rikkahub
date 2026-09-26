@@ -31,6 +31,7 @@ class PhoneControllerTest {
         var noticeAllowed = true
         var sensitive = false
         var truncated = false
+        var previewTruncated = false
         var password = false
         var text = "Safe button"
         var fingerprint = "page"
@@ -59,7 +60,7 @@ class PhoneControllerTest {
                 listOf(PhoneNode("button", text = text, bounds = PhoneBounds(0, 0, 50, 50), clickable = true, password = password),
                     PhoneNode("editor", bounds = PhoneBounds(0, 50, 100, 100), editable = true),
                     PhoneNode("scroll", bounds = PhoneBounds(0, 100, 100, 500), scrollable = true)),
-                truncated, sensitive, fingerprint,
+                truncated, sensitive, fingerprint, previewTruncated = previewTruncated,
             )
         }
         override suspend fun execute(permit: PhonePermit, observation: PhoneObservation?, action: PhoneAction): PhoneBackendResult {
@@ -73,6 +74,27 @@ class PhoneControllerTest {
 
     private inline fun expectCode(code: String, block: () -> Unit) {
         try { block(); fail("Expected $code") } catch (error: PhoneControlException) { assertEquals(code, error.code) }
+    }
+
+    @Test fun `shopping evidence is bounded to real observations and current grant`() = runBlocking {
+        Fixture().use { f ->
+            val token = f.start()
+            assertTrue(f.controller.shoppingEvidence(token).isEmpty())
+            repeat(10) { f.controller.observe(token) }
+            val evidence = f.controller.shoppingEvidence(token)
+            assertEquals(8, evidence.size)
+            assertEquals("snapshot3", evidence.first().snapshotId)
+            assertEquals("Safe button", evidence.last().nodes.first().text)
+            f.controller.pause()
+            assertTrue(f.controller.shoppingEvidence(token).isEmpty())
+            val resumed = f.controller.resume()
+            assertTrue(f.controller.shoppingEvidence(resumed).isEmpty())
+            f.controller.observe(resumed)
+            assertEquals(1, f.controller.shoppingEvidence(resumed).size)
+            f.controller.stop()
+            assertTrue(f.controller.shoppingEvidence(resumed).isEmpty())
+            assertTrue(f.controller.shoppingEvidence(f.start()).isEmpty())
+        }
     }
 
     @Test fun `live activity follows actual model observation and dispatch lifecycle`() = runBlocking {
@@ -376,13 +398,26 @@ class PhoneControllerTest {
             Fixture().use { f ->
                 f.backend.sensitive = kind == "flag"
                 f.backend.password = kind == "password"
-                f.backend.text = when (kind) { "payment" -> "确认付款"; "otp" -> "验证码 123456"; else -> "private text" }
+                f.backend.text = when (kind) { "payment" -> "支付密码"; "otp" -> "验证码 123456"; else -> "private text" }
                 val token = f.start()
                 expectCode("USER_HANDOVER_REQUIRED") { f.controller.observe(token) }
                 assertEquals(PhoneSessionStatus.PAUSED, f.controller.state.value.status)
                 assertFalse(f.controller.state.value.audit.toString().contains("123456"))
                 assertEquals(0, f.backend.actions)
             }
+        }
+    }
+
+    @Test fun `coordinate swipe cannot activate payment sliders`() = runBlocking {
+        Fixture().use { f ->
+            val token = f.start()
+            f.backend.text = "滑动确认支付"
+            val screen = f.controller.observe(token)
+            expectCode("PURCHASE_CONFIRMATION_REQUIRED") {
+                f.controller.act(token, screen.id, PhoneAction.Swipe(PhoneSwipeDirection.RIGHT))
+            }
+            assertEquals(0, f.backend.actions)
+            assertEquals(PhoneSessionStatus.PAUSED, f.controller.state.value.status)
         }
     }
 
@@ -393,6 +428,28 @@ class PhoneControllerTest {
             val snapshot = f.controller.observe(token)
             expectCode("INCOMPLETE_SCREEN") { f.controller.act(token, snapshot.id, PhoneAction.Click("button")) }
             expectCode("INCOMPLETE_SCREEN") { f.controller.act(token, snapshot.id, PhoneAction.Screenshot) }
+        }
+    }
+
+    @Test fun `safe preview compression still permits navigation but final purchase is local guarded`() = runBlocking {
+        Fixture().use { f ->
+            f.backend.previewTruncated = true
+            val token = f.start()
+            val screen = f.controller.observe(token)
+            assertTrue(screen.previewTruncated)
+            assertFalse(screen.truncated)
+            assertTrue(f.controller.act(token, screen.id, PhoneAction.Scroll("scroll", true)).accepted)
+        }
+        listOf("确认付款", "提交订单", "开通会员", "免费试用", "使用积分").forEach { label ->
+            Fixture().use { f ->
+                f.backend.text = label
+                val token = f.start()
+                val screen = f.controller.observe(token)
+                assertEquals(label, screen.nodes.first().text)
+                expectCode("PURCHASE_CONFIRMATION_REQUIRED") { f.controller.act(token, screen.id, PhoneAction.Click("button")) }
+                assertEquals(0, f.backend.actions)
+                assertEquals(PhoneSessionStatus.PAUSED, f.controller.state.value.status)
+            }
         }
     }
 

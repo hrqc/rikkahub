@@ -12,6 +12,7 @@ import androidx.compose.material3.CircularProgressIndicator
 import androidx.compose.material3.LargeFlexibleTopAppBar
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.Scaffold
+import androidx.compose.material3.Switch
 import androidx.compose.material3.Text
 import androidx.compose.material3.TextButton
 import androidx.compose.material3.TopAppBarDefaults
@@ -123,7 +124,7 @@ fun DeviceCapabilitiesPage(vm: DeviceCapabilitiesVM = koinViewModel()) {
                         headlineContent = { Text("能力检测") },
                         supportingContent = {
                             Column(verticalArrangement = Arrangement.spacedBy(4.dp)) {
-                                Text("本页显示设备与服务的实际状态。请从聊天的更多菜单进入手机控制面板，选择目标应用并开始任务。刷新不会申请 Root 或无障碍权限。")
+                                Text("本页显示设备与服务的实际状态。可直接在聊天提出手机操作，也可使用高级控制面板。刷新不会申请 Root 或无障碍权限。")
                                 snapshot.refreshedAtEpochMillis?.let {
                                     Text("最近刷新：${formatCapabilityTime(it)}")
                                 }
@@ -162,7 +163,7 @@ fun DeviceCapabilitiesPage(vm: DeviceCapabilitiesVM = koinViewModel()) {
                                 snapshot.root.checkedAtEpochMillis?.let {
                                     Text("最近检测：${formatCapabilityTime(it)}")
                                 }
-                                Text("只有点击下方按钮才会向设备的 Root 管理器申请权限。拒绝或取消后仍可继续使用应用。")
+                                Text("首次请点击下方按钮授权并验证。验证成功后，任务可自动复用近期结果或短时只读复核，无需每次选择 Root；验证失败后使用标准能力，直到你重新验证。")
                                 if (snapshot.rootProbeRunning) {
                                     CircularProgressIndicator()
                                     TextButton(onClick = { vm.cancelRootProbe() }) { Text("取消检测") }
@@ -172,6 +173,13 @@ fun DeviceCapabilitiesPage(vm: DeviceCapabilitiesVM = koinViewModel()) {
                                     }
                                 }
                             }
+                        },
+                    )
+                    item(
+                        headlineContent = { Text("自动使用可用 Root") },
+                        supportingContent = { Text("记住此选择。始终优先 Android API 和无障碍节点，必要时才使用已验证的 Root；关闭后使用标准能力。") },
+                        trailingContent = {
+                            Switch(checked = snapshot.rootUsage.enabled, onCheckedChange = vm::setRootUsageEnabled)
                         },
                     )
                     item(

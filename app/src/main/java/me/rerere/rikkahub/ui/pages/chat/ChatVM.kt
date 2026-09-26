@@ -42,6 +42,7 @@ import me.rerere.rikkahub.data.model.MessageNode
 import me.rerere.rikkahub.data.model.NodeFavoriteTarget
 import me.rerere.rikkahub.data.mobileagent.PhoneBackend
 import me.rerere.rikkahub.data.mobileagent.PhoneController
+import me.rerere.rikkahub.data.mobileagent.DeviceCapabilityRepository
 import me.rerere.rikkahub.data.mobileagent.PhoneIntentBinding
 import me.rerere.rikkahub.data.mobileagent.PhoneIntentStore
 import me.rerere.rikkahub.data.mobileagent.PhoneSessionToken
@@ -77,6 +78,7 @@ class ChatVM(
     private val phoneBackend: PhoneBackend,
     private val phoneIntents: PhoneIntentStore,
     private val phoneTargets: PhoneTargetAppRepository,
+    private val deviceCapabilities: DeviceCapabilityRepository,
 ) : ViewModel() {
     private val _conversationId: Uuid = Uuid.parse(id)
     val conversation: StateFlow<Conversation> = chatService.getConversationFlow(_conversationId)
@@ -161,6 +163,7 @@ class ChatVM(
         intents = phoneIntents,
         loadTargets = phoneTargets::load,
         resolveTargets = phoneTargets::resolve,
+        selectRootForTask = deviceCapabilities::ensureRootForTask,
     )
 
     private fun invalidatePhoneContext() {

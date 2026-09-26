@@ -42,6 +42,7 @@ val viewModelModule = module {
             phoneBackend = get(),
             phoneIntents = get(),
             phoneTargets = get(),
+            deviceCapabilities = get(),
         )
     }
     viewModelOf(::ChatDrawerVM)

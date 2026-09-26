@@ -14,6 +14,8 @@ import kotlinx.coroutines.launch
 import kotlinx.coroutines.sync.Mutex
 import kotlinx.coroutines.sync.withLock
 import kotlinx.coroutines.withTimeout
+import me.rerere.rikkahub.data.shopping.ShoppingObservedEvidence
+import me.rerere.rikkahub.data.shopping.ShoppingObservedNode
 import java.util.UUID
 
 /** In-memory user authorization. Model tools cannot start or resume it. */
@@ -33,6 +35,7 @@ class PhoneController(
     val taskControls = PhoneTaskControlRegistry { state.value }
     private var epoch = 0L
     private var observation: PhoneObservation? = null
+    private val evidence = ArrayDeque<ShoppingObservedEvidence>()
     private var enteredTarget = false
     private var lastUnchangedAction: String? = null
     private var unchangedActions = 0
@@ -133,6 +136,11 @@ class PhoneController(
 
     fun pause() = pauseWith(PhoneSessionStatus.PAUSED, "用户暂停，旧动作和页面快照已失效")
 
+    /** Only the current grant may use a bounded history of actual, non-sensitive observations. */
+    fun shoppingEvidence(token: PhoneSessionToken): List<ShoppingObservedEvidence> = synchronized(gate) {
+        if (!valid(token)) emptyList() else evidence.toList()
+    }
+
     /** UI events carry the exact displayed epoch; validation and owner callbacks are atomic. */
     fun requestTaskControl(expected: PhoneSessionToken, action: PhoneTaskControl): Boolean = synchronized(gate) {
         taskControls.dispatch(expected, action)
@@ -153,7 +161,7 @@ class PhoneController(
     fun pauseIfCurrent(token: PhoneSessionToken, reason: String) =
         pauseWith(PhoneSessionStatus.PAUSED, reason, token)
 
-    fun resume(): PhoneSessionToken = synchronized(gate) {
+    fun resume(useRoot: Boolean? = null): PhoneSessionToken = synchronized(gate) {
         val environment = backend.state.value
         if (!environment.connected) fail("SERVICE_DISCONNECTED", "无障碍服务尚未连接")
         if (environment.locked) fail("DEVICE_LOCKED", "请先解锁手机")
@@ -171,7 +179,7 @@ class PhoneController(
             foregroundDeadline = null
             enteredTarget = false
             mutableState.value = current.copy(token = updated, status = PhoneSessionStatus.RUNNING, detail = "用户恢复，请重新观察页面",
-                modelWorking = false, activity = PhoneActivity.READY, activityStartedAtMillis = now())
+                modelWorking = false, activity = PhoneActivity.READY, activityStartedAtMillis = now(), useRoot = useRoot ?: current.useRoot)
             updated
         }
         backend.invalidate()
@@ -216,6 +224,7 @@ class PhoneController(
             modelWorking = false, activity = PhoneActivity.READY, activityStartedAtMillis = now(),
         )
         current.token?.let { taskControls.clearSession(it.sessionId) }
+        evidence.clear()
         observation = null
         enteredTarget = false
         deadline?.cancel()
@@ -234,6 +243,7 @@ class PhoneController(
             audit = (current.audit + PhoneAuditEntry(now(), "pause", reason)).takeLast(60),
             modelWorking = false, activity = PhoneActivity.READY, activityStartedAtMillis = now(),
         )
+        evidence.clear()
         observation = null
         foregroundDeadline?.cancel()
         foregroundDeadline = null
@@ -276,7 +286,7 @@ class PhoneController(
             authorize(token)
             if (!result.accepted) {
                 record(token, action, "平台未接受动作")
-                return@guarded PhoneActionResult(false, detail = "平台未接受动作；请重新观察，不要盲目重试")
+                return@guarded PhoneActionResult(false, detail = result.detail)
             }
             if (action == PhoneAction.Screenshot) {
                 record(token, action, "已获取目标窗口截图")
@@ -327,12 +337,22 @@ class PhoneController(
             pauseWith(PhoneSessionStatus.PAUSED, "当前页面涉及密码、支付或授权，请用户接手", token)
             fail("USER_HANDOVER_REQUIRED", "当前页面需要用户接手，未提供敏感界面内容")
         }
-        val safe = raw.copy(nodes = raw.nodes.map { it.copy(text = it.text.take(300), description = it.description.take(300)) }.take(100))
-            .let { it.copy(truncated = it.truncated || raw.nodes.size > 100) }
+        val safe = raw.copy(
+            nodes = raw.nodes.map { it.copy(text = it.text.take(300), description = it.description.take(300),
+                requiresUserConfirmation = it.requiresUserConfirmation || PhonePurchasePolicy.requiresUser(it.text + "\n" + it.description)) }.take(100),
+            previewTruncated = raw.previewTruncated || raw.nodes.size > 100,
+        )
         synchronized(gate) {
             authorize(token)
             enteredTarget = true
             observation = safe
+            evidence.removeAll { it.snapshotId == safe.id }
+            evidence.addLast(ShoppingObservedEvidence(safe.id, safe.packageName, safe.nodes.map {
+                ShoppingObservedNode(it.id, it.text, it.description)
+            }))
+            while (evidence.size > 8 || evidence.sumOf { page -> page.nodes.sumOf { it.text.length + it.description.length } } > 64_000) {
+                evidence.removeFirst()
+            }
             val current = mutableState.value
             mutableState.value = current.copy(detail = "已观察目标页面",
                 audit = (current.audit + PhoneAuditEntry(now(), "observe", "已读取目标页面")).takeLast(60))
@@ -356,6 +376,9 @@ class PhoneController(
     private fun checkAction(current: PhoneObservation, action: PhoneAction) {
         if (current.truncated || current.sensitive) fail("INCOMPLETE_SCREEN", "无法完整确认页面安全状态，请用户接手")
         if (action == PhoneAction.Screenshot && !state.value.allowScreenshots) fail("SCREENSHOT_NOT_ALLOWED", "本次会话未允许截图")
+        if (action is PhoneAction.Swipe && current.nodes.any { it.requiresUserConfirmation }) {
+            fail("PURCHASE_CONFIRMATION_REQUIRED", "页面含需要用户确认的控件，不能使用坐标滑动；可读取或使用普通滚动节点。")
+        }
         val id = when (action) {
             is PhoneAction.Click -> action.nodeId
             is PhoneAction.LongClick -> action.nodeId
@@ -366,6 +389,9 @@ class PhoneController(
         if (id != null) {
             val node = current.nodes.singleOrNull { it.id == id } ?: fail("UNKNOWN_NODE", "节点不属于本次快照")
             if (!node.enabled || node.password) fail("NODE_NOT_ALLOWED", "该节点不可操作")
+            if (node.requiresUserConfirmation && action !is PhoneAction.Scroll) {
+                fail("PURCHASE_CONFIRMATION_REQUIRED", "下单、付款、会员、试用或账户资产变更需用户亲自确认；未执行该动作")
+            }
             when (action) {
                 is PhoneAction.Click -> if (!node.clickable) fail("NODE_NOT_CLICKABLE", "该节点不可点击")
                 is PhoneAction.LongClick -> if (!node.longClickable) fail("NODE_NOT_CLICKABLE", "该节点不支持长按")
@@ -446,7 +472,7 @@ class PhoneController(
     }
 
     private fun pauseForSafetyFailure(token: PhoneSessionToken, failure: PhoneControlException) {
-        if (failure.code in setOf("USER_REQUIRED", "USER_HANDOVER_REQUIRED", "DEVICE_LOCKED", "FOREGROUND_CONFLICT", "STOP_UNAVAILABLE", "ACCESSIBILITY_DISCONNECTED")) {
+        if (failure.code in setOf("USER_REQUIRED", "USER_HANDOVER_REQUIRED", "PURCHASE_CONFIRMATION_REQUIRED", "ACTION_RESULT_UNKNOWN", "DEVICE_LOCKED", "FOREGROUND_CONFLICT", "STOP_UNAVAILABLE", "ACCESSIBILITY_DISCONNECTED")) {
             pauseWith(PhoneSessionStatus.PAUSED, "当前环境需要用户接手，请检查后恢复", token)
         }
     }
@@ -478,9 +504,9 @@ class PhoneController(
 /** Conservative handover markers, supplemented by Android password/data-sensitive flags. */
 object PhoneContentPolicy {
     private val markers = listOf(
-        "支付密码", "确认付款", "确认支付", "立即支付", "付款码", "验证码", "一次性密码", "短信验证",
+        "支付密码", "付款码", "验证码", "一次性密码", "短信验证",
         "指纹验证", "人脸验证", "生物识别", "解锁密码", "超级用户", "安装未知应用",
-        "pay now", "confirm payment", "payment password", "one-time password", "verification code",
+        "payment password", "one-time password", "verification code",
         "biometric", "enter pin", "enter password", "superuser", "sukisu", "magisk", "apatch",
     )
     fun isSensitive(text: String): Boolean = markers.any { text.contains(it, ignoreCase = true) }

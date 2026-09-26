@@ -18,6 +18,7 @@ import me.rerere.rikkahub.data.mobileagent.PhoneSessionToken
 import me.rerere.rikkahub.data.repository.ConversationRepository
 import me.rerere.rikkahub.data.repository.MemoryRepository
 import me.rerere.rikkahub.data.repository.WorkspaceRepository
+import me.rerere.rikkahub.data.research.ResearchRepository
 import me.rerere.workspace.WorkspaceShellStatus
 
 private const val TAG = "ChatToolFactory"
@@ -50,6 +51,7 @@ class ChatToolFactory(
     private val workspaceRepository: WorkspaceRepository,
     private val phoneController: PhoneController,
     private val phoneIntentStore: PhoneIntentStore,
+    private val researchRepository: ResearchRepository,
 ) {
     suspend fun createTools(
         settings: Settings,
@@ -70,7 +72,10 @@ class ChatToolFactory(
             conversationId = conversationId,
             assistantId = assistant.id.toString(),
             proposing = phoneIntentBinding != null,
-        )?.let { addAll(createPhoneTools(phoneController, it, json)) }
+        )?.let { token ->
+            addAll(createPhoneTools(phoneController, token, json))
+            addAll(createShoppingTools(json) { phoneController.shoppingEvidence(token) })
+        }
         if (assistant.enableMemory) {
             val memoryAssistantId = if (assistant.useGlobalMemory) {
                 MemoryRepository.GLOBAL_MEMORY_ID
@@ -88,6 +93,9 @@ class ChatToolFactory(
         }
         if (shouldUseExternalWebSearch(assistant, model)) {
             addAll(createSearchTools(settings))
+        }
+        if (assistant.enableWebSearch && !conversationId.isNullOrBlank()) {
+            addAll(createResearchTools(researchRepository, conversationId))
         }
         addAll(localTools.getTools(assistant.localTools))
         if (assistant.enableRecentChatsReference) {
