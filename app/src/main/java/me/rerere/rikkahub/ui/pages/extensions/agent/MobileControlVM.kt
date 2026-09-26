@@ -11,6 +11,7 @@ import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
+import me.rerere.ai.provider.ModelAbility
 import me.rerere.ai.ui.UIMessagePart
 import me.rerere.rikkahub.data.datastore.SettingsStore
 import me.rerere.rikkahub.data.datastore.findModelById
@@ -21,6 +22,8 @@ import me.rerere.rikkahub.data.mobileagent.PhoneAction
 import me.rerere.rikkahub.data.mobileagent.PhoneControlException
 import me.rerere.rikkahub.data.mobileagent.PhoneController
 import me.rerere.rikkahub.data.mobileagent.PhoneSessionStatus
+import me.rerere.rikkahub.data.mobileagent.PhoneSessionToken
+import me.rerere.rikkahub.data.mobileagent.PhoneTaskLauncher
 import me.rerere.rikkahub.data.mobileagent.RootState
 import me.rerere.rikkahub.service.ChatService
 import kotlin.uuid.Uuid
@@ -65,6 +68,11 @@ class MobileControlVM(
     private var generationStateReady = false
     private var cancelGenerationJob: Job? = null
     private var appsJob: Job? = null
+    private val taskLauncher = PhoneTaskLauncher(controller, backend)
+    private var preparationJob: Job? = null
+    private var preparationToken: PhoneSessionToken? = null
+    private var preparationSequence = 0L
+    private var pendingModelTask: Pair<String, String>? = null
 
     init {
         chatService.addConversationReference(conversationUuid)
@@ -147,15 +155,16 @@ class MobileControlVM(
             _message.value = "当前截图后端不可用，请关闭允许截图后继续。"
             return
         }
-        var sessionStarted = false
+        var startedToken: PhoneSessionToken? = null
         try {
             val token = controller.start(conversationId, assistantId, targetPackage, useRoot, allowScreenshots)
-            sessionStarted = true
+            startedToken = token
             _preparedSessionId.value = token.sessionId.takeIf { prepareOnly }
             _modelSessionId.value = token.sessionId.takeUnless { prepareOnly }
-            if (!prepareOnly) chatService.sendMessage(conversationUuid, listOf(UIMessagePart.Text(task.trim())))
+            pendingModelTask = (token.sessionId to task.trim()).takeUnless { prepareOnly }
+            if (!prepareOnly) prepareAndSend(token, task.trim())
         } catch (error: Exception) {
-            if (sessionStarted) controller.stopForConversation(conversationId)
+            startedToken?.let { controller.pauseIfCurrent(it, "未能准备模型任务，请检查后恢复") }
             _message.value = safeMessage(error, "未能开始手机任务，请检查状态后重试。")
         }
     }
@@ -164,6 +173,7 @@ class MobileControlVM(
         if (!ownsSession() || _busy.value) return
         try {
             controller.pause()
+            cancelPreparation()
             cancelGeneration(pauseOnly = true)
         } catch (error: Exception) {
             _message.value = safeMessage(error, "未能暂停任务，请使用 STOP 停止。")
@@ -179,21 +189,20 @@ class MobileControlVM(
         }
         if (!ownsSession() || _busy.value || _openingTarget.value || !validateConversation(requireModel = !prepareOnly)) return
         _message.value = null
-        var resumed = false
+        var resumedToken: PhoneSessionToken? = null
         try {
             val token = controller.resume()
-            resumed = true
+            resumedToken = token
             if (prepareOnly) {
                 _preparedSessionId.value = token.sessionId
             } else {
                 _modelSessionId.value = token.sessionId
-                chatService.sendMessage(
-                    conversationUuid,
-                    listOf(UIMessagePart.Text("继续刚才未完成的手机操作任务。请先重新打开已授权的目标应用并读取当前页面，再决定下一步操作。")),
-                )
+                val task = pendingModelTask?.takeIf { it.first == token.sessionId }?.second
+                    ?: "继续刚才未完成的手机操作任务。目标应用已在本地打开，请先重新读取当前页面，再决定下一步操作。"
+                prepareAndSend(token, task)
             }
         } catch (error: Exception) {
-            if (resumed) controller.stopForConversation(conversationId)
+            resumedToken?.let { controller.pauseIfCurrent(it, "未能准备恢复任务，请检查后恢复") }
             _message.value = safeMessage(error, "未能恢复任务，请检查状态后重试。")
         }
     }
@@ -201,7 +210,50 @@ class MobileControlVM(
     fun stop() {
         // Revocation is synchronous: STOP must not wait for network cancellation or a UI coroutine.
         controller.stopForConversation(conversationId)
+        cancelPreparation()
         cancelGeneration(pauseOnly = false)
+    }
+
+    private fun prepareAndSend(token: PhoneSessionToken, task: String) {
+        val sequence = ++preparationSequence
+        preparationToken = token
+        _openingTarget.value = true
+        preparationJob = viewModelScope.launch {
+            try {
+                taskLauncher.prepare(token)
+                if (!validateConversation()) {
+                    controller.pauseIfCurrent(token, "模型或会话状态已变化，未发送模型请求，请检查后恢复")
+                    return@launch
+                }
+                taskLauncher.requireReady(token)
+                chatService.sendMessage(conversationUuid, listOf(UIMessagePart.Text(task)))
+                if (pendingModelTask?.first == token.sessionId) pendingModelTask = null
+            } catch (cancelled: CancellationException) {
+                throw cancelled
+            } catch (error: Exception) {
+                controller.pauseIfCurrent(token, "未能准备模型任务，未发送模型请求，请检查后恢复")
+                if (session.value.token?.sessionId == token.sessionId) {
+                    _message.value = safeMessage(error, "未能准备目标应用，未发送模型请求，请检查后恢复。")
+                }
+            } finally {
+                if (sequence == preparationSequence) {
+                    preparationToken = null
+                    _openingTarget.value = false
+                }
+            }
+        }
+    }
+
+    private fun cancelPreparation() {
+        // A coroutine that finishes later cannot clear or revoke a replacement task.
+        ++preparationSequence
+        preparationToken?.let {
+            controller.pauseIfCurrent(it, "目标应用准备已取消，未发送模型请求，请检查后恢复")
+        }
+        preparationToken = null
+        preparationJob?.cancel()
+        preparationJob = null
+        _openingTarget.value = false
     }
 
     fun openPreparedTarget() {
@@ -244,13 +296,16 @@ class MobileControlVM(
 
     private fun validateConversation(requireModel: Boolean = true): Boolean {
         val assistant = settings.value.getAssistantById(assistantUuid)
+        val model = settings.value.findModelById(assistant?.chatModelId ?: settings.value.chatModelId)
         val error = when {
             conversation.value.assistantId != assistantUuid || assistant == null ->
                 "当前会话与助手不匹配，请返回对应聊天后重新进入手机控制。"
             !generationStateReady -> "正在读取会话状态，请稍后再试。"
             _generating.value -> "当前聊天仍在生成，请先暂停或停止生成后再开始手机任务。"
-            requireModel && settings.value.findModelById(assistant.chatModelId ?: settings.value.chatModelId) == null ->
+            requireModel && model == null ->
                 "请先返回聊天，配置并选择用于此助手的模型。"
+            requireModel && model?.abilities?.contains(ModelAbility.TOOL) == false ->
+                "当前模型未启用工具调用能力，请在模型设置中启用工具调用，或选择支持工具调用的模型。"
             else -> null
         }
         if (error != null) _message.value = error
@@ -264,6 +319,7 @@ class MobileControlVM(
     fun dismissMessage() { _message.value = null }
 
     override fun onCleared() {
+        cancelPreparation()
         chatService.removeConversationReference(conversationUuid)
         super.onCleared()
     }

@@ -9,14 +9,18 @@ import kotlinx.coroutines.runBlocking
 import kotlinx.serialization.json.Json
 import kotlinx.serialization.json.JsonObject
 import kotlinx.serialization.json.buildJsonObject
+import kotlinx.serialization.json.jsonArray
 import kotlinx.serialization.json.jsonObject
 import kotlinx.serialization.json.jsonPrimitive
 import kotlinx.serialization.json.put
+import me.rerere.ai.core.Tool
+import me.rerere.ai.provider.Model
 import me.rerere.ai.ui.UIMessagePart
 import me.rerere.rikkahub.data.mobileagent.PhoneAction
 import me.rerere.rikkahub.data.mobileagent.PhoneBackend
 import me.rerere.rikkahub.data.mobileagent.PhoneBackendResult
 import me.rerere.rikkahub.data.mobileagent.PhoneBackendState
+import me.rerere.rikkahub.data.mobileagent.PhoneBackendStopReason
 import me.rerere.rikkahub.data.mobileagent.PhoneController
 import me.rerere.rikkahub.data.mobileagent.PhoneObservation
 import me.rerere.rikkahub.data.mobileagent.PhonePermit
@@ -69,6 +73,75 @@ class PhoneToolsTest {
             assertEquals(null, controller.activeToken("other-conversation", "assistant"))
             assertEquals(null, controller.activeToken("conversation", "other-assistant"))
         } finally { controller.close() }
+    }
+
+    @Test
+    fun `current grant prompt replaces old namespace and rejects old page state`() {
+        val controller = controller(FakeBackend())
+        try {
+            val oldToken = controller.start("conversation", "assistant", "target")
+            controller.stop()
+            val currentToken = controller.start("conversation", "assistant", "target")
+            val prompts = createPhoneTools(controller, currentToken, Json)
+                .map { it.systemPrompt(Model(), emptyList()) }
+                .filter { it.isNotBlank() }
+
+            val prompt = prompts.single()
+            assertTrue(prompt.contains(phoneToolPrefix(currentToken) + "open_app"))
+            assertTrue(prompt.contains(phoneToolPrefix(currentToken) + "observe"))
+            assertTrue(prompt.contains("先调用 ${phoneToolPrefix(currentToken)}observe"))
+            assertTrue(prompt.contains("只有工具明确提示目标应用不在前台时，才调用一次"))
+            assertFalse(prompt.contains(phoneToolPrefix(oldToken)))
+            assertTrue(prompt.contains("snapshot_id"))
+            assertTrue(prompt.contains("node_id"))
+            assertTrue(prompt.contains("旧授权"))
+            assertTrue(prompt.contains("系统授权弹窗"))
+            assertTrue(prompt.contains("不要反复调用 open_app"))
+        } finally { controller.close() }
+    }
+
+    @Test
+    fun `stale tool result exposes only current phone names without executing any tool`() {
+        val backend = FakeBackend()
+        val controller = controller(backend)
+        try {
+            val oldToken = controller.start("conversation", "assistant", "target")
+            controller.stop()
+            val currentToken = controller.start("conversation", "assistant", "target")
+            val currentTools = createPhoneTools(controller, currentToken, Json)
+            val unrelatedTool = Tool(name = "other_tool", description = "", execute = {
+                error("Recovery must not execute tools")
+            })
+
+            val result = Json.parseToJsonElement(
+                stalePhoneToolResult(currentTools + unrelatedTool)
+                    .filterIsInstance<UIMessagePart.Text>().single().text,
+            ).jsonObject
+
+            assertEquals("stale_phone_tool", result["code"]?.jsonPrimitive?.content)
+            assertEquals("false", result["accepted"]?.jsonPrimitive?.content)
+            assertTrue(result["detail"]!!.jsonPrimitive.content.contains("先使用本次 observe"))
+            assertTrue(result["detail"]!!.jsonPrimitive.content.contains("只有工具明确提示目标应用不在前台时，才调用一次"))
+            assertEquals(
+                currentTools.map { it.name },
+                result["available_tools"]?.jsonArray?.map { it.jsonPrimitive.content },
+            )
+            assertFalse(result.toString().contains(phoneToolPrefix(oldToken)))
+            assertEquals(0, backend.actions)
+            assertEquals(0, backend.observations)
+        } finally { controller.close() }
+    }
+
+    @Test
+    fun `stale tool result without current phone tools requires stopping for user authorization`() {
+        val result = Json.parseToJsonElement(
+            stalePhoneToolResult(emptyList()).filterIsInstance<UIMessagePart.Text>().single().text,
+        ).jsonObject
+
+        assertEquals("stale_phone_tool", result["code"]?.jsonPrimitive?.content)
+        assertTrue(result["available_tools"]!!.jsonArray.isEmpty())
+        assertTrue(result["detail"]!!.jsonPrimitive.content.contains("停止调用手机工具"))
+        assertTrue(result["detail"]!!.jsonPrimitive.content.contains("必须由用户"))
     }
 
     @Test
@@ -151,7 +224,7 @@ class PhoneToolsTest {
         var actions = 0
         var cancelObservation = false
         override fun isTargetAllowed(packageName: String) = packageName == "target"
-        override fun showSessionNotice(token: PhoneSessionToken, targetPackage: String, onStop: () -> Unit) = true
+        override fun showSessionNotice(token: PhoneSessionToken, targetPackage: String, onStop: (PhoneBackendStopReason) -> Unit) = true
         override fun endSessionNotice() = Unit
         override suspend fun observe(permit: PhonePermit): PhoneObservation {
             check(permit.isValid())

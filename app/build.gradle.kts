@@ -36,7 +36,7 @@ android {
         applicationId = "me.rerere.rikkahub"
         minSdk = 26
         targetSdk = 37
-        versionCode = 191
+        versionCode = 192
         versionName = "2.5.4"
 
         // This fork must not replace its Mobile Agent features with an official upstream APK.
@@ -100,7 +100,7 @@ android {
         }
         debug {
             applicationIdSuffix = ".debug"
-            versionNameSuffix = "-mobile-agent-v1-m2"
+            versionNameSuffix = "-mobile-agent-v1-m2.1"
             buildConfigField("String", "VERSION_NAME", "\"${android.defaultConfig.versionName}${versionNameSuffix}\"")
             buildConfigField("String", "VERSION_CODE", "\"${android.defaultConfig.versionCode}\"")
         }

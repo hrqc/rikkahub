@@ -12,6 +12,8 @@ data class PhoneSessionToken(
 
 enum class PhoneSessionStatus { IDLE, RUNNING, PAUSED, WAITING_FOR_FOREGROUND, STOPPED, EXPIRED }
 
+enum class PhoneBackendStopReason { NOTIFICATION_STOP, SERVICE_INTERRUPTED, SERVICE_DISCONNECTED, SERVICE_REPLACED }
+
 data class PhoneSessionState(
     val token: PhoneSessionToken? = null,
     val targetPackage: String = "",
@@ -115,7 +117,7 @@ interface PhoneBackend {
     val state: StateFlow<PhoneBackendState>
     val supportsScreenshot: Boolean get() = false
     fun isTargetAllowed(packageName: String): Boolean
-    fun showSessionNotice(token: PhoneSessionToken, targetPackage: String, onStop: () -> Unit): Boolean
+    fun showSessionNotice(token: PhoneSessionToken, targetPackage: String, onStop: (PhoneBackendStopReason) -> Unit): Boolean
     fun endSessionNotice()
     suspend fun observe(permit: PhonePermit): PhoneObservation
     suspend fun execute(

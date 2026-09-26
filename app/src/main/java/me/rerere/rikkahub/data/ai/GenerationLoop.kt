@@ -33,6 +33,7 @@ import me.rerere.ai.ui.limitContext
 import me.rerere.rikkahub.R
 import me.rerere.rikkahub.data.ai.transformers.InputMessageTransformer
 import me.rerere.rikkahub.data.ai.tools.isPhoneToolName
+import me.rerere.rikkahub.data.ai.tools.stalePhoneToolResult
 import me.rerere.rikkahub.data.ai.transformers.MessageTransformer
 import me.rerere.rikkahub.data.ai.transformers.OutputMessageTransformer
 import me.rerere.rikkahub.data.files.FileFolders
@@ -257,18 +258,20 @@ class GenerationLoop(
 
                     else -> {
                         // Auto or Approved - execute the tool
+                        val toolDef = tools.find { it.name == tool.toolName }
+                        if (toolDef == null && isPhoneToolName(tool.toolName)) {
+                            executedTools += tool.copy(output = stalePhoneToolResult(tools))
+                            return@forEach
+                        }
                         runCatching {
-                            val toolDef = tools.find { toolDef -> toolDef.name == tool.toolName }
-                                ?: error(if (isPhoneToolName(tool.toolName)) {
-                                    "手机控制授权已失效，请由用户重新开启并重新观察"
-                                } else "Tool not found")
+                            val availableTool = toolDef ?: error("Tool not found")
                             val args = runCatching {
                                 json.parseToJsonElement(tool.input.ifBlank { "{}" })
                             }.getOrElse {
                                 error("Invalid tool arguments JSON")
                             }
                             Log.i(TAG, "generateText: executing tool")
-                            val result = toolDef.execute(args)
+                            val result = availableTool.execute(args)
                             val hasShellAccess = tools.any { it.name == "workspace_shell" }
                             executedTools += tool.copy(
                                 output = if (isPhoneToolName(tool.toolName)) result else {

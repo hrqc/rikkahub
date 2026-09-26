@@ -56,7 +56,7 @@ class AccessibilityPhoneBackend(context: Context) : PhoneBackend {
     private val windowPackages = mutableMapOf<Int, String>()
     private val recentEvents = ArrayDeque<EventMetadata>()
 
-    private data class SessionNotice(val token: PhoneSessionToken, val targetPackage: String, val onStop: () -> Unit)
+    private data class SessionNotice(val token: PhoneSessionToken, val targetPackage: String, val onStop: (PhoneBackendStopReason) -> Unit)
     private data class Snapshot(val token: PhoneSessionToken, val observation: PhoneObservation, val tree: AndroidTreeCapture)
     private data class EventMetadata(val type: Int, val windowId: Int, val packageName: String?)
 
@@ -71,7 +71,7 @@ class AccessibilityPhoneBackend(context: Context) : PhoneBackend {
         }.getOrDefault(false)
     }
 
-    override fun showSessionNotice(token: PhoneSessionToken, targetPackage: String, onStop: () -> Unit): Boolean {
+    override fun showSessionNotice(token: PhoneSessionToken, targetPackage: String, onStop: (PhoneBackendStopReason) -> Unit): Boolean {
         if (!notifications.show(token, targetPackage)) return false
         activeNotice.set(SessionNotice(token, targetPackage, onStop))
         return true
@@ -84,7 +84,7 @@ class AccessibilityPhoneBackend(context: Context) : PhoneBackend {
 
     /** A stale notification from a previous session must not stop a later session. */
     fun stopFromNotification(sessionId: String) {
-        activeNotice.get()?.takeIf { it.token.sessionId == sessionId }?.onStop?.invoke()
+        activeNotice.get()?.takeIf { it.token.sessionId == sessionId }?.onStop?.invoke(PhoneBackendStopReason.NOTIFICATION_STOP)
     }
 
     fun onServiceConnected(connectedService: AccessibilityService) {
@@ -92,22 +92,24 @@ class AccessibilityPhoneBackend(context: Context) : PhoneBackend {
             val stopPreviousSession = activeNotice.get()?.onStop
             invalidate()
             windowPackages.clear()
+            stopPreviousSession?.invoke(PhoneBackendStopReason.SERVICE_REPLACED)
             mutableState.value = PhoneBackendState(connected = true, windowRevision = revision.get(), locked = isLocked())
-            stopPreviousSession?.invoke()
         }
     }
 
     fun onServiceDisconnected(disconnectedService: AccessibilityService) {
         if (!service.compareAndSet(disconnectedService, null)) return
+        val stopSession = activeNotice.get()?.onStop
         invalidate()
         windowPackages.clear()
+        // Revoke synchronously with the actual cause before the state collector can stop it.
+        stopSession?.invoke(PhoneBackendStopReason.SERVICE_DISCONNECTED)
         mutableState.value = PhoneBackendState(windowRevision = revision.get(), locked = isLocked())
-        activeNotice.get()?.onStop?.invoke()
     }
 
     fun onServiceInterrupted() {
         invalidate()
-        activeNotice.get()?.onStop?.invoke()
+        activeNotice.get()?.onStop?.invoke(PhoneBackendStopReason.SERVICE_INTERRUPTED)
     }
 
     fun onAccessibilityEvent(event: AccessibilityEvent) {

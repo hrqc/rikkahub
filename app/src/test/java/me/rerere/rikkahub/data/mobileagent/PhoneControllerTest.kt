@@ -40,11 +40,11 @@ class PhoneControllerTest {
         var actions = 0
         var invalidations = 0
         var noticesEnded = 0
-        var onStop: (() -> Unit)? = null
+        var onStop: ((PhoneBackendStopReason) -> Unit)? = null
         var beforeDispatch: suspend (PhonePermit) -> Unit = {}
         var beforeRead: suspend () -> Unit = {}
         override fun isTargetAllowed(packageName: String) = packageName == "com.example.target"
-        override fun showSessionNotice(token: PhoneSessionToken, targetPackage: String, onStop: () -> Unit): Boolean {
+        override fun showSessionNotice(token: PhoneSessionToken, targetPackage: String, onStop: (PhoneBackendStopReason) -> Unit): Boolean {
             this.onStop = onStop
             return noticeAllowed
         }
@@ -118,10 +118,49 @@ class PhoneControllerTest {
         Fixture().use { f ->
             val token = f.start()
             val snapshot = f.controller.observe(token)
-            f.backend.onStop!!.invoke()
+            f.backend.onStop!!.invoke(PhoneBackendStopReason.NOTIFICATION_STOP)
             expectCode("SESSION_INVALID") { f.controller.act(token, snapshot.id, PhoneAction.Click("button")) }
             assertEquals(0, f.backend.actions)
             assertEquals(PhoneSessionStatus.STOPPED, f.controller.state.value.status)
+            assertEquals("用户从通知停止", f.controller.state.value.detail)
+        }
+    }
+
+    @Test fun `service stop causes revoke immediately without being attributed to the notification`() = runBlocking {
+        val reasons = mapOf(
+            PhoneBackendStopReason.SERVICE_INTERRUPTED to "无障碍服务被系统中断，请检查后重新开启任务",
+            PhoneBackendStopReason.SERVICE_DISCONNECTED to "无障碍服务已断开",
+            PhoneBackendStopReason.SERVICE_REPLACED to "无障碍服务已重新连接，请重新开启任务",
+        )
+        reasons.forEach { (reason, detail) ->
+            Fixture().use { f ->
+                val token = f.start()
+                val snapshot = f.controller.observe(token)
+                val invalidations = f.backend.invalidations
+                f.backend.onStop!!.invoke(reason)
+                assertNull(f.controller.activeToken("chat", "assistant"))
+                assertTrue(f.backend.invalidations > invalidations)
+                assertEquals(PhoneSessionStatus.STOPPED, f.controller.state.value.status)
+                assertEquals(detail, f.controller.state.value.detail)
+                assertEquals(detail, f.controller.state.value.audit.last().result)
+                expectCode("SESSION_INVALID") { f.controller.act(token, snapshot.id, PhoneAction.Click("button")) }
+                assertEquals(0, f.backend.actions)
+                // Later service metadata must not overwrite the original stopping cause.
+                f.backend.state.value = f.backend.state.value.copy(connected = false)
+                assertEquals(detail, f.controller.state.value.detail)
+            }
+        }
+    }
+
+    @Test fun `resumed sessions retain the actual backend stop cause`() {
+        Fixture().use { f ->
+            f.start()
+            f.controller.pause()
+            f.controller.resume()
+            f.backend.onStop!!.invoke(PhoneBackendStopReason.SERVICE_INTERRUPTED)
+            assertEquals(PhoneSessionStatus.STOPPED, f.controller.state.value.status)
+            assertEquals("无障碍服务被系统中断，请检查后重新开启任务", f.controller.state.value.detail)
+            assertNull(f.controller.activeToken("chat", "assistant"))
         }
     }
 
@@ -179,7 +218,7 @@ class PhoneControllerTest {
             dispatched.await()
             val newer = f.start()
             val invalidations = f.backend.invalidations
-            oldStop()
+            PhoneBackendStopReason.entries.forEach(oldStop)
             pending.cancel()
             pending.join()
             assertEquals(newer, f.controller.activeToken("chat", "assistant"))

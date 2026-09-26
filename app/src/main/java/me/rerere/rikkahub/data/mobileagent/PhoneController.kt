@@ -106,7 +106,7 @@ class PhoneController(
                 )
             }
         }
-        if (!backend.showSessionNotice(token, targetPackage) { end(PhoneSessionStatus.STOPPED, "用户从通知停止", token.sessionId) }) {
+        if (!backend.showSessionNotice(token, targetPackage) { stopFromBackend(token, it) }) {
             stop("无法显示停止通知")
             fail("STOP_NOTIFICATION_REQUIRED", "请先允许应用通知，以便随时停止手机控制")
         }
@@ -127,6 +127,10 @@ class PhoneController(
     }
 
     fun pause() = pauseWith(PhoneSessionStatus.PAUSED, "用户暂停，旧动作和页面快照已失效")
+
+    /** A delayed preparation timeout/cancellation must never pause a newer authorization. */
+    fun pauseIfCurrent(token: PhoneSessionToken, reason: String) =
+        pauseWith(PhoneSessionStatus.PAUSED, reason, token)
 
     fun resume(): PhoneSessionToken = synchronized(gate) {
         val environment = backend.state.value
@@ -149,7 +153,7 @@ class PhoneController(
             updated
         }
         backend.invalidate()
-        if (!backend.showSessionNotice(token, state.value.targetPackage) { end(PhoneSessionStatus.STOPPED, "用户从通知停止", token.sessionId) }) {
+        if (!backend.showSessionNotice(token, state.value.targetPackage) { stopFromBackend(token, it) }) {
             stop("无法显示停止通知")
             fail("STOP_NOTIFICATION_REQUIRED", "无法显示停止通知")
         }
@@ -162,6 +166,17 @@ class PhoneController(
     }
 
     fun stop(reason: String = "用户停止") = end(PhoneSessionStatus.STOPPED, reason)
+
+    private fun stopFromBackend(token: PhoneSessionToken, reason: PhoneBackendStopReason) = end(
+        PhoneSessionStatus.STOPPED,
+        when (reason) {
+            PhoneBackendStopReason.NOTIFICATION_STOP -> "用户从通知停止"
+            PhoneBackendStopReason.SERVICE_INTERRUPTED -> "无障碍服务被系统中断，请检查后重新开启任务"
+            PhoneBackendStopReason.SERVICE_DISCONNECTED -> "无障碍服务已断开"
+            PhoneBackendStopReason.SERVICE_REPLACED -> "无障碍服务已重新连接，请重新开启任务"
+        },
+        token.sessionId,
+    )
 
     private fun expire(sessionId: String) = end(PhoneSessionStatus.EXPIRED, "本次会话已到时间上限", sessionId)
 
