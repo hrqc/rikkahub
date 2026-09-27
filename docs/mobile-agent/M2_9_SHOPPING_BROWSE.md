@@ -1,6 +1,6 @@
 # M2.9：有界翻页、商品预筛与评价证据
 
-更新：2026-09-27。范围仍为 V1。此文记录开发检查点，不代表京东或其他平台业务验收完成。
+更新：2026-09-28。范围仍为 V1。此文记录开发检查点及 200 真机证据，不代表京东或其他平台业务验收完成。
 
 ## 目标与验收口径
 
@@ -60,12 +60,40 @@ debug instrumentation 增加默认配置、包含非重要节点、逐父节点�
 
 主包为 `me.rerere.rikkahub.debug`，versionCode 200，versionName `2.5.4-mobile-agent-v1-m2.9-shopping-browse`，arm64-v8a。SHA-256：`D4E10F11946BBBE4B60ABDF01B2262A1F4543F46950C97E0EB9DEB361069B8B3`。对应 instrumentation APK SHA-256：`FA3792E36393C57779618C5D3702E1D272A43C48F6A6D75B7530E17C921B46C7`。版本、源码提交、构建时间及完整产物路径在本地 `BUILD_INFO.md` 登记。
 
-本轮手机只读检查仍为息屏锁定，安装版本 199。已请求用户解锁；尚未安装或实测 200，不代替用户通过锁屏。
+用户解锁后，200 主 APK 和对应测试 APK 已安装到一加；以下真机诊断的 `appVersion` 也记录为 `2.5.4-mobile-agent-v1-m2.9-shopping-browse`。随后为原生滚动烟测单独构建并安装了测试草稿 APK，主 APK 仍为上述 200 构建。测试草稿不能与已登记源码检查点的测试 APK 混为一份产物，详情见本地 `BUILD_INFO.md`。
+
+### 200 真机生产观察与受控对照
+
+汇总为 `artifacts/v1-m2.9-shopping-browse/controlled-profile-summary.json`，逐次原始记录在下表各目录的 `dynamic-ui-diagnostic.jsonl`，对应 runner 日志为 `instrumentation.log`。flags 取每次实际读取的 `attempt.serviceFlags`，不是临时配置应用前的 `begin.serviceFlags`。
+
+| 目录／配置 | 树节点预算 | 实际 flags | 读取次数 | 每次已访问节点／缺口 | 完整读取次数 |
+| --- | ---: | ---: | ---: | --- | ---: |
+| `jd-production-200-a`／生产观察 | 512 | 80 | 4 | 55／6 | 0 |
+| `jd-default-768-200-a`／DEFAULT | 768 | 80 | 7 | 55／6 | 0 |
+| `jd-refresh-parents-200-a`／REFRESH_PARENTS | 768 | 80 | 6 | 55／6 | 0 |
+| `jd-include-200-a`／INCLUDE_UNIMPORTANT | 768 | 82 | 5 | 563／1 | 0 |
+| `jd-include-refresh-200-a`／INCLUDE_UNIMPORTANT_REFRESH_PARENTS | 768 | 82 | 4 | 563／1 | 0 |
+
+所有读取均为 `INCOMPLETE`，唯一 inspection issue 为 `unavailable_child`；各次读取前后的窗口元数据一致，root refresh 和 cache clear 均报告成功。逐父节点刷新组分别报告每次 55／563 个节点刷新成功、零刷新失败，仍没有消除缺口。四组实验实际完成次数不同：DEFAULT 未跳过计划时隙，REFRESH_PARENTS、INCLUDE_UNIMPORTANT、组合组分别有 1、2、3 个过期时隙未执行；这是采样调度记录，不是额外成功读取或 JUnit assumption skip。
+
+生产路径返回一次 `scrollOnly` 观察，`outcome=scroll_only_available`、清理前状态 `RUNNING`、`actionsUsed=0`；这只证明受限滚动能力可以发布，没有证明滚动动作成功。四组对照均完成调度，但 `diagnosticReadSuccesses=0`、`actionsUsed=0`、`businessTaskAccepted=false`。五个 runner 的 `OK (1 test)` 只表示诊断测试及其约束完成，不能计为五次购物或完整页面验收。
+
+本次同源对照中，包含非重要节点的配置能读到更多结构，但仍缺一个子节点：父路径 `/0/0/0/1/0/0/4/0/0`，`LinearLayout`，父 bounds `[0,603,1080,604]`，声明 4 个子节点、索引 1 不可读取。1 像素高的是父容器，不能当作缺失子节点的边界或据此认定无害。563 个已访问节点也超过生产默认 512 节点预算；该配置尚未改为生产默认。当前证据不能解释底层为何返回空子节点，也不能建立可信商品卡片或 SKU 归属。
+
+### 原生滚动首轮未进入动作阶段
+
+`jd-native-scroll-200-a.json` 与 `.log` 记录前置 `before_observe` Activity 检查返回 `ACTIVITY_CHECK_EXCEPTION`，耗时约 15.2 秒。`actionRequestsIssued=0`、`controllerActionsUsed=0`；`selectedNode`、`before`、`after`、`accepted`、`screenChanged` 均为 `null`。测试自己的会话随后停止清理。
+
+因此这是测试前置 Activity 检查异常，未执行观察或滚动请求，既不是 APP 原生滚动失败，也不是滚动成功。`engineeringScrollPassed=false`、`businessTaskAccepted=false`；runner 的 `OK (1 test)` 不能覆盖这两个实际结果。后续需修正前置检查并重测。
+
+### 后续 201 开发状态
+
+201 的独立 DEBUG 结构采集入口正在开发，拟保留真实父路径、卡片层级和缺口，仅输出无正文元数据到本地受控产物；生产诊断的正文禁入规则保持不变。截至本次文档更新尚未验证，不能记为 201 构建、安装、测试或商品归属验证通过，也不计入 200 的 362 项回归。它不赋予新的点击或购物权限。
 
 ## 仍需解决与下一步
 
-1. 手机解锁后进行四组同源诊断与真实原生滚动，验证是否取得完整商品页面。
-2. 对真实京东页面建立宿主可核证的单商品卡片、SKU／商家归属；解决跨节点混拼及可靠去重。
+1. 修正原生滚动测试的前置 Activity 检查并重测，分别核对动作是否派发、是否接受及页面是否变化；已有四组同源对照仍未得到完整页面。
+2. 验证后续独立结构采样入口，再对真实京东页面建立宿主可核证的单商品卡片、SKU／商家归属；解决跨节点混拼及可靠去重。结构采样成功不能替代商品证据验证。
 3. 用 App 自身模型完成翻页、至少三个可比候选、评价抽样、明确待核费用的流程，保留实际成功和失败证据。
 4. 再验普通免费券的规则、领取、应用与最终金额核对；不自动下单、付款或消耗积分、储值、会员权益。
 5. 京东流程达到验收标准后扩展美团等平台和非 Root 设备。

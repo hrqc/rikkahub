@@ -4,6 +4,7 @@ import android.graphics.Rect
 import android.os.Build
 import android.os.SystemClock
 import android.view.accessibility.AccessibilityNodeInfo
+import me.rerere.rikkahub.BuildConfig
 import java.security.MessageDigest
 
 internal class TreeReadAborted : IllegalStateException("界面读取已失效。")
@@ -58,9 +59,11 @@ internal class AccessibilityTreeReader {
         targetPackage: String,
         diagnostics: ReadDiagnosticTree? = null,
         diagnosticProfile: ReadDiagnosticProfile? = null,
+        debugStructure: PhoneDebugStructureCapture? = null,
         isValid: () -> Boolean,
     ): AndroidTreeCapture {
         require(diagnosticProfile == null || diagnostics != null)
+        require(debugStructure == null || (BuildConfig.DEBUG && diagnosticProfile != null && diagnostics != null))
         val nodes = mutableListOf<PhoneNode>()
         val handles = linkedMapOf<String, AndroidNodeHandle>()
         val budget = PhoneTreeReadBudget(SystemClock.elapsedRealtime(), diagnosticProfile?.nodeLimit ?: 512)
@@ -139,6 +142,13 @@ internal class AccessibilityTreeReader {
                 return
             }
             val children = node.childCount
+            debugStructure?.recordNode(path, PhoneDebugNodeShape(
+                className = signature.role, viewId = signature.viewId,
+                bounds = PhoneBounds(signature.left, signature.top, signature.right, signature.bottom),
+                visible = isVisible, enabled = signature.enabled, scrollable = signature.scrollable,
+                childCount = children, clickable = signature.clickable, focused = node.isFocused,
+                emittedNodeId = if (wasEmitted) effectiveParent else null,
+            ))
             diagnostics?.node(path, signature.role, signature.viewId,
                 PhoneBounds(signature.left, signature.top, signature.right, signature.bottom),
                 isVisible, children, signature.scrollable, node.isFocused, wasEmitted)
@@ -148,6 +158,7 @@ internal class AccessibilityTreeReader {
                 if (!budget.canContinue(SystemClock.elapsedRealtime())) break
                 val child = child(node, index)
                 if (child == null) {
+                    debugStructure?.recordGap(path, index)
                     diagnostics?.gap(path, signature.role, signature.viewId,
                         PhoneBounds(signature.left, signature.top, signature.right, signature.bottom),
                         isVisible, children, index)

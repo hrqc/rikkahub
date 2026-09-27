@@ -227,7 +227,29 @@ class AccessibilityPhoneBackend(
     }
 
     /** Isolated read experiment: never publishes Snapshot/PhoneObservation or dispatches an action. */
-    internal suspend fun captureReadDiagnosticVariant(handle: ReadDiagnosticCapture): String = operationLock.withLock {
+    internal suspend fun captureReadDiagnosticVariant(handle: ReadDiagnosticCapture): String =
+        captureReadDiagnosticVariant(handle, null, null)
+
+    /** Separate USB-only structure export. No text, executable observations or shopping evidence. */
+    internal suspend fun captureReadDiagnosticStructure(handle: ReadDiagnosticCapture): Pair<String, String?> {
+        var exported: String? = null
+        val collector = PhoneDebugStructureCapture(now = SystemClock::elapsedRealtime)
+        val outcome = captureReadDiagnosticVariant(handle, collector) { exported = it }
+        val stillAuthorized = withContext(Dispatchers.Main.immediate) {
+            currentReadDiagnostics(handle.token) === handle
+        }
+        if (!stillAuthorized || outcome !in setOf("COMPLETE", "INCOMPLETE")) {
+            collector.abort()
+            return outcome to null
+        }
+        return outcome to exported
+    }
+
+    private suspend fun captureReadDiagnosticVariant(
+        handle: ReadDiagnosticCapture,
+        structureCollector: PhoneDebugStructureCapture?,
+        publishStructure: ((String) -> Unit)?,
+    ): String = operationLock.withLock {
         withContext(Dispatchers.Main.immediate) {
             if (!BuildConfig.DEBUG || readDiagnostics.get() !== handle) return@withContext "DIAGNOSTICS_INACTIVE"
             refreshEnvironment()
@@ -289,7 +311,7 @@ class AccessibilityPhoneBackend(
                     attempt.rootRefresh = ReadDiagnosticOperation.SUCCEEDED
                     if (!readContext.isActive || !valid() || capturedRoot.windowId != expected.windowId ||
                         capturedRoot.packageName?.toString() != handle.targetPackage) throw TreeReadAborted()
-                    reader.capture(capturedRoot, handle.targetPackage, attempt.tree, handle.profile) {
+                    reader.capture(capturedRoot, handle.targetPackage, attempt.tree, handle.profile, structureCollector) {
                         readContext.isActive && valid()
                     }
                 }
@@ -298,6 +320,15 @@ class AccessibilityPhoneBackend(
                     checkNotNull(tree).sensitive -> "SENSITIVE"
                     checkNotNull(tree).truncated -> "INCOMPLETE"
                     else -> "COMPLETE"
+                }
+                if (outcome in setOf("COMPLETE", "INCOMPLETE") && valid()) {
+                    structureCollector?.finish(
+                        captureId = sample.id, sourceProfile = handle.profile.name,
+                        windowId = capturedRoot.windowId, revision = expected.revision,
+                        treeTruncated = checkNotNull(tree).truncated, issues = checkNotNull(tree).inspectionIssues,
+                        windowIdentity = expected.identity, actualServiceFlags = attempt.serviceFlags,
+                        treeNodeLimit = handle.profile.nodeLimit,
+                    )?.let { published -> if (valid()) publishStructure?.invoke(published) }
                 }
             } catch (cancelled: CancellationException) {
                 outcome = "CANCELLED"
