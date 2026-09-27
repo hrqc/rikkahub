@@ -75,6 +75,7 @@ class ChatToolFactory(
         )?.let { token ->
             addAll(createPhoneTools(phoneController, token, json))
             addAll(createShoppingTools(json) { phoneController.shoppingEvidence(token) })
+            addAll(createShoppingReviewTools(json) { phoneController.shoppingEvidence(token) })
         }
         if (assistant.enableMemory) {
             val memoryAssistantId = if (assistant.useGlobalMemory) {

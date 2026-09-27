@@ -18,6 +18,7 @@ import android.view.accessibility.AccessibilityWindowInfo
 import androidx.core.content.FileProvider
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.NonCancellable
 import kotlinx.coroutines.currentCoroutineContext
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
@@ -63,6 +64,7 @@ class AccessibilityPhoneBackend(
     private val snapshot = AtomicReference<Snapshot?>(null)
     private val readDiagnostics = AtomicReference<ReadDiagnosticCapture?>(null)
     private val readDiagnosticAuthority = ReadDiagnosticAuthority()
+    private val readDiagnosticFlags = AtomicReference<ReadDiagnosticFlagLease?>(null)
     // Accessed only on Main. Contains package metadata, never accessibility text or event.source.
     private val windowPackages = mutableMapOf<Int, String>()
     private var controlOverlayWindowId: Int? = null
@@ -70,7 +72,14 @@ class AccessibilityPhoneBackend(
     private var lastWindowCount: Int? = null
 
     private data class SessionNotice(val token: PhoneSessionToken, val targetPackage: String, val onStop: (PhoneBackendStopReason) -> Unit)
-    private data class Snapshot(val token: PhoneSessionToken, val observation: PhoneObservation, val tree: AndroidTreeCapture)
+    private data class Snapshot(
+        val token: PhoneSessionToken,
+        val observation: PhoneObservation,
+        val tree: AndroidTreeCapture,
+        val identity: Long,
+        val capability: PhoneSnapshotCapability,
+        val capturedAtElapsedMillis: Long = SystemClock.elapsedRealtime(),
+    )
     private data class EventMetadata(val type: Int, val windowId: Int, val packageName: String?)
 
     override fun isTargetAllowed(packageName: String): Boolean {
@@ -85,6 +94,7 @@ class AccessibilityPhoneBackend(
     }
 
     override fun showSessionNotice(token: PhoneSessionToken, targetPackage: String, onStop: (PhoneBackendStopReason) -> Unit): Boolean {
+        if (!restoreReadDiagnosticFlags()) return false
         if (!notifications.show(token, targetPackage)) return false
         readDiagnostics.get()?.takeIf { it.token != token }?.stop(ReadDiagnosticStop.REPLACED)
         activeNotice.set(SessionNotice(token, targetPackage, onStop))
@@ -95,6 +105,7 @@ class AccessibilityPhoneBackend(
     override fun endSessionNotice() {
         readDiagnosticAuthority.revoke()
         readDiagnostics.get()?.stop(ReadDiagnosticStop.SESSION_INVALIDATED)
+        restoreReadDiagnosticFlags()
         activeNotice.set(null)
         notifications.cancel()
     }
@@ -105,6 +116,11 @@ class AccessibilityPhoneBackend(
     }
 
     fun onServiceConnected(connectedService: AccessibilityService) {
+        if (service.get() !== connectedService) {
+            readDiagnosticAuthority.revoke()
+            readDiagnostics.get()?.stop(ReadDiagnosticStop.SESSION_INVALIDATED)
+            restoreReadDiagnosticFlags()
+        }
         if (service.getAndSet(connectedService) !== connectedService) {
             val stopPreviousSession = activeNotice.get()?.onStop
             invalidate()
@@ -116,6 +132,11 @@ class AccessibilityPhoneBackend(
     }
 
     fun onServiceDisconnected(disconnectedService: AccessibilityService) {
+        if (service.get() === disconnectedService) {
+            readDiagnosticAuthority.revoke()
+            readDiagnostics.get()?.stop(ReadDiagnosticStop.SESSION_INVALIDATED)
+            restoreReadDiagnosticFlags()
+        }
         if (!service.compareAndSet(disconnectedService, null)) return
         val stopSession = activeNotice.get()?.onStop
         invalidate()
@@ -173,7 +194,10 @@ class AccessibilityPhoneBackend(
     }
 
     /** Debug instrumentation only. A handle grants no reads or actions by itself. */
-    internal suspend fun beginReadDiagnostics(token: PhoneSessionToken): ReadDiagnosticCapture = withContext(Dispatchers.Main.immediate) {
+    internal suspend fun beginReadDiagnostics(
+        token: PhoneSessionToken,
+        profile: ReadDiagnosticProfile = ReadDiagnosticProfile.DEFAULT,
+    ): ReadDiagnosticCapture = withContext(Dispatchers.Main.immediate) {
         if (!BuildConfig.DEBUG) fail("DIAGNOSTICS_DISABLED", "诊断仅用于调试构建。")
         val notice = activeNotice.get()?.takeIf { it.token == token && readDiagnosticAuthority.allows(token) }
             ?: fail("SESSION_INACTIVE", "诊断必须绑定当前授权。")
@@ -183,6 +207,7 @@ class AccessibilityPhoneBackend(
             fail("FOREGROUND_CONFLICT", "诊断目标必须保持在前台。")
         }
         if (readDiagnostics.get()?.isRecording() == true) fail("DIAGNOSTICS_BUSY", "已有只读诊断正在记录。")
+        if (!restoreReadDiagnosticFlags()) fail("DIAGNOSTICS_CLEANUP_FAILED", "上次诊断配置尚未恢复。")
         val info = service.get()?.serviceInfo
         readDiagnosticAuthority.whileAuthorized(token) {
             ReadDiagnosticCapture(
@@ -190,13 +215,141 @@ class AccessibilityPhoneBackend(
                 Build.VERSION.SDK_INT, BuildConfig.VERSION_NAME,
                 now = SystemClock::elapsedRealtime, wallTime = System::currentTimeMillis,
                 maxBytes = 112 * 1024,
+                profile = profile,
             ).also { readDiagnostics.set(it) }
         } ?: fail("SESSION_INACTIVE", "诊断授权已失效。")
     }
 
     internal fun finishReadDiagnostics(handle: ReadDiagnosticCapture): List<String> {
+        restoreReadDiagnosticFlags(handle.runId)
         readDiagnostics.compareAndSet(handle, null)
         return handle.finish()
+    }
+
+    /** Isolated read experiment: never publishes Snapshot/PhoneObservation or dispatches an action. */
+    internal suspend fun captureReadDiagnosticVariant(handle: ReadDiagnosticCapture): String = operationLock.withLock {
+        withContext(Dispatchers.Main.immediate) {
+            if (!BuildConfig.DEBUG || readDiagnostics.get() !== handle) return@withContext "DIAGNOSTICS_INACTIVE"
+            refreshEnvironment()
+            if (currentReadDiagnostics(handle.token) !== handle) return@withContext "DIAGNOSTICS_INACTIVE"
+            if (!notifications.canPost()) return@withContext "STOP_UNAVAILABLE"
+            val connectedService = service.get() ?: return@withContext "ACCESSIBILITY_DISCONNECTED"
+            val sample = handle.beginSample() ?: return@withContext "DIAGNOSTICS_INACTIVE"
+            val attempt = handle.beginAttempt(sample, readDiagnosticWindow())
+                ?: return@withContext "DIAGNOSTICS_INACTIVE"
+            attempt.variantRead = true
+            attempt.profile = handle.profile
+            attempt.treeNodeLimit = handle.profile.nodeLimit
+            var outcome = "OBSERVATION_UNAVAILABLE"
+            var tree: AndroidTreeCapture? = null
+            var root: AccessibilityNodeInfo? = null
+            try {
+                // Any previously executable snapshot is invalid before changing the read configuration.
+                snapshot.set(null)
+                revision.incrementAndGet()
+                mutableState.update { it.copy(windowRevision = revision.get()) }
+                synchronized(readDiagnosticFlags) {
+                    if (readDiagnosticFlags.get() != null) fail("DIAGNOSTICS_BUSY", "诊断配置仍在使用。")
+                    if (currentReadDiagnostics(handle.token) !== handle || service.get() !== connectedService) {
+                        fail("SESSION_INACTIVE", "诊断授权已失效。")
+                    }
+                    val info = connectedService.serviceInfo ?: fail("ACCESSIBILITY_DISCONNECTED", "服务信息不可用。")
+                    val originalFlags = info.flags
+                    val requestedFlags = handle.profile.applyFlags(originalFlags)
+                    readDiagnosticFlags.set(ReadDiagnosticFlagLease(handle.token, handle.runId, connectedService, originalFlags, requestedFlags))
+                    info.flags = requestedFlags
+                    connectedService.serviceInfo = info
+                    attempt.serviceFlags = connectedService.serviceInfo?.flags
+                    if (attempt.serviceFlags != requestedFlags) fail("DIAGNOSTIC_PROFILE_NOT_APPLIED", "诊断配置未生效。")
+                }
+                refreshEnvironment()
+                if (currentReadDiagnostics(handle.token) !== handle) fail("SESSION_INACTIVE", "诊断授权已失效。")
+                val expected = readDiagnosticWindow()
+                attempt.window = expected
+                root = withWindows { windows ->
+                    val target = selectedWindow(windows)?.takeIf {
+                        it.id == expected.windowId && windowPackages[it.id] == handle.targetPackage
+                    } ?: fail("FOREGROUND_CONFLICT", "诊断目标窗口已改变。")
+                    if (Build.VERSION.SDK_INT >= 33) target.getRoot(0) else target.root
+                } ?: fail("WINDOW_UNAVAILABLE", "当前目标窗口无法读取。")
+                val capturedRoot = checkNotNull(root)
+                fun valid(): Boolean = readDiagnosticValid(handle, connectedService, expected)
+                if (!valid() || capturedRoot.windowId != expected.windowId || capturedRoot.packageName?.toString() != handle.targetPackage) {
+                    throw TreeReadAborted()
+                }
+                if (Build.VERSION.SDK_INT >= 33) {
+                    attempt.cacheClear = ReadDiagnosticOperation.FAILED
+                    if (connectedService.clearCachedSubtree(capturedRoot)) attempt.cacheClear = ReadDiagnosticOperation.SUCCEEDED
+                }
+                tree = withContext(Dispatchers.Default) {
+                    val readContext = currentCoroutineContext()
+                    if (!readContext.isActive || !valid()) throw TreeReadAborted()
+                    attempt.rootRefresh = ReadDiagnosticOperation.FAILED
+                    if (!capturedRoot.refresh()) throw TreeReadAborted()
+                    attempt.rootRefresh = ReadDiagnosticOperation.SUCCEEDED
+                    if (!readContext.isActive || !valid() || capturedRoot.windowId != expected.windowId ||
+                        capturedRoot.packageName?.toString() != handle.targetPackage) throw TreeReadAborted()
+                    reader.capture(capturedRoot, handle.targetPackage, attempt.tree, handle.profile) {
+                        readContext.isActive && valid()
+                    }
+                }
+                if (!valid()) throw TreeReadAborted()
+                outcome = when {
+                    checkNotNull(tree).sensitive -> "SENSITIVE"
+                    checkNotNull(tree).truncated -> "INCOMPLETE"
+                    else -> "COMPLETE"
+                }
+            } catch (cancelled: CancellationException) {
+                outcome = "CANCELLED"
+                throw cancelled
+            } catch (_: TreeReadAborted) {
+                outcome = "INVALIDATED"
+            } catch (failure: PhoneControlException) {
+                outcome = failure.code
+            } catch (_: Exception) {
+                outcome = "OBSERVATION_UNAVAILABLE"
+            } finally {
+                withContext(NonCancellable + Dispatchers.Main.immediate) {
+                    root?.let(::recycleNode)
+                    if (!restoreReadDiagnosticFlags(handle.runId)) outcome = "DIAGNOSTICS_CLEANUP_FAILED"
+                    handle.endAttempt(attempt, readDiagnosticWindow(), outcome, tree?.inspectionIssues.orEmpty(),
+                        tree?.truncated, tree?.previewTruncated, tree?.sensitive)
+                    handle.endSample(sample, outcome, null, readDiagnosticWindow())
+                }
+            }
+            outcome
+        }
+    }
+
+    private fun readDiagnosticValid(handle: ReadDiagnosticCapture, expectedService: AccessibilityService, expected: ReadDiagnosticWindow): Boolean {
+        val current = mutableState.value
+        return readDiagnostics.get() === handle && handle.isRecording() && readDiagnosticAuthority.allows(handle.token) &&
+            activeNotice.get()?.let { it.token == handle.token && it.targetPackage == handle.targetPackage } == true &&
+            service.get() === expectedService && current.connected && !current.locked && !isLocked() &&
+            current.foregroundPackage == handle.targetPackage && current.windowId == expected.windowId &&
+            windowIdentity.get() == expected.identity && revision.get() == expected.revision
+    }
+
+    /** Called before replacing a notice/handle, and from the variant's non-cancellable Main finally. */
+    private fun restoreReadDiagnosticFlags(runId: String? = null): Boolean = synchronized(readDiagnosticFlags) {
+        val lease = readDiagnosticFlags.get() ?: return@synchronized true
+        if (runId != null && lease.runId != runId) return@synchronized true
+        val connectedService = service.get()
+        if (connectedService !== lease.serviceIdentity) {
+            readDiagnosticFlags.compareAndSet(lease, null)
+            return@synchronized true
+        }
+        try {
+            val info = connectedService?.serviceInfo ?: return@synchronized false
+            val restored = lease.restoreFlags(connectedService, activeNotice.get()?.token, readDiagnostics.get()?.runId, info.flags)
+            if (restored != null) {
+                info.flags = restored
+                connectedService.serviceInfo = info
+                if ((connectedService.serviceInfo?.flags?.and(2)) != (lease.originalFlags and 2)) return@synchronized false
+            }
+            readDiagnosticFlags.compareAndSet(lease, null)
+            true
+        } catch (_: Exception) { false }
     }
 
     private fun readDiagnosticWindow() = ReadDiagnosticWindow(
@@ -281,6 +434,7 @@ class AccessibilityPhoneBackend(
                     },
                     capture = { version ->
                         val attempt = diagnosticSample?.let { diagnostic?.beginAttempt(it, readDiagnosticWindow()) }
+                            ?.also { it.serviceFlags = service.get()?.serviceInfo?.flags }
                         var attemptOutcome = "OBSERVATION_UNAVAILABLE"
                         var inspectedTree: AndroidTreeCapture? = null
                         try {
@@ -309,26 +463,38 @@ class AccessibilityPhoneBackend(
                                     )
                                 ) {
                                     // Discard stale descendant metadata only for this verified target.
-                                    // The retry policy discards this entire capture; no old paths are reused.
+                                    // A later attempt reacquires the root; a final limited snapshot
+                                    // still needs an independent fresh tree and node resolution to scroll.
                                     attempt?.cacheClear = ReadDiagnosticOperation.FAILED
                                     val cleared = service.get()?.clearCachedSubtree(root)
                                     attempt?.cacheClear = if (cleared == true) ReadDiagnosticOperation.SUCCEEDED else ReadDiagnosticOperation.FAILED
                                 }
+                                val scrollNodes = nativeScrollNodes(tree)
+                                val scrollOnly = canUseNativeScrollOnly(tree.sensitive, tree.truncated, tree.inspectionIssues, scrollNodes)
                                 val observation = PhoneObservation(
                                     id = UUID.randomUUID().toString(),
                                     packageName = permit.targetPackage,
                                     windowId = root.windowId,
                                     windowRevision = version.revision,
                                     capturedAtMillis = System.currentTimeMillis(),
-                                    nodes = if (tree.sensitive) tree.nodes.map { it.copy(text = "", description = "") } else tree.nodes,
+                                    nodes = when {
+                                        tree.sensitive -> tree.nodes.map { it.copy(text = "", description = "") }
+                                        scrollOnly -> nativeScrollOnlyPreview(scrollNodes)
+                                        else -> tree.nodes
+                                    },
                                     truncated = tree.truncated,
                                     sensitive = tree.sensitive,
                                     fingerprint = tree.fingerprint,
                                     previewTruncated = tree.previewTruncated,
                                     inspectionIssues = tree.inspectionIssues,
+                                    scrollOnly = scrollOnly,
                                 )
                                 attemptOutcome = when { tree.sensitive -> "SENSITIVE"; tree.truncated -> "INCOMPLETE"; else -> "COMPLETE" }
-                                Snapshot(permit.token, observation, tree)
+                                Snapshot(permit.token, observation, tree, version.identity, when {
+                                    scrollOnly -> PhoneSnapshotCapability.NATIVE_SCROLL_ONLY
+                                    !tree.sensitive && !tree.truncated -> PhoneSnapshotCapability.FULL
+                                    else -> PhoneSnapshotCapability.NONE
+                                })
                             } catch (_: TreeReadAborted) {
                                 throw PhoneObservationInvalidated()
                             } catch (error: PhoneControlException) {
@@ -358,10 +524,11 @@ class AccessibilityPhoneBackend(
                             captured.tree.sensitive, captured.tree.truncated, captured.tree.inspectionIssues,
                         )
                     },
+                    acceptLastStable = { it.capability == PhoneSnapshotCapability.NATIVE_SCROLL_ONLY },
                 )
                 // Nothing is published until a whole read finishes at its original revision.
                 snapshot.set(captured)
-                diagnosticOutcome = "OBSERVED"
+                diagnosticOutcome = if (captured.observation.scrollOnly) "OBSERVED_SCROLL_ONLY" else "OBSERVED"
                 diagnosticSnapshotId = captured.observation.id
                 captured.observation
             } catch (error: PhoneControlException) {
@@ -383,16 +550,34 @@ class AccessibilityPhoneBackend(
             withContext(Dispatchers.Main.immediate) {
                 try {
                     requirePermit(permit, requireTarget = action != PhoneAction.OpenApp)
-                    if (action == PhoneAction.OpenApp) return@withContext openTarget(permit)
+                    if (action == PhoneAction.OpenApp) {
+                        if (snapshot.get()?.capability == PhoneSnapshotCapability.NATIVE_SCROLL_ONLY) {
+                            fail("SCROLL_ONLY", "本次不完整观察仅允许已验证列表的原生滚动，请重新观察后执行其他动作。")
+                        }
+                        return@withContext openTarget(permit)
+                    }
                     val stored = validatedSnapshot(permit, observation)
+                    if (stored.capability == PhoneSnapshotCapability.NATIVE_SCROLL_ONLY &&
+                        !nativeScrollOnlyRequestAllowed(stored.capability, stored.observation, observation, action)) {
+                        fail("SCROLL_ONLY", "本次不完整观察仅允许已验证列表的原生滚动。")
+                    }
                     // Re-read the bounded target tree immediately before dispatch. A newly displayed
                     // payment/password prompt elsewhere in the window must invalidate this action too.
                     val root = authorizedRoot(permit)
                     try {
                         val latest = withContext(Dispatchers.Default) {
-                            reader.capture(root, permit.targetPackage) {
-                                validAtRevision(permit, stored.observation.windowRevision)
+                            if (stored.capability == PhoneSnapshotCapability.NATIVE_SCROLL_ONLY &&
+                                (!validNativeScrollSnapshot(permit, stored) || !root.refresh() ||
+                                    root.windowId != stored.observation.windowId || root.packageName?.toString() != permit.targetPackage)) {
+                                throw TreeReadAborted()
                             }
+                            reader.capture(root, permit.targetPackage) {
+                                if (stored.capability == PhoneSnapshotCapability.NATIVE_SCROLL_ONLY) validNativeScrollSnapshot(permit, stored)
+                                else validAtRevision(permit, stored.observation.windowRevision)
+                            }
+                        }
+                        if (stored.capability == PhoneSnapshotCapability.NATIVE_SCROLL_ONLY) {
+                            return@withContext executeNativeScrollOnly(permit, stored, latest, root, action as PhoneAction.Scroll)
                         }
                         if (latest.sensitive || latest.truncated) {
                             throw PhoneControlException("USER_REQUIRED", "页面含敏感内容或未能完整检查，请由用户接手。")
@@ -561,8 +746,80 @@ class AccessibilityPhoneBackend(
             fail("STALE_SNAPSHOT", "界面快照不属于当前会话或已过期。")
         }
         requireRevision(permit, observation.windowRevision)
-        if (observation.sensitive || observation.truncated) fail("USER_REQUIRED", "页面含敏感内容或未能完整检查，请由用户接手。")
+        if (stored.identity != windowIdentity.get() || observation.windowId != mutableState.value.windowId) {
+            fail("STALE_WINDOW", "目标窗口身份已改变，请重新观察。")
+        }
+        if (stored.capability == PhoneSnapshotCapability.NONE || observation.sensitive ||
+            (observation.truncated && stored.capability != PhoneSnapshotCapability.NATIVE_SCROLL_ONLY) ||
+            (observation.scrollOnly != (stored.capability == PhoneSnapshotCapability.NATIVE_SCROLL_ONLY))) {
+            fail("USER_REQUIRED", "页面含敏感内容或不具备本次动作所需的观察能力，请由用户接手。")
+        }
         return stored
+    }
+
+    private fun nativeScrollNodes(tree: AndroidTreeCapture): List<PhoneNode> = tree.nodes.mapNotNull { node ->
+        val handle = tree.handles[node.id] ?: return@mapNotNull null
+        if (node.id !in tree.nativeScrollNodeIds || isNativeScrollPathRestricted(handle.path, tree.restrictedPaths)) return@mapNotNull null
+        // Complete-page click guards include transaction descendants. Native scrolling needs its
+        // own node/ancestor guard and never activates those descendant controls.
+        node.copy(requiresUserConfirmation = handle.signature.requiresUserConfirmation)
+            .takeIf(::isNativeScrollOnlyNode)
+    }
+
+    private fun validNativeScrollSnapshot(permit: PhonePermit, stored: Snapshot): Boolean =
+        snapshot.get() === stored && stored.token == permit.token && stored.identity == windowIdentity.get() &&
+            stored.observation.windowId == mutableState.value.windowId &&
+            SystemClock.elapsedRealtime() - stored.capturedAtElapsedMillis in 0..15_000 &&
+            System.currentTimeMillis() - stored.observation.capturedAtMillis in 0..15_000 &&
+            validAtRevision(permit, stored.observation.windowRevision)
+
+    private fun requireNativeScrollSnapshot(permit: PhonePermit, stored: Snapshot) {
+        requireRevision(permit, stored.observation.windowRevision)
+        if (!validNativeScrollSnapshot(permit, stored)) fail("STALE_SNAPSHOT", "本次受限滚动观察已失效，请重新观察。")
+    }
+
+    /** This branch has no coordinate gesture, global action, screenshot or Root fallback. */
+    private suspend fun executeNativeScrollOnly(
+        permit: PhonePermit,
+        stored: Snapshot,
+        latest: AndroidTreeCapture,
+        root: AccessibilityNodeInfo,
+        action: PhoneAction.Scroll,
+    ): PhoneBackendResult {
+        val candidates = nativeScrollNodes(latest)
+        if (!latest.sensitive && !latest.truncated) {
+            fail("STALE_WINDOW", "页面已恢复完整，请重新观察后继续；旧的受限观察不能自动提升权限。")
+        }
+        if (!canUseNativeScrollOnly(latest.sensitive, latest.truncated, latest.inspectionIssues, candidates)) {
+            fail("INCOMPLETE_SCREEN", "当前页面已不符合受限原生滚动条件，请重新观察。")
+        }
+        if (latest.fingerprint != stored.tree.fingerprint) fail("STALE_WINDOW", "页面内容已改变，请重新观察后滚动。")
+        val handle = latest.handles[action.nodeId]
+            ?: fail("NODE_UNAVAILABLE", "滚动节点不在当前观察中。")
+        if (candidates.none { it.id == action.nodeId } || handle != stored.tree.handles[action.nodeId]) {
+            fail("STALE_NODE", "滚动节点或其受限状态已改变，请重新观察。")
+        }
+        requireNativeScrollSnapshot(permit, stored)
+        val node = withContext(Dispatchers.Default) {
+            val readContext = currentCoroutineContext()
+            reader.resolve(root, handle, strictNativeScroll = true) {
+                readContext.isActive && validNativeScrollSnapshot(permit, stored)
+            }
+        } ?: fail("STALE_NODE", "滚动节点或祖先已改变，请重新观察。")
+        try {
+            if (!node.isVisibleToUser || !node.isEnabled || node.isPassword || !node.isScrollable ||
+                (Build.VERSION.SDK_INT >= 34 && node.isAccessibilityDataSensitive)) {
+                fail("ACTION_UNSUPPORTED", "当前节点不可执行受限原生滚动。")
+            }
+            val nativeAction = if (action.forward) AccessibilityNodeInfo.ACTION_SCROLL_FORWARD else AccessibilityNodeInfo.ACTION_SCROLL_BACKWARD
+            if (node.actionList.none { it.id == nativeAction }) fail("ACTION_UNSUPPORTED", "该列表未提供所请求方向的原生滚动动作。")
+            requireNativeScrollSnapshot(permit, stored)
+            val dispatched = node.performAction(nativeAction)
+            return PhoneBackendResult(dispatched, if (dispatched) "已请求列表原生滚动；页面仍须重新观察核对。"
+                else "列表未接受原生滚动，未执行其他后备动作；请重新观察。")
+        } finally {
+            recycleNode(node)
+        }
     }
 
     private suspend fun withNode(root: AccessibilityNodeInfo, stored: Snapshot, nodeId: String, permit: PhonePermit, action: suspend (AccessibilityNodeInfo) -> PhoneBackendResult): PhoneBackendResult {

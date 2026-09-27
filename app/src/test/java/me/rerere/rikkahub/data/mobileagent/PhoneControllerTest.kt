@@ -31,9 +31,12 @@ class PhoneControllerTest {
         var noticeAllowed = true
         var sensitive = false
         var truncated = false
+        var scrollOnly = false
+        var inspectionIssues = emptyList<String>()
         var previewTruncated = false
         var password = false
         var text = "Safe button"
+        var extraNodes = emptyList<PhoneNode>()
         var fingerprint = "page"
         var changes = true
         var accepts = true
@@ -61,8 +64,9 @@ class PhoneControllerTest {
                 "snapshot$reads", "com.example.target", 7, state.value.windowRevision, now(),
                 listOf(PhoneNode("button", text = text, bounds = PhoneBounds(0, 0, 50, 50), clickable = true, password = password),
                     PhoneNode("editor", bounds = PhoneBounds(0, 50, 100, 100), editable = true),
-                    PhoneNode("scroll", bounds = PhoneBounds(0, 100, 100, 500), scrollable = true)),
+                    PhoneNode("scroll", bounds = PhoneBounds(0, 100, 100, 500), scrollable = true)) + extraNodes,
                 truncated, sensitive, fingerprint, previewTruncated = previewTruncated,
+                inspectionIssues = inspectionIssues, scrollOnly = scrollOnly,
             )
         }
         override suspend fun execute(permit: PhonePermit, observation: PhoneObservation?, action: PhoneAction): PhoneBackendResult {
@@ -83,15 +87,193 @@ class PhoneControllerTest {
         "INCOMPLETE_SCREEN" to "未能完整检查目标页面，任务已暂停；请检查页面后手动继续。",
     )
 
+    @Test fun `scroll only observation strips product text and actions without adding shopping evidence`() = runBlocking {
+        Fixture().use { f ->
+            val token = f.start()
+            f.controller.observe(token)
+            val completeEvidence = f.controller.shoppingEvidence(token)
+            f.backend.truncated = true
+            f.backend.scrollOnly = true
+            f.backend.inspectionIssues = listOf("unavailable_child")
+            val partial = f.controller.observe(token)
+            assertTrue(partial.scrollOnly)
+            assertTrue(partial.truncated)
+            assertEquals(listOf("scroll"), partial.nodes.map { it.id })
+            assertTrue(partial.nodes.all { it.text.isEmpty() && it.description.isEmpty() && !it.clickable && !it.editable })
+            assertEquals(completeEvidence, f.controller.shoppingEvidence(token))
+            val moved = f.controller.act(token, partial.id, PhoneAction.Scroll("scroll", true))
+            assertTrue(moved.accepted)
+            assertTrue(moved.screenChanged)
+            assertTrue(moved.observation!!.scrollOnly)
+            assertEquals(1, f.backend.actions)
+            assertEquals(completeEvidence, f.controller.shoppingEvidence(token))
+            expectCode("STALE_SNAPSHOT") { f.controller.act(token, partial.id, PhoneAction.Scroll("scroll", true)) }
+            f.controller.pause()
+            assertTrue(f.controller.shoppingEvidence(token).isEmpty())
+        }
+    }
+
+    @Test fun `scroll only observations reject every other action before dispatch`() = runBlocking {
+        val blocked = listOf(PhoneAction.Click("scroll"), PhoneAction.LongClick("scroll"),
+            PhoneAction.InputText("scroll", "test"), PhoneAction.Swipe(PhoneSwipeDirection.UP),
+            PhoneAction.Back, PhoneAction.Screenshot, PhoneAction.OpenApp)
+        for (action in blocked) Fixture().use { f ->
+            val token = f.start(allowScreenshots = true)
+            f.backend.truncated = true
+            f.backend.scrollOnly = true
+            f.backend.inspectionIssues = listOf("unavailable_child")
+            val screen = f.controller.observe(token)
+            expectCode("SCROLL_ONLY") { f.controller.act(token, screen.id, action) }
+            assertEquals(0, f.backend.actions)
+            assertTrue(f.controller.shoppingEvidence(token).isEmpty())
+        }
+    }
+
+    @Test fun `forged scroll capability cannot hide other inspection gaps or sensitive content`() = runBlocking {
+        for (issues in listOf(emptyList(), listOf("unavailable_child", "visit_limit"), listOf("foreign_node"))) {
+            Fixture().use { f ->
+                val token = f.start()
+                f.backend.truncated = true
+                f.backend.scrollOnly = true
+                f.backend.inspectionIssues = issues
+                expectCode("INCOMPLETE_SCREEN") { f.controller.observe(token) }
+                assertEquals(0, f.backend.actions)
+            }
+        }
+        Fixture().use { f ->
+            val token = f.start()
+            f.backend.scrollOnly = true
+            f.backend.inspectionIssues = listOf("unavailable_child")
+            expectCode("INCOMPLETE_SCREEN") { f.controller.observe(token) }
+        }
+        Fixture().use { f ->
+            val token = f.start()
+            f.backend.truncated = true
+            f.backend.scrollOnly = true
+            f.backend.inspectionIssues = listOf("unavailable_child")
+            f.backend.text = "支付密码"
+            expectCode("USER_HANDOVER_REQUIRED") { f.controller.observe(token) }
+        }
+    }
+
+    @Test fun `scroll only snapshot remains stale on revision age stop and lock`() = runBlocking {
+        for (change in listOf("revision", "age", "stop", "lock")) Fixture().use { f ->
+            val token = f.start()
+            f.backend.truncated = true
+            f.backend.scrollOnly = true
+            f.backend.inspectionIssues = listOf("unavailable_child")
+            val screen = f.controller.observe(token)
+            when (change) {
+                "revision" -> f.backend.state.value = f.backend.state.value.copy(windowRevision = 2)
+                "age" -> f.time += 10_001
+                "stop" -> f.controller.stop()
+                "lock" -> f.backend.state.value = f.backend.state.value.copy(locked = true)
+            }
+            expectCode(if (change in listOf("revision", "age")) "STALE_SNAPSHOT" else "SESSION_INVALID") {
+                f.controller.act(token, screen.id, PhoneAction.Scroll("scroll", true))
+            }
+            assertEquals(0, f.backend.actions)
+        }
+    }
+
+    @Test fun `failed native scroll is not retried and consumes its partial snapshot`() = runBlocking {
+        Fixture().use { f ->
+            val token = f.start()
+            f.backend.truncated = true
+            f.backend.scrollOnly = true
+            f.backend.inspectionIssues = listOf("unavailable_child")
+            f.backend.accepts = false
+            val screen = f.controller.observe(token)
+            assertFalse(f.controller.act(token, screen.id, PhoneAction.Scroll("scroll", true)).accepted)
+            expectCode("STALE_SNAPSHOT") { f.controller.act(token, screen.id, PhoneAction.Scroll("scroll", true)) }
+            expectCode("SCROLL_ONLY") { f.controller.act(token, null, PhoneAction.OpenApp) }
+            assertEquals(1, f.backend.actions)
+            f.controller.pause()
+            val resumed = f.controller.resume()
+            expectCode("SCROLL_ONLY") { f.controller.act(resumed, null, PhoneAction.OpenApp) }
+            f.backend.truncated = false
+            f.backend.scrollOnly = false
+            f.backend.inspectionIssues = emptyList()
+            f.controller.observe(resumed)
+            f.backend.accepts = true
+            assertTrue(f.controller.act(resumed, null, PhoneAction.OpenApp).accepted)
+            assertEquals(2, f.backend.actions)
+        }
+    }
+
+    @Test fun `five partial scrolls bound a task even when every page changes`() = runBlocking {
+        Fixture().use { f ->
+            val token = f.start()
+            f.backend.truncated = true
+            f.backend.scrollOnly = true
+            f.backend.inspectionIssues = listOf("unavailable_child")
+            var screen = f.controller.observe(token)
+            repeat(5) {
+                screen = f.controller.act(token, screen.id, PhoneAction.Scroll("scroll", true)).observation!!
+            }
+            expectCode("SCROLL_ONLY_LIMIT") { f.controller.act(token, screen.id, PhoneAction.Scroll("scroll", true)) }
+            assertEquals(5, f.backend.actions)
+            assertEquals(PhoneSessionStatus.PAUSED, f.controller.state.value.status)
+            val resumed = f.controller.resume()
+            screen = f.controller.observe(resumed)
+            expectCode("SCROLL_ONLY_LIMIT") { f.controller.act(resumed, screen.id, PhoneAction.Scroll("scroll", true)) }
+            assertEquals(5, f.backend.actions)
+        }
+    }
+
+    @Test fun `native scroll can reach a complete page without promoting earlier partial evidence`() = runBlocking {
+        Fixture().use { f ->
+            val token = f.start()
+            f.backend.beforeRead = {
+                val partial = f.backend.actions < 2
+                f.backend.truncated = partial
+                f.backend.scrollOnly = partial
+                f.backend.inspectionIssues = if (partial) listOf("unavailable_child") else emptyList()
+                f.backend.text = if (partial) "unverified product price" else "verified visible product"
+            }
+            var screen = f.controller.observe(token)
+            screen = f.controller.act(token, screen.id, PhoneAction.Scroll("scroll", true)).observation!!
+            assertTrue(screen.scrollOnly)
+            assertTrue(f.controller.shoppingEvidence(token).isEmpty())
+            screen = f.controller.act(token, screen.id, PhoneAction.Scroll("scroll", true)).observation!!
+            assertFalse(screen.scrollOnly)
+            assertFalse(screen.truncated)
+            assertEquals(listOf(screen.id), f.controller.shoppingEvidence(token).map { it.snapshotId })
+            assertEquals("verified visible product", f.controller.shoppingEvidence(token).single().nodes.first().text)
+            assertTrue(f.controller.act(token, screen.id, PhoneAction.Click("button")).accepted)
+            assertEquals(3, f.backend.actions)
+        }
+    }
+
+    @Test fun `partial scroll with unchanged content stops without spending all five attempts`() = runBlocking {
+        Fixture().use { f ->
+            val token = f.start()
+            f.backend.truncated = true
+            f.backend.scrollOnly = true
+            f.backend.inspectionIssues = listOf("unavailable_child")
+            f.backend.changes = false
+            var screen = f.controller.observe(token)
+            repeat(3) { screen = f.controller.act(token, screen.id, PhoneAction.Scroll("scroll", true)).observation!! }
+            assertEquals(PhoneSessionStatus.PAUSED, f.controller.state.value.status)
+            assertEquals(3, f.backend.actions)
+            assertTrue(f.controller.shoppingEvidence(token).isEmpty())
+            expectCode("SESSION_INVALID") { f.controller.act(token, screen.id, PhoneAction.Scroll("scroll", true)) }
+        }
+    }
+
     @Test fun `shopping evidence is bounded to real observations and current grant`() = runBlocking {
         Fixture().use { f ->
             val token = f.start()
             assertTrue(f.controller.shoppingEvidence(token).isEmpty())
             repeat(10) { f.controller.observe(token) }
             val evidence = f.controller.shoppingEvidence(token)
-            assertEquals(8, evidence.size)
-            assertEquals("snapshot3", evidence.first().snapshotId)
+            assertEquals(10, evidence.size)
+            assertEquals("snapshot1", evidence.first().snapshotId)
             assertEquals("Safe button", evidence.last().nodes.first().text)
+            expectCode("STALE_SNAPSHOT") { f.controller.act(token, "snapshot1", PhoneAction.Click("button")) }
+            repeat(25) { f.controller.observe(token) }
+            assertEquals(32, f.controller.shoppingEvidence(token).size)
+            assertEquals("snapshot4", f.controller.shoppingEvidence(token).first().snapshotId)
             f.controller.pause()
             assertTrue(f.controller.shoppingEvidence(token).isEmpty())
             val resumed = f.controller.resume()
@@ -101,6 +283,23 @@ class PhoneControllerTest {
             f.controller.stop()
             assertTrue(f.controller.shoppingEvidence(resumed).isEmpty())
             assertTrue(f.controller.shoppingEvidence(f.start()).isEmpty())
+        }
+    }
+
+    @Test fun `large page evidence is evicted by text budget before page count limit`() = runBlocking {
+        Fixture().use { f ->
+            val token = f.start()
+            f.backend.extraNodes = List(97) { index ->
+                PhoneNode("product$index", text = "x".repeat(300), description = "y".repeat(300),
+                    bounds = PhoneBounds(0, 100, 100, 500))
+            }
+            repeat(10) { f.controller.observe(token) }
+            val retained = f.controller.shoppingEvidence(token)
+            assertTrue(retained.size in 1..9)
+            assertFalse(retained.any { it.snapshotId == "snapshot1" })
+            assertTrue(retained.sumOf { page -> page.nodes.sumOf { it.text.length + it.description.length } } <= 256_000)
+            f.controller.pause()
+            assertTrue(f.controller.shoppingEvidence(token).isEmpty())
         }
     }
 

@@ -23,6 +23,7 @@ internal suspend fun <T : Any> readStablePhoneObservation(
     capture: suspend (PhoneObservationVersion) -> T,
     pause: suspend (Long) -> Unit = { delay(it) },
     shouldRetry: (T) -> Boolean = { false },
+    acceptLastStable: (T) -> Boolean = { false },
 ): T {
     val startedAt = nowMillis()
     val initial = version()
@@ -45,7 +46,13 @@ internal suspend fun <T : Any> readStablePhoneObservation(
                 val result = capture(before)
                 if (checkedVersion().revision != before.revision) throw PhoneObservationInvalidated()
                 if (nowMillis() - startedAt >= 4_500) exhausted()
-                if (shouldRetry(result)) throw PhoneObservationInvalidated()
+                if (shouldRetry(result)) {
+                    // A caller may grant a narrower capability for this final, completed read.
+                    // Never retain an earlier result across invalidation, timeout or failed capture.
+                    if (attempt != 3 || !acceptLastStable(result)) throw PhoneObservationInvalidated()
+                    if (checkedVersion().revision != before.revision) throw PhoneObservationInvalidated()
+                    if (nowMillis() - startedAt >= 4_500) exhausted()
+                }
                 return@withTimeoutOrNull result
             } catch (_: PhoneObservationInvalidated) {
                 // This also rechecks STOP, lock, service and package before waiting or reading again.

@@ -43,6 +43,8 @@ internal data class AndroidTreeCapture(
     val fingerprint: String,
     val previewTruncated: Boolean,
     val inspectionIssues: List<String>,
+    val restrictedPaths: List<List<Int>>,
+    val nativeScrollNodeIds: Set<String>,
 )
 
 /** Reads only the already authorized root supplied by the backend. Never queries windows itself. */
@@ -51,11 +53,20 @@ internal class AccessibilityTreeReader {
         const val MAX_CHILDREN = 128
     }
 
-    fun capture(root: AccessibilityNodeInfo, targetPackage: String, diagnostics: ReadDiagnosticTree? = null, isValid: () -> Boolean): AndroidTreeCapture {
+    fun capture(
+        root: AccessibilityNodeInfo,
+        targetPackage: String,
+        diagnostics: ReadDiagnosticTree? = null,
+        diagnosticProfile: ReadDiagnosticProfile? = null,
+        isValid: () -> Boolean,
+    ): AndroidTreeCapture {
+        require(diagnosticProfile == null || diagnostics != null)
         val nodes = mutableListOf<PhoneNode>()
         val handles = linkedMapOf<String, AndroidNodeHandle>()
-        val budget = PhoneTreeReadBudget(SystemClock.elapsedRealtime())
+        val budget = PhoneTreeReadBudget(SystemClock.elapsedRealtime(), diagnosticProfile?.nodeLimit ?: 512)
+        val rootWindowId = if (diagnosticProfile != null) root.windowId else null
         val restrictedPaths = mutableListOf<List<Int>>()
+        val nativeScrollNodeIds = mutableSetOf<String>()
         val inspectedSignatures = mutableListOf<AndroidNodeSignature>()
         var sensitive = false
 
@@ -72,6 +83,18 @@ internal class AccessibilityTreeReader {
                 diagnostics?.foreign(path)
                 budget.markTruncated("foreign_node")
                 return
+            }
+            if (diagnosticProfile?.refreshParents == true && !node.isPassword &&
+                !(Build.VERSION.SDK_INT >= 34 && node.isAccessibilityDataSensitive)) {
+                if (node.windowId != rootWindowId) throw TreeReadAborted()
+                val refreshed = node.refresh()
+                check()
+                diagnostics?.nodeRefresh(refreshed)
+                if (!refreshed) {
+                    budget.markTruncated("node_refresh_failed")
+                    return
+                }
+                if (node.windowId != rootWindowId || node.packageName?.toString() != targetPackage) throw TreeReadAborted()
             }
             val signature = signature(node)
             inspectedSignatures += signature
@@ -106,6 +129,9 @@ internal class AccessibilityTreeReader {
                     requiresUserConfirmation = signature.requiresUserConfirmation,
                 )
                 handles[id] = AndroidNodeHandle(path, signature)
+                if (signature.scrollable && node.actionList.any {
+                        it.id == AccessibilityNodeInfo.ACTION_SCROLL_FORWARD || it.id == AccessibilityNodeInfo.ACTION_SCROLL_BACKWARD
+                    }) nativeScrollNodeIds += id
             }
             // Descendants may repeat the password text without setting isPassword themselves.
             if (signature.sensitive) {
@@ -146,21 +172,38 @@ internal class AccessibilityTreeReader {
         // Preview omission must not omit safety inspection or freshness of the remaining tree.
         val fingerprint = digest(inspectedSignatures.joinToString("\n") { it.toString() })
         return AndroidTreeCapture(guardedNodes, handles, budget.truncated, sensitive, fingerprint,
-            budget.previewTruncated, budget.issues.toList())
+            budget.previewTruncated, budget.issues.toList(), restrictedPaths.toList(), nativeScrollNodeIds.toSet())
     }
 
     /** Returns an owned fresh node; the caller must recycle it on API < 33. */
-    fun resolve(root: AccessibilityNodeInfo, handle: AndroidNodeHandle, isValid: () -> Boolean): AccessibilityNodeInfo? {
+    fun resolve(
+        root: AccessibilityNodeInfo,
+        handle: AndroidNodeHandle,
+        strictNativeScroll: Boolean = false,
+        isValid: () -> Boolean,
+    ): AccessibilityNodeInfo? {
         @Suppress("DEPRECATION")
         var current = AccessibilityNodeInfo.obtain(root)
         try {
+            fun permittedAncestor(): Boolean {
+                if (!isValid()) throw TreeReadAborted()
+                if (!current.refresh()) return false
+                if (!isValid()) throw TreeReadAborted()
+                if (current.windowId != handle.signature.windowId ||
+                    current.packageName?.toString() != handle.signature.packageName) return false
+                val currentSignature = signature(current)
+                return !currentSignature.sensitive && !currentSignature.inspectionIncomplete &&
+                    !currentSignature.requiresUserConfirmation && currentSignature.enabled
+            }
             for (index in handle.path) {
                 if (!isValid()) throw TreeReadAborted()
+                if (strictNativeScroll && !permittedAncestor()) return null
                 if (index !in 0 until current.childCount) return null
                 val next = child(current, index) ?: return null
                 recycleNode(current)
                 current = next
             }
+            if (strictNativeScroll && !permittedAncestor()) return null
             if (!isValid() || !current.refresh() || !current.isVisibleToUser || signature(current) != handle.signature) {
                 return null
             }

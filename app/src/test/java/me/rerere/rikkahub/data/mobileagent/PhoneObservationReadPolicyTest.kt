@@ -16,6 +16,7 @@ class PhoneObservationReadPolicyTest {
 
         suspend fun read(
             shouldRetry: (String) -> Boolean = { false },
+            acceptLastStable: (String) -> Boolean = { false },
             capture: (PhoneObservationVersion) -> String,
         ): String = readStablePhoneObservation(
             nowMillis = { now },
@@ -26,6 +27,7 @@ class PhoneObservationReadPolicyTest {
             capture = { reads++; capture(it) },
             pause = { now += it; waits++; duringWait() },
             shouldRetry = shouldRetry,
+            acceptLastStable = acceptLastStable,
         )
     }
 
@@ -72,6 +74,77 @@ class PhoneObservationReadPolicyTest {
         }
         assertEquals(4, f.reads)
         assertEquals(3, f.waits)
+    }
+
+    @Test fun `explicit limited capability returns only the final stable incomplete read`() = runBlocking {
+        val f = ReadFixture()
+        val accepted = mutableListOf<String>()
+        val result = f.read(shouldRetry = { true }, acceptLastStable = { accepted += it; true }) {
+            "partial-${f.reads}"
+        }
+        assertEquals("partial-4", result)
+        assertEquals(listOf("partial-4"), accepted)
+        assertEquals(4, f.reads)
+        assertEquals(3, f.waits)
+    }
+
+    @Test fun `partial capability never returns an earlier read when the final capture aborts`() = runBlocking {
+        val f = ReadFixture()
+        var capabilityChecks = 0
+        expectCode("PAGE_UNSTABLE") {
+            f.read(shouldRetry = { true }, acceptLastStable = { capabilityChecks++; true }) {
+                if (f.reads == 4) throw PhoneObservationInvalidated()
+                "partial-${f.reads}"
+            }
+        }
+        assertEquals(0, capabilityChecks)
+        assertEquals(4, f.reads)
+    }
+
+    @Test fun `ineligible final partial does not reuse an eligible previous read`() = runBlocking {
+        val f = ReadFixture()
+        expectCode("PAGE_UNSTABLE") {
+            f.read(shouldRetry = { true }, acceptLastStable = { it == "eligible" }) {
+                if (f.reads == 4) "no scroll node" else "eligible"
+            }
+        }
+        assertEquals(4, f.reads)
+    }
+
+    @Test fun `final partial must still have the same revision identity time and permit`() = runBlocking {
+        val cases: List<Pair<String, (ReadFixture) -> Unit>> = listOf(
+            "PAGE_UNSTABLE" to { f -> f.current = f.current.copy(revision = 2) },
+            "STALE_WINDOW" to { f -> f.current = f.current.copy(identity = 2) },
+            "STALE_WINDOW" to { f -> f.current = f.current.copy(windowId = 2) },
+            "PAGE_UNSTABLE" to { f -> f.now = 4_500 },
+            "SESSION_INACTIVE" to { f -> f.denied = "SESSION_INACTIVE" },
+        )
+        cases.forEach { (code, invalidate) ->
+            val f = ReadFixture()
+            expectCode(code) {
+                f.read(shouldRetry = { true }, acceptLastStable = { invalidate(f); true }) { "partial" }
+            }
+            assertEquals(4, f.reads)
+        }
+    }
+
+    @Test fun `late or cancelled partial cannot be accepted`() = runBlocking {
+        val f = ReadFixture()
+        expectCode("PAGE_UNSTABLE") {
+            f.read(shouldRetry = { true }, acceptLastStable = { fail("Too late"); true }) {
+                if (f.reads == 4) f.now = 4_500
+                "partial"
+            }
+        }
+        val cancelled = ReadFixture()
+        val error = runCatching {
+            cancelled.read(shouldRetry = { true }, acceptLastStable = { fail("Cancelled"); true }) {
+                if (cancelled.reads == 4) throw CancellationException("stopped")
+                "partial"
+            }
+        }.exceptionOrNull()
+        assertTrue(error is CancellationException)
+        assertEquals(4, cancelled.reads)
     }
 
     @Test fun `content invalidation and missing children share one total retry budget`() = runBlocking {

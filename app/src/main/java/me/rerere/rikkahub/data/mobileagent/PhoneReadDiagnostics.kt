@@ -10,6 +10,32 @@ import kotlinx.serialization.json.put
 import java.security.MessageDigest
 import java.util.UUID
 
+internal enum class ReadDiagnosticProfile(val includeUnimportant: Boolean, val refreshParents: Boolean) {
+    DEFAULT(false, false),
+    INCLUDE_UNIMPORTANT(true, false),
+    REFRESH_PARENTS(false, true),
+    INCLUDE_UNIMPORTANT_REFRESH_PARENTS(true, true);
+
+    val nodeLimit: Int get() = 768
+    fun applyFlags(flags: Int): Int = if (includeUnimportant) flags or 2 else flags and 2.inv()
+}
+
+/** Only the temporary flag bit is restored; unrelated concurrent configuration is preserved. */
+internal class ReadDiagnosticFlagLease(
+    val token: PhoneSessionToken,
+    val runId: String,
+    val serviceIdentity: Any,
+    val originalFlags: Int,
+    val appliedFlags: Int,
+) {
+    fun restoreFlags(currentService: Any?, currentToken: PhoneSessionToken?, currentRunId: String?, currentFlags: Int): Int? {
+        if (currentService !== serviceIdentity || (currentToken != null && currentToken != token) ||
+            (currentRunId != null && currentRunId != runId)) return null
+        if ((currentFlags and 2) != (appliedFlags and 2)) return null
+        return (currentFlags and 2.inv()) or (originalFlags and 2)
+    }
+}
+
 /** Diagnostic permission is revoked independently of a notification retained while paused. */
 internal class ReadDiagnosticAuthority {
     private var token: PhoneSessionToken? = null
@@ -38,10 +64,14 @@ internal data class ReadDiagnosticSample(val id: String, val index: Int, val sta
 
 internal class ReadDiagnosticAttempt(
     val sample: ReadDiagnosticSample, val index: Int, val startedAt: Long,
-    val window: ReadDiagnosticWindow, val tree: ReadDiagnosticTree,
+    var window: ReadDiagnosticWindow, val tree: ReadDiagnosticTree,
 ) {
     var rootRefresh = ReadDiagnosticOperation.NOT_ATTEMPTED
     var cacheClear = ReadDiagnosticOperation.NOT_ATTEMPTED
+    var profile = ReadDiagnosticProfile.DEFAULT
+    var variantRead = false
+    var serviceFlags: Int? = null
+    var treeNodeLimit = 512
 }
 
 /** No node, text, description, image, exception message or model output is accepted by this model. */
@@ -53,6 +83,7 @@ internal class ReadDiagnosticCapture(
     private val now: () -> Long,
     private val wallTime: () -> Long,
     private val maxBytes: Int = 128 * 1024,
+    val profile: ReadDiagnosticProfile = ReadDiagnosticProfile.DEFAULT,
 ) {
     val runId: String = UUID.randomUUID().toString()
     private val startedAt = now()
@@ -70,6 +101,7 @@ internal class ReadDiagnosticCapture(
         require(maxBytes in 4096..128 * 1024)
         append("begin") {
             put("source", "production_accessibility_backend")
+            put("diagnosticProfile", profile.name)
             put("apiLevel", apiLevel)
             put("appVersion", diagnosticLabel(appVersion, 96))
             put("serviceFlags", serviceFlags?.let(::JsonPrimitive) ?: JsonNull)
@@ -85,6 +117,7 @@ internal class ReadDiagnosticCapture(
                 put("durationMs", 15_000); put("samples", 7); put("attempts", 32)
                 put("events", 128); put("gapsPerAttempt", 20); put("exportBytes", maxBytes)
                 put("treeNodes", 512); put("treeDepth", 40); put("treeTimeMs", 2_000)
+                put("variantTreeNodes", profile.nodeLimit)
                 put("childrenPerNode", 128)
             })
         }
@@ -119,6 +152,10 @@ internal class ReadDiagnosticCapture(
             put("startedElapsedMs", attempt.startedAt); put("durationMs", now() - attempt.startedAt)
             put("windowBefore", diagnosticWindow(attempt.window)); put("windowAfter", diagnosticWindow(window))
             put("rootRefresh", attempt.rootRefresh.name); put("cacheClear", attempt.cacheClear.name)
+            put("readMode", if (attempt.variantRead) "diagnostic_variant" else "normal_observe")
+            put("diagnosticProfile", attempt.profile.name)
+            put("serviceFlags", attempt.serviceFlags?.let(::JsonPrimitive) ?: JsonNull)
+            put("treeNodeLimit", attempt.treeNodeLimit)
             put("outcome", diagnosticCode(outcome))
             put("truncated", truncated?.let(::JsonPrimitive) ?: JsonNull)
             put("previewTruncated", previewTruncated?.let(::JsonPrimitive) ?: JsonNull)
@@ -202,12 +239,19 @@ internal class ReadDiagnosticTree(private val enabled: () -> Boolean = { true })
     private var foreign = 0
     private var missing = 0
     private var scrollable = 0
+    private var nodeRefreshSucceeded = 0
+    private var nodeRefreshFailed = 0
     private var rootChildren: Int? = null
     private var rootHash: String? = null
     private var focusedPath: String? = null
     private var result: JsonObject? = null
 
     private fun canRecord() = result == null && enabled()
+
+    fun nodeRefresh(succeeded: Boolean) {
+        if (!canRecord()) return
+        if (succeeded) nodeRefreshSucceeded++ else nodeRefreshFailed++
+    }
     fun visited() { if (canRecord()) visits++ }
     fun protectedSubtree(path: List<Int>, isVisible: Boolean = false, wasEmitted: Boolean = false) {
         if (!canRecord()) return
@@ -258,6 +302,7 @@ internal class ReadDiagnosticTree(private val enabled: () -> Boolean = { true })
             put("inspectedNodeCount", inspected); put("totalNodeCountKnown", false)
             put("protectedSubtrees", protectedCount); put("foreignSubtrees", foreign)
             put("unavailableChildCount", missing); put("scrollableNodeCount", scrollable)
+            put("nodeRefreshSucceeded", nodeRefreshSucceeded); put("nodeRefreshFailed", nodeRefreshFailed)
             put("focusedNodePath", focusedPath?.let(::JsonPrimitive) ?: JsonNull)
             put("gaps", JsonArray(gaps)); put("gapsOmitted", missing - gaps.size)
         }.also { result = it }

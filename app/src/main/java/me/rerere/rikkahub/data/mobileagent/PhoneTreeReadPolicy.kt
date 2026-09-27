@@ -22,7 +22,8 @@ internal fun samplePhoneNodeText(protected: Boolean, read: () -> CharSequence?):
             .digest(full.toByteArray(Charsets.UTF_8)).joinToString("") { "%02x".format(it) })
 }
 
-internal class PhoneTreeReadBudget(private val startedAtMillis: Long) {
+internal class PhoneTreeReadBudget(private val startedAtMillis: Long, private val maxVisits: Int = 512) {
+    init { require(maxVisits in 1..768) }
     var visits = 0
         private set
     private var emitted = 0
@@ -34,8 +35,8 @@ internal class PhoneTreeReadBudget(private val startedAtMillis: Long) {
     val issues = linkedSetOf<String>()
 
     fun visit(depth: Int, nowMillis: Long): Boolean {
-        if (visits >= 512 || depth > 40 || nowMillis - startedAtMillis > 2_000) {
-            markTruncated(when { visits >= 512 -> "visit_limit"; depth > 40 -> "depth_limit"; else -> "time_limit" })
+        if (visits >= maxVisits || depth > 40 || nowMillis - startedAtMillis > 2_000) {
+            markTruncated(when { visits >= maxVisits -> "visit_limit"; depth > 40 -> "depth_limit"; else -> "time_limit" })
             return false
         }
         visits++
@@ -54,8 +55,8 @@ internal class PhoneTreeReadBudget(private val startedAtMillis: Long) {
     }
 
     fun canContinue(nowMillis: Long): Boolean {
-        if (visits >= 512 || nowMillis - startedAtMillis > 2_000) {
-            markTruncated(if (visits >= 512) "visit_limit" else "time_limit")
+        if (visits >= maxVisits || nowMillis - startedAtMillis > 2_000) {
+            markTruncated(if (visits >= maxVisits) "visit_limit" else "time_limit")
             return false
         }
         return true

@@ -3,6 +3,7 @@ package me.rerere.rikkahub.data.shopping
 import kotlinx.serialization.SerialName
 import kotlinx.serialization.Serializable
 import java.math.BigDecimal
+import java.util.Locale
 
 /** Supplied by the host from real observations in the current grant, never by tool arguments. */
 data class ShoppingObservedEvidence(val snapshotId: String, val packageName: String, val nodes: List<ShoppingObservedNode>)
@@ -121,6 +122,26 @@ data class ShoppingCandidateResult(
 )
 
 @Serializable
+enum class ShoppingRankingBasis { CONFIRMED_PAYABLE, CONFIRMED_PAYABLE_THEN_DISPLAYED_SUBTOTAL, DISPLAYED_SUBTOTAL }
+
+@Serializable
+data class ShoppingDisplayedSubtotalEntry(
+    val id: String,
+    @SerialName("merchandise_subtotal_cents") val merchandiseSubtotalCents: Long,
+    @SerialName("unverified_fees") val unverifiedFees: List<String>,
+    @SerialName("pending_conditions") val pendingConditions: List<String>,
+)
+
+@Serializable
+data class ShoppingDisplayedSubtotalPrefilter(
+    @SerialName("ranked_candidates") val rankedCandidates: List<ShoppingDisplayedSubtotalEntry>,
+    @SerialName("ranking_basis") val rankingBasis: ShoppingRankingBasis = ShoppingRankingBasis.DISPLAYED_SUBTOTAL,
+    @SerialName("is_payable") val isPayable: Boolean = false,
+    @SerialName("is_final_best") val isFinalBest: Boolean = false,
+    val detail: String = "仅按页面展示单价乘以数量升序预筛，同价保持输入顺序，不表示优劣；不加计运费和其他费用，也不另减优惠券。这不是实付价或最终最优，未知费用和券条件仍须核实。",
+)
+
+@Serializable
 data class ShoppingComparisonGroup(
     @SerialName("product_identity") val productIdentity: String,
     val specification: String,
@@ -128,6 +149,8 @@ data class ShoppingComparisonGroup(
     @SerialName("ranked_candidates") val rankedCandidates: List<ShoppingCandidateResult>,
     @SerialName("lowest_confirmed_candidate_ids") val lowestConfirmedCandidateIds: List<String>,
     @SerialName("has_unpriced_candidates") val hasUnpricedCandidates: Boolean,
+    @SerialName("ranking_basis") val rankingBasis: ShoppingRankingBasis,
+    @SerialName("displayed_subtotal_prefilter") val displayedSubtotalPrefilter: ShoppingDisplayedSubtotalPrefilter,
 )
 
 @Serializable
@@ -135,8 +158,12 @@ data class ShoppingComparisonResult(
     val currency: String = "CNY",
     @SerialName("evaluated_at_epoch_ms") val evaluatedAtEpochMillis: Long,
     val groups: List<ShoppingComparisonGroup>,
+    @SerialName("possible_duplicate_candidate_ids") val possibleDuplicateCandidateIds: List<String> = emptyList(),
+    @SerialName("product_binding_verified") val productBindingVerified: Boolean = false,
     val limitations: List<String> = listOf(
         "排序仅限本次已观察证据中商品身份、规格和数量相同的候选，不是全平台最低价。",
+        "当前仅核对引用来自真实观察节点，尚未核证标题、规格、价格、店铺和优惠属于同一商品；候选ID或条数不能证明不同SKU，排序不是最终最优。",
+        "跨快照相同标题和规格仅标记可能重复，可能是同一商品再次出现，也可能是不同店铺同款；不会自动合并或宣称已确认独立商品。",
         "可确认实付基于页面提取的已知价格、费用及已可用优惠；领取后方案仍须实际免费领取成功并在结算页复核。",
         "评分、评价数量和质量证据分别展示；评分高不等于质量最好，页面宣传不构成质量保证。",
         "未计入隐藏优惠、未知规则、会员/订阅、账户状态变更、积分或储值；计算不执行领取、选券、下单或付款。",
@@ -155,6 +182,17 @@ class DiscountEngine(private val nowMillis: () -> Long = System::currentTimeMill
         checkInput(request.compatibility.size <= 66, "叠加关系数量超过上限。")
         val evidence = EvidenceIndex(observed)
         request.candidates.forEach { validateCandidate(it, evidence) }
+        val coreKeys = request.candidates.map { candidate ->
+            coreRefs(candidate).map { it.snapshotId to it.nodeId }
+        }
+        if (coreKeys.distinct().size != coreKeys.size) throw ShoppingComparisonException(
+            "duplicate_candidate_evidence", "多个候选重复引用同一组商品身份、规格和价格节点；更换ID或摘录不能增加不同候选数量，请保留一项并继续观察。",
+        )
+        val possibleDuplicateIds = request.candidates.groupBy {
+            Triple(evidence.source(it.productIdentity.evidence), normalizedFact(it.productIdentity.value), normalizedFact(it.specification.value))
+        }.values.filter { candidates ->
+            candidates.size > 1 && candidates.map { coreRefs(it).map { ref -> ref.snapshotId } }.distinct().size > 1
+        }.flatten().map { it.id }.toSet()
         request.coupons.forEach { coupon ->
             checkId(coupon.id)
             checkInput(coupon.eligibleCandidateIds.isNotEmpty() && coupon.eligibleCandidateIds.size <= 12 &&
@@ -184,15 +222,36 @@ class DiscountEngine(private val nowMillis: () -> Long = System::currentTimeMill
         val now = nowMillis()
         val groups = request.candidates.groupBy { Triple(it.productIdentity.value.trim(), it.specification.value.trim(), it.quantity) }
             .map { (key, candidates) ->
-                val ranked = candidates.map { evaluate(it, request.coupons, pairRules, evidence, now) }
-                    .sortedWith(compareBy<ShoppingCandidateResult> { it.confirmedPlan?.payableCents ?: Long.MAX_VALUE }.thenBy { it.id })
+                val evaluated = candidates.map { evaluate(it, request.coupons, pairRules, evidence, now) }
+                val ranked = evaluated.sortedWith(
+                    compareBy<ShoppingCandidateResult> { it.confirmedPlan?.payableCents ?: Long.MAX_VALUE }
+                        .thenBy { if (it.confirmedPlan == null) it.merchandiseSubtotalCents else 0L },
+                )
                 val lowest = ranked.mapNotNull { it.confirmedPlan?.payableCents }.minOrNull()
+                val basis = when {
+                    ranked.all { it.confirmedPlan != null } -> ShoppingRankingBasis.CONFIRMED_PAYABLE
+                    lowest == null -> ShoppingRankingBasis.DISPLAYED_SUBTOTAL
+                    else -> ShoppingRankingBasis.CONFIRMED_PAYABLE_THEN_DISPLAYED_SUBTOTAL
+                }
+                val prefilter = ShoppingDisplayedSubtotalPrefilter(evaluated.sortedBy { it.merchandiseSubtotalCents }.map {
+                    ShoppingDisplayedSubtotalEntry(it.id, it.merchandiseSubtotalCents, buildList {
+                        if (it.shippingCents == null) add("shipping")
+                        if (it.otherFeesCents == null) add("other_fees")
+                    }, it.unknowns)
+                })
                 ShoppingComparisonGroup(key.first, key.second, key.third, ranked,
                     ranked.filter { lowest != null && it.confirmedPlan?.payableCents == lowest }.map { it.id },
-                    ranked.any { it.confirmedPlan == null })
+                    ranked.any { it.confirmedPlan == null }, basis, prefilter)
             }
-        return ShoppingComparisonResult(evaluatedAtEpochMillis = now, groups = groups)
+        return ShoppingComparisonResult(evaluatedAtEpochMillis = now, groups = groups,
+            possibleDuplicateCandidateIds = request.candidates.map { it.id }.filter { it in possibleDuplicateIds })
     }
+
+    private fun coreRefs(candidate: ShoppingCandidate) = listOf(
+        candidate.productIdentity.evidence, candidate.specification.evidence, candidate.unitPrice.evidence,
+    )
+
+    private fun normalizedFact(value: String) = value.trim().replace(Regex("\\s+"), " ").lowercase(Locale.ROOT)
 
     private fun validateCandidate(candidate: ShoppingCandidate, evidence: EvidenceIndex) {
         checkId(candidate.id)

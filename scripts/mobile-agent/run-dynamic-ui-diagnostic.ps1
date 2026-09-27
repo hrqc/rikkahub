@@ -6,7 +6,9 @@ param(
     [ValidateSet('com.jingdong.app.mall', 'com.heytap.browser', 'com.taobao.taobao', 'com.xunmeng.pinduoduo', 'com.sankuai.meituan', 'me.rerere.rikkahub.debug.test')]
     [string]$Package,
     [Parameter(Mandatory)][string]$OutputDirectory,
-    [ValidateRange(1000,120000)][int]$WaitForServiceMillis = 8000
+    [ValidateRange(1000,120000)][int]$WaitForServiceMillis = 8000,
+    [ValidateSet('DEFAULT','INCLUDE_UNIMPORTANT','REFRESH_PARENTS','INCLUDE_UNIMPORTANT_REFRESH_PARENTS')]
+    [string]$DiagnosticVariant
 )
 $ErrorActionPreference = 'Stop'
 # Explicit invocation only. This does not install APKs, launch the target, or change permissions.
@@ -16,9 +18,12 @@ New-Item -ItemType Directory -Path $destination | Out-Null
 $log = Join-Path $destination 'instrumentation.log'
 $jsonl = Join-Path $destination 'dynamic-ui-diagnostic.jsonl'
 Write-Output 'Starting read-only foreground diagnosis; instrumentation may require the already-authorized service to reconnect.'
+$variantArguments = @()
+if ($DiagnosticVariant) { $variantArguments = @('-e', 'diagnosticVariant', $DiagnosticVariant) }
 & $AdbPath -s $Serial shell am instrument -w -r `
     -e class 'me.rerere.rikkahub.data.mobileagent.PhoneDynamicUiDiagnosticTest#captureCurrentForegroundWithoutActions' `
     -e diagnostic true -e targetPackage $Package -e waitForServiceMillis $WaitForServiceMillis `
+    @variantArguments `
     me.rerere.rikkahub.debug.test/androidx.test.runner.AndroidJUnitRunner 2>&1 | Set-Content -LiteralPath $log -Encoding utf8
 $adbExit = $LASTEXITCODE
 & $PythonPath -B -X utf8 (Join-Path $PSScriptRoot 'decode-dynamic-ui.py') $log $jsonl

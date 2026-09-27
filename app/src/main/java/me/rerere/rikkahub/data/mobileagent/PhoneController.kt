@@ -39,6 +39,8 @@ class PhoneController(
     private var enteredTarget = false
     private var lastUnchangedAction: String? = null
     private var unchangedActions = 0
+    private var partialScrolls = 0
+    private var restrictedToNativeScroll = false
     private var deadline: Job? = null
     private var foregroundDeadline: Job? = null
 
@@ -106,6 +108,8 @@ class PhoneController(
                 enteredTarget = false
                 lastUnchangedAction = null
                 unchangedActions = 0
+                partialScrolls = 0
+                restrictedToNativeScroll = false
                 mutableState.value = PhoneSessionState(
                     token = it, targetPackage = targetPackage, status = PhoneSessionStatus.RUNNING,
                     detail = "已允许本聊天控制选定应用", useRoot = useRoot,
@@ -259,6 +263,9 @@ class PhoneController(
             authorize(token)
             val before = if (action == PhoneAction.OpenApp) null else requireObservation(token, snapshotId)
             if (action == PhoneAction.OpenApp) {
+                if (synchronized(gate) { restrictedToNativeScroll }) {
+                    fail("SCROLL_ONLY", "当前页面检查不完整，仅允许原生节点滚动；请先重新观察。")
+                }
                 val foreground = backend.state.value.foregroundPackage
                 if (foreground != ownPackageName && foreground != state.value.targetPackage) {
                     pauseWith(PhoneSessionStatus.WAITING_FOR_FOREGROUND, "前台不是本应用或目标应用，请确认后恢复", token)
@@ -277,6 +284,13 @@ class PhoneController(
                 if (current.observationsUsed >= current.observationLimit) {
                     pauseWith(PhoneSessionStatus.PAUSED, "观察预算不足，不能验证下一步动作")
                     fail("OBSERVATION_LIMIT", "观察预算不足")
+                }
+                if (before?.scrollOnly == true) {
+                    if (partialScrolls >= 5) {
+                        pauseWith(PhoneSessionStatus.PAUSED, "页面持续无法完整读取，已达到五次受限滚动上限", token)
+                        fail("SCROLL_ONLY_LIMIT", "已达到本任务受限滚动上限，请检查页面；未确认商品筛选完成")
+                    }
+                    partialScrolls++
                 }
                 observation = null // A snapshot is single-use, including rejected platform actions.
                 mutableState.value = current.copy(actionsUsed = current.actionsUsed + 1,
@@ -337,11 +351,18 @@ class PhoneController(
             pauseWith(PhoneSessionStatus.PAUSED, "当前页面涉及密码、支付或授权，请用户接手", token)
             fail("USER_HANDOVER_REQUIRED", "当前页面需要用户接手，未提供敏感界面内容")
         }
-        if (raw.truncated) {
+        val scrollOnly = raw.scrollOnly && canUseNativeScrollOnly(
+            raw.sensitive, raw.truncated, raw.inspectionIssues, raw.nodes,
+        )
+        if ((raw.truncated && !scrollOnly) || (raw.scrollOnly && !scrollOnly)) {
             fail("INCOMPLETE_SCREEN", "无法完整确认页面安全状态，未发布本次页面或购物证据")
         }
         val safe = raw.copy(
-            nodes = raw.nodes.map { it.copy(text = it.text.take(300), description = it.description.take(300),
+            nodes = if (scrollOnly) raw.nodes.filter {
+                it.scrollable && it.enabled && !it.password && !it.requiresUserConfirmation &&
+                    !PhonePurchasePolicy.requiresUser(it.text + "\n" + it.description)
+            }.map { it.copy(parentId = null, text = "", description = "", clickable = false, longClickable = false, editable = false) }.take(100)
+            else raw.nodes.map { it.copy(text = it.text.take(300), description = it.description.take(300),
                 requiresUserConfirmation = it.requiresUserConfirmation || PhonePurchasePolicy.requiresUser(it.text + "\n" + it.description)) }.take(100),
             previewTruncated = raw.previewTruncated || raw.nodes.size > 100,
         )
@@ -349,16 +370,22 @@ class PhoneController(
             authorize(token)
             enteredTarget = true
             observation = safe
-            evidence.removeAll { it.snapshotId == safe.id }
-            evidence.addLast(ShoppingObservedEvidence(safe.id, safe.packageName, safe.nodes.map {
-                ShoppingObservedNode(it.id, it.text, it.description)
-            }))
-            while (evidence.size > 8 || evidence.sumOf { page -> page.nodes.sumOf { it.text.length + it.description.length } } > 64_000) {
+            restrictedToNativeScroll = scrollOnly
+            if (!scrollOnly) {
+                evidence.removeAll { it.snapshotId == safe.id }
+                evidence.addLast(ShoppingObservedEvidence(safe.id, safe.packageName, safe.nodes.map {
+                    ShoppingObservedNode(it.id, it.text, it.description)
+                }))
+            }
+            // Keep comparison evidence across list pages and detail visits; action snapshots
+            // remain single-use and retain their independent 10-second freshness check.
+            while (evidence.size > 32 || evidence.sumOf { page -> page.nodes.sumOf { it.text.length + it.description.length } } > 256_000) {
                 evidence.removeFirst()
             }
             val current = mutableState.value
-            mutableState.value = current.copy(detail = "已观察目标页面",
-                audit = (current.audit + PhoneAuditEntry(now(), "observe", "已读取目标页面")).takeLast(60))
+            val detail = if (scrollOnly) "页面检查不完整，仅可原生滚动；未登记商品证据" else "已观察目标页面"
+            mutableState.value = current.copy(detail = detail,
+                audit = (current.audit + PhoneAuditEntry(now(), "observe", detail)).takeLast(60))
         }
         return safe
     }
@@ -377,7 +404,12 @@ class PhoneController(
     }
 
     private fun checkAction(current: PhoneObservation, action: PhoneAction) {
-        if (current.truncated || current.sensitive) fail("INCOMPLETE_SCREEN", "无法完整确认页面安全状态，请用户接手")
+        if (current.scrollOnly) {
+            if (!canUseNativeScrollOnly(current.sensitive, current.truncated, current.inspectionIssues, current.nodes)) {
+                fail("INCOMPLETE_SCREEN", "当前页面不具备受限滚动条件，请重新观察")
+            }
+            if (action !is PhoneAction.Scroll) fail("SCROLL_ONLY", "当前页面检查不完整，仅允许原生节点滚动，不能点击、输入或截图")
+        } else if (current.truncated || current.sensitive) fail("INCOMPLETE_SCREEN", "无法完整确认页面安全状态，请用户接手")
         if (action == PhoneAction.Screenshot && !state.value.allowScreenshots) fail("SCREENSHOT_NOT_ALLOWED", "本次会话未允许截图")
         if (action is PhoneAction.Swipe && current.nodes.any { it.requiresUserConfirmation }) {
             fail("PURCHASE_CONFIRMATION_REQUIRED", "页面含需要用户确认的控件，不能使用坐标滑动；可读取或使用普通滚动节点。")

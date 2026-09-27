@@ -56,6 +56,137 @@ class DiscountEngineTest {
         assertEquals(4, f.compare(listOf(base, otherSize, otherModel, otherQuantity)).groups.size)
     }
 
+    @Test fun `same core evidence rejects renamed candidates and changing quote cannot bypass rejection`() {
+        val f = Fixture()
+        val original = f.candidate()
+        val renamed = original.copy(id = "renamed")
+        val requoted = renamed.copy(unitPrice = renamed.unitPrice.copy(
+            evidence = renamed.unitPrice.evidence.copy(quote = "100.00"),
+        ))
+        listOf(renamed, requoted).forEach { duplicate ->
+            val error = runCatching { f.compare(listOf(original, duplicate)) }.exceptionOrNull()
+            assertTrue(error is ShoppingComparisonException)
+            assertEquals("duplicate_candidate_evidence", (error as ShoppingComparisonException).code)
+        }
+    }
+
+    @Test fun `cross snapshot normalized identity and specification only warn without merging or verifying sku binding`() {
+        val f = Fixture()
+        val first = f.candidate("first", "90.00")
+        val second = f.candidate("second", "100.00").copy(
+            productIdentity = ShoppingFact("  brand   model1  ", f.ref("  brand   model1  ")),
+            specification = ShoppingFact("500G", f.ref("500G")),
+        )
+        val samePage = f.compare(listOf(first, second))
+        assertTrue(samePage.possibleDuplicateCandidateIds.isEmpty())
+        assertFalse(samePage.productBindingVerified)
+        assertEquals(2, samePage.groups.sumOf { it.rankedCandidates.size })
+
+        val nextPage = second.copy(
+            productIdentity = second.productIdentity.copy(evidence = second.productIdentity.evidence.copy(snapshotId = "next-page")),
+            specification = second.specification.copy(evidence = second.specification.evidence.copy(snapshotId = "next-page")),
+            unitPrice = second.unitPrice.copy(evidence = second.unitPrice.evidence.copy(snapshotId = "next-page")),
+        )
+        val result = DiscountEngine { 1_000 }.compare(ShoppingComparisonRequest(candidates = listOf(first, nextPage)),
+            f.observed() + f.observed().single().copy(snapshotId = "next-page"))
+        assertEquals(listOf("first", "second"), result.possibleDuplicateCandidateIds)
+        assertEquals(2, result.groups.sumOf { it.rankedCandidates.size })
+        assertEquals(setOf("first", "second"), result.groups.flatMap { it.rankedCandidates }.map { it.id }.toSet())
+        assertFalse(result.productBindingVerified)
+        assertTrue(result.limitations.any { "不能证明不同SKU" in it })
+        assertTrue(result.groups.all { !it.displayedSubtotalPrefilter.isFinalBest })
+    }
+
+    @Test fun `prefilter retains outstanding conditions even when all fee amounts exist`() {
+        val f = Fixture()
+        val candidate = f.candidate().copy(unknowns = listOf("偏远地区附加费待核"))
+        val group = f.compare(listOf(candidate)).groups.single()
+        val result = group.rankedCandidates.single()
+        val prefilter = group.displayedSubtotalPrefilter.rankedCandidates.single()
+        assertNotNull(result.shippingCents)
+        assertNotNull(result.otherFeesCents)
+        assertNull(result.confirmedPlan)
+        assertTrue(prefilter.unverifiedFees.isEmpty())
+        assertEquals(result.unknowns, prefilter.pendingConditions)
+        assertEquals(listOf("偏远地区附加费待核"), prefilter.pendingConditions)
+    }
+
+    @Test fun `unconfirmed candidates use displayed subtotals instead of ids without inventing fees or coupon savings`() {
+        val f = Fixture()
+        fun unknown(id: String, price: String) = f.candidate(id, price).copy(
+            shipping = null, otherFees = null, priceBeforeListedCoupons = false,
+        )
+        val expensive = unknown("a", "29.90")
+        val cheap = unknown("z", "9.90")
+        val middle = unknown("m", "19.90")
+        val unknownCoupon = f.coupon(discount = "8.00", threshold = "0.00", candidates = listOf("z"))
+            .copy(eligibility = ShoppingEligibility.UNKNOWN)
+        val group = f.compare(listOf(expensive, cheap, middle), listOf(unknownCoupon)).groups.single()
+
+        assertEquals(ShoppingRankingBasis.DISPLAYED_SUBTOTAL, group.rankingBasis)
+        assertEquals(listOf("z", "m", "a"), group.rankedCandidates.map { it.id })
+        assertTrue(group.hasUnpricedCandidates)
+        assertTrue(group.lowestConfirmedCandidateIds.isEmpty())
+        group.rankedCandidates.forEach {
+            assertNull(it.shippingCents)
+            assertNull(it.otherFeesCents)
+            assertNull(it.baselineCents)
+            assertNull(it.confirmedPlan)
+            assertNull(it.afterFreeClaimPlan)
+        }
+        assertFalse(group.rankedCandidates.first().couponDecisions.single().included)
+        val prefilter = group.displayedSubtotalPrefilter
+        assertEquals(ShoppingRankingBasis.DISPLAYED_SUBTOTAL, prefilter.rankingBasis)
+        assertFalse(prefilter.isPayable)
+        assertFalse(prefilter.isFinalBest)
+        assertEquals(listOf("z", "m", "a"), prefilter.rankedCandidates.map { it.id })
+        assertEquals(listOf(990L, 1990L, 2990L), prefilter.rankedCandidates.map { it.merchandiseSubtotalCents })
+        assertTrue(prefilter.rankedCandidates.all { it.unverifiedFees == listOf("shipping", "other_fees") })
+        assertEquals(group.rankedCandidates.map { it.unknowns }, prefilter.rankedCandidates.map { it.pendingConditions })
+    }
+
+    @Test fun `confirmed payable ranking remains separate from displayed subtotal prefilter`() {
+        val f = Fixture()
+        val discounted = f.candidate("discounted", "100.00", "0.00")
+        val lowerDisplay = f.candidate("lower_display", "90.00", "0.00")
+        val incomplete = f.candidate("incomplete", "1.00").copy(shipping = null)
+        val coupon = f.coupon(discount = "50.00", threshold = "100.00", candidates = listOf("discounted"))
+        val group = f.compare(listOf(incomplete, lowerDisplay, discounted), listOf(coupon)).groups.single()
+
+        assertEquals(ShoppingRankingBasis.CONFIRMED_PAYABLE_THEN_DISPLAYED_SUBTOTAL, group.rankingBasis)
+        assertEquals(listOf("discounted", "lower_display", "incomplete"), group.rankedCandidates.map { it.id })
+        assertEquals(listOf("discounted"), group.lowestConfirmedCandidateIds)
+        assertEquals(5000L, group.rankedCandidates.first().confirmedPlan!!.payableCents)
+        assertNull(group.rankedCandidates.last().confirmedPlan)
+        val prefilter = group.displayedSubtotalPrefilter
+        assertEquals(listOf("incomplete", "lower_display", "discounted"), prefilter.rankedCandidates.map { it.id })
+        assertEquals(listOf(100L, 9000L, 10000L), prefilter.rankedCandidates.map { it.merchandiseSubtotalCents })
+        assertEquals(listOf("shipping"), prefilter.rankedCandidates.first().unverifiedFees)
+        assertTrue(prefilter.rankedCandidates.drop(1).all { it.unverifiedFees.isEmpty() })
+        assertFalse(prefilter.isPayable)
+        assertFalse(prefilter.isFinalBest)
+        assertEquals(ShoppingRankingBasis.CONFIRMED_PAYABLE,
+            f.compare(listOf(lowerDisplay, discounted), listOf(coupon)).groups.single().rankingBasis)
+    }
+
+    @Test fun `subtotal prefilter keeps equal price order and separates specifications and quantities`() {
+        val f = Fixture()
+        val first = f.candidate("z", "9.90").copy(otherFees = null)
+        val second = f.candidate("a", "9.90").copy(otherFees = null)
+        val otherSpec = f.candidate("small", "1.00").copy(specification = ShoppingFact("50g", f.ref("50g")))
+        val otherQuantity = f.candidate("two", "9.90").copy(quantity = 2, quantityEvidence = f.ref("数量2"))
+        val groups = f.compare(listOf(first, second, otherSpec, otherQuantity)).groups
+
+        assertEquals(3, groups.size)
+        val same = groups.single { it.specification == "500g" && it.quantity == 1 }
+        assertEquals(listOf("z", "a"), same.rankedCandidates.map { it.id })
+        assertEquals(listOf("z", "a"), same.displayedSubtotalPrefilter.rankedCandidates.map { it.id })
+        assertEquals(listOf("small"), groups.single { it.specification == "50g" }
+            .displayedSubtotalPrefilter.rankedCandidates.map { it.id })
+        assertEquals(1980L, groups.single { it.quantity == 2 }
+            .displayedSubtotalPrefilter.rankedCandidates.single().merchandiseSubtotalCents)
+    }
+
     @Test fun `shipping does not satisfy product threshold and shipping coupon cannot reduce merchandise`() {
         val f = Fixture()
         val a = f.candidate(price = "99.00", shipping = "10.00")

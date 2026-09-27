@@ -29,6 +29,11 @@ class PhoneDynamicUiDiagnosticTest {
         val arguments = InstrumentationRegistry.getArguments()
         assumeTrue("显式传入 diagnostic=true 才采样", arguments.getString("diagnostic") == "true")
         val target = arguments.getString("targetPackage").orEmpty()
+        val variantName = arguments.getString("diagnosticVariant")
+        val variant = variantName?.let { name ->
+            ReadDiagnosticProfile.entries.singleOrNull { it.name == name }
+                ?: error("Unsupported diagnostic variant")
+        }
         assertTrue("目标必须是明确指定的测试应用", target in setOf(
             "com.jingdong.app.mall", "com.heytap.browser", "com.taobao.taobao",
             "com.xunmeng.pinduoduo", "com.sankuai.meituan", instrumentation.context.packageName,
@@ -66,13 +71,15 @@ class PhoneDynamicUiDiagnosticTest {
         var capture: ReadDiagnosticCapture? = null
         val schedule = mutableListOf<String>()
         var successfulObservations = 0
+        var scrollOnlyObservations = 0
+        var successfulVariantReads = 0
         var outcome = "not_started"
         var diagnosticActions: Int? = null
         try {
             delay(300) // Let the existing status overlay attach before establishing the time origin.
             assertEquals("诊断开始前任务已失效", token, controller.state.value.token)
             assertEquals(PhoneSessionStatus.RUNNING, controller.state.value.status)
-            val activeCapture = backend.beginReadDiagnostics(token)
+            val activeCapture = backend.beginReadDiagnostics(token, variant ?: ReadDiagnosticProfile.DEFAULT)
             capture = activeCapture
             outcome = "running"
             val started = SystemClock.elapsedRealtime()
@@ -100,7 +107,22 @@ class PhoneDynamicUiDiagnosticTest {
                     break
                 }
                 try {
+                    if (variant != null) {
+                        val result = backend.captureReadDiagnosticVariant(activeCapture)
+                        if (result == "COMPLETE") successfulVariantReads++
+                        else if (result !in setOf("INCOMPLETE", "INVALIDATED")) {
+                            outcome = result
+                            break
+                        }
+                        // Diagnostic variants collect metadata only; they never publish phone observations.
+                        continue
+                    }
                     val observed = controller.observe(token)
+                    if (observed.scrollOnly) {
+                        scrollOnlyObservations++
+                        outcome = "scroll_only_available"
+                        break // This diagnostic never exercises even the restricted scroll action.
+                    }
                     if (observed.sensitive || observed.truncated) {
                         outcome = "incomplete_or_sensitive"
                         break
@@ -130,6 +152,10 @@ class PhoneDynamicUiDiagnosticTest {
                     put("diagnosticRunId", capture?.runId.orEmpty())
                     put("packageName", target)
                     put("observationSuccesses", successfulObservations)
+                    put("scrollOnlyObservations", scrollOnlyObservations)
+                    put("diagnosticReadSuccesses", successfulVariantReads)
+                    put("captureMode", if (variant == null) "production_observe" else "read_only_variant")
+                    put("diagnosticVariant", variant?.name ?: "none")
                     put("outcome", outcome)
                     put("sessionStatusBeforeCleanup", session?.status?.name ?: "replaced")
                     put("actionsUsed", diagnosticActions)

@@ -96,6 +96,7 @@ def main() -> None:
     outcome = next(row for row in records if row["recordType"] == "test_outcome")
     print(f"Decoded {len(records)} metadata records. "
           f"Observation successes: {outcome.get('observationSuccesses', 'unknown')}; "
+          f"diagnostic-only successes: {outcome.get('diagnosticReadSuccesses', 0)}; "
           f"outcome: {outcome.get('outcome', 'unknown')}. This is diagnostic evidence, not business acceptance.")
 
 

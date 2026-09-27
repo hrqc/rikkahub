@@ -87,6 +87,8 @@ data class PhoneObservation(
     val fingerprint: String,
     val previewTruncated: Boolean = false,
     val inspectionIssues: List<String> = emptyList(),
+    /** Incomplete inspection; only the advertised native list scrolling capability is available. */
+    val scrollOnly: Boolean = false,
 )
 
 enum class PhoneSwipeDirection { UP, DOWN, LEFT, RIGHT }
