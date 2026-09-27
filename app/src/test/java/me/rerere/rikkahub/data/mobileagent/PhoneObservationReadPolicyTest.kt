@@ -14,7 +14,10 @@ class PhoneObservationReadPolicyTest {
         var waits = 0
         var duringWait: () -> Unit = {}
 
-        suspend fun read(capture: (PhoneObservationVersion) -> String): String = readStablePhoneObservation(
+        suspend fun read(
+            shouldRetry: (String) -> Boolean = { false },
+            capture: (PhoneObservationVersion) -> String,
+        ): String = readStablePhoneObservation(
             nowMillis = { now },
             version = {
                 denied?.let { throw PhoneControlException(it, "revoked") }
@@ -22,6 +25,7 @@ class PhoneObservationReadPolicyTest {
             },
             capture = { reads++; capture(it) },
             pause = { now += it; waits++; duringWait() },
+            shouldRetry = shouldRetry,
         )
     }
 
@@ -36,6 +40,73 @@ class PhoneObservationReadPolicyTest {
         assertEquals("revision=1", f.read { "revision=${it.revision}" })
         assertEquals(1, f.reads)
         assertEquals(0, f.waits)
+    }
+
+    @Test fun `only a non-sensitive capture with solely unavailable children can be retried`() {
+        assertTrue(shouldRetryPhoneInspection(false, true, listOf("unavailable_child")))
+        assertFalse(shouldRetryPhoneInspection(true, true, listOf("unavailable_child")))
+        assertFalse(shouldRetryPhoneInspection(false, false, listOf("unavailable_child")))
+        // An output preview may be shortened while the actual inspection remains complete.
+        assertFalse(shouldRetryPhoneInspection(false, false, emptyList()))
+        assertFalse(shouldRetryPhoneInspection(false, true, emptyList()))
+        listOf("foreign_node", "children_limit", "visit_limit", "time_limit", "depth_limit", "text_limit").forEach { issue ->
+            assertFalse(shouldRetryPhoneInspection(false, true, listOf(issue)))
+            assertFalse(shouldRetryPhoneInspection(false, true, listOf("unavailable_child", issue)))
+        }
+    }
+
+    @Test fun `missing child rereads the same version and publishes only the complete capture`() = runBlocking {
+        val f = ReadFixture()
+        val result = f.read(shouldRetry = { it == "missing child" }) {
+            if (f.reads == 1) "missing child" else "complete revision=${it.revision}"
+        }
+        assertEquals("complete revision=1", result)
+        assertEquals(2, f.reads)
+        assertEquals(1, f.waits)
+    }
+
+    @Test fun `persistent missing children fail after the existing total retry budget`() = runBlocking {
+        val f = ReadFixture()
+        expectCode("PAGE_UNSTABLE") {
+            f.read(shouldRetry = { true }) { "missing child" }
+        }
+        assertEquals(4, f.reads)
+        assertEquals(3, f.waits)
+    }
+
+    @Test fun `content invalidation and missing children share one total retry budget`() = runBlocking {
+        val f = ReadFixture()
+        expectCode("PAGE_UNSTABLE") {
+            f.read(shouldRetry = { true }) {
+                if (f.reads == 1) {
+                    f.current = f.current.copy(revision = 2)
+                    throw PhoneObservationInvalidated()
+                }
+                "missing child"
+            }
+        }
+        assertEquals(4, f.reads)
+        assertEquals(3, f.waits)
+    }
+
+    @Test fun `window identity change during missing child retry cannot capture the replacement`() = runBlocking {
+        val f = ReadFixture()
+        f.duringWait = { f.current = f.current.copy(identity = 2) }
+        expectCode("STALE_WINDOW") {
+            f.read(shouldRetry = { true }) { "missing child" }
+        }
+        assertEquals(1, f.reads)
+        assertEquals(1, f.waits)
+    }
+
+    @Test fun `stop during missing child retry prevents another read`() = runBlocking {
+        val f = ReadFixture()
+        f.duringWait = { f.denied = "SESSION_INACTIVE" }
+        expectCode("SESSION_INACTIVE") {
+            f.read(shouldRetry = { true }) { "missing child" }
+        }
+        assertEquals(1, f.reads)
+        assertEquals(1, f.waits)
     }
 
     @Test fun `same window content invalidation reacquires and returns only the stable read`() = runBlocking {

@@ -55,6 +55,25 @@ class PhoneControlDeviceSmokeTest {
         runFixtureActions(useRoot = true)
     }
 
+    @Test
+    fun rootHistoryRechecksWithoutManualRequest() = runBlocking {
+        assumeTrue("仅在已授权的 Root 设备显式运行", InstrumentationRegistry.getArguments().getString("root") == "true")
+        // A new repository has no in-memory grant or success cache, like a restarted app.
+        val restarted = DeviceCapabilityRepository(targetContext, backend)
+        val usage = restarted.capabilities.value.rootUsage
+        assumeTrue("必须已有本机验证历史且允许自动复核，不主动申请新权限",
+            usage.enabled && usage.previouslyVerified && usage.autoVerificationAllowed)
+        assertEquals(RootState.UNKNOWN, restarted.capabilities.value.root.state)
+        assertFalse(restarted.canUseRootNow())
+        assertTrue("曾授予的 Root 未能在任务入口自动复核", restarted.ensureRootForTask())
+        assertEquals(RootState.ROOT_GRANTED, restarted.capabilities.value.root.state)
+        assertTrue(restarted.canUseRootNow())
+        val checkedAt = restarted.capabilities.value.root.checkedAtEpochMillis
+        assertTrue("短时缓存应复用本次真实验证", restarted.ensureRootForTask())
+        assertEquals(checkedAt, restarted.capabilities.value.root.checkedAtEpochMillis)
+        report("persisted Root history rechecked from UNKNOWN without requestRoot; recent check reused")
+    }
+
     private suspend fun runFixtureActions(useRoot: Boolean) {
         requirePrerequisites()
         if (useRoot) requireExplicitRootProbe()

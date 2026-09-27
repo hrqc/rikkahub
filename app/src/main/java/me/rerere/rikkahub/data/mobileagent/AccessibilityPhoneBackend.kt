@@ -212,11 +212,27 @@ class AccessibilityPhoneBackend(
                         try {
                             val tree = withContext(Dispatchers.Default) {
                                 val readContext = currentCoroutineContext()
+                                if (!readContext.isActive || !validAtRevision(permit, version.revision) || !root.refresh()) {
+                                    throw TreeReadAborted()
+                                }
+                                // Reacquiring a root can still return cached metadata. Refresh before
+                                // capture, then verify identity before any node content is inspected.
+                                if (root.windowId != version.windowId || root.packageName?.toString() != permit.targetPackage) {
+                                    fail("FOREGROUND_CONFLICT", "刷新后目标窗口身份已改变，请重新观察。")
+                                }
                                 reader.capture(root, permit.targetPackage) {
                                     readContext.isActive && validAtRevision(permit, version.revision)
                                 }
                             }
                             requireRevision(permit, version.revision)
+                            if (Build.VERSION.SDK_INT >= 33 && shouldRetryPhoneInspection(
+                                    tree.sensitive, tree.truncated, tree.inspectionIssues,
+                                )
+                            ) {
+                                // Discard stale descendant metadata only for this verified target.
+                                // The retry policy discards this entire capture; no old paths are reused.
+                                service.get()?.clearCachedSubtree(root)
+                            }
                             val observation = PhoneObservation(
                                 id = UUID.randomUUID().toString(),
                                 packageName = permit.targetPackage,
@@ -239,6 +255,11 @@ class AccessibilityPhoneBackend(
                         } finally {
                             recycleNode(root)
                         }
+                    },
+                    shouldRetry = { captured ->
+                        shouldRetryPhoneInspection(
+                            captured.tree.sensitive, captured.tree.truncated, captured.tree.inspectionIssues,
+                        )
                     },
                 )
                 // Nothing is published until a whole read finishes at its original revision.

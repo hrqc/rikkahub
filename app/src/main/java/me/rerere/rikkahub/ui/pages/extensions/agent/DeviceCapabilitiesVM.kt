@@ -77,11 +77,15 @@ class DeviceCapabilitiesVM(
     }
 
     fun cancelRootProbe(showMessage: Boolean = true) {
-        val wasRunning = rootJob?.isActive == true || capabilities.value.rootProbeRunning
-        rootJob?.cancel()
-        repository.cancelRootProbe()
+        val ownedJob = rootJob
+        val wasRunning = ownedJob?.isActive == true
+        // Cancelling this request propagates to its probe. Page disposal must never cancel
+        // the shared repository's probe owned by a newer chat or control-panel task.
+        ownedJob?.cancel()
         if (showMessage && wasRunning) {
             _message.value = "已取消 Root 检测。"
+        } else if (showMessage && capabilities.value.rootProbeRunning) {
+            _message.value = "当前 Root 检测由其他任务发起，请在对应任务中暂停或停止。"
         }
     }
 

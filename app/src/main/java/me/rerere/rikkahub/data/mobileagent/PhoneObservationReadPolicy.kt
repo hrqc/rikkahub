@@ -8,12 +8,21 @@ internal data class PhoneObservationVersion(val windowId: Int?, val identity: Lo
 
 internal class PhoneObservationInvalidated : IllegalStateException()
 
+/** A temporarily missing child can be reread; other inspection gaps retain their refusal. */
+internal fun shouldRetryPhoneInspection(
+    sensitive: Boolean,
+    truncated: Boolean,
+    inspectionIssues: List<String>,
+): Boolean = !sensitive && truncated && inspectionIssues.isNotEmpty() &&
+    inspectionIssues.all { it == "unavailable_child" }
+
 /** Only read-only capture uses this helper. Dispatch and node resolution retain strict revisions. */
 internal suspend fun <T : Any> readStablePhoneObservation(
     nowMillis: () -> Long,
     version: () -> PhoneObservationVersion,
     capture: suspend (PhoneObservationVersion) -> T,
     pause: suspend (Long) -> Unit = { delay(it) },
+    shouldRetry: (T) -> Boolean = { false },
 ): T {
     val startedAt = nowMillis()
     val initial = version()
@@ -36,6 +45,7 @@ internal suspend fun <T : Any> readStablePhoneObservation(
                 val result = capture(before)
                 if (checkedVersion().revision != before.revision) throw PhoneObservationInvalidated()
                 if (nowMillis() - startedAt >= 4_500) exhausted()
+                if (shouldRetry(result)) throw PhoneObservationInvalidated()
                 return@withTimeoutOrNull result
             } catch (_: PhoneObservationInvalidated) {
                 // This also rechecks STOP, lock, service and package before waiting or reading again.

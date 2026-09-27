@@ -91,6 +91,7 @@ class GenerationLoop(
         conversationModeInjectionIds: Set<Uuid> = emptySet(),
         conversationLorebookIds: Set<Uuid> = emptySet(),
         workspaceCwd: String? = null,
+        modelProgressTimeoutMillis: Long? = null,
     ): Flow<GenerationChunk> = flow {
         val provider = model.findProvider(settings.providers) ?: error("Provider not found")
         val providerImpl = providerManager.getProviderByType(provider)
@@ -109,44 +110,55 @@ class GenerationLoop(
 
             // Skip generation if we have approved/denied tool calls to handle
             if (pendingTools.isEmpty()) {
-                generateInternal(
-                    assistant = assistant,
-                    settings = settings,
-                    messages = messages,
-                    onUpdateMessages = {
-                        messages = it.transforms(
-                            transformers = outputTransformers,
-                            context = context,
-                            model = model,
-                            assistant = assistant,
-                            settings = settings
-                        )
-                        emit(
-                            GenerationChunk.Messages(
-                                messages.visualTransforms(
-                                    transformers = outputTransformers,
-                                    context = context,
-                                    model = model,
-                                    assistant = assistant,
-                                    settings = settings
+                if (modelProgressTimeoutMillis != null) Log.i(TAG, "PHONE_MODEL_WAIT")
+                var progressLogged = false
+                withModelProgressTimeout(modelProgressTimeoutMillis) { progress ->
+                    generateInternal(
+                        assistant = assistant,
+                        settings = settings,
+                        messages = messages,
+                        onUpdateMessages = {
+                            messages = it.transforms(
+                                transformers = outputTransformers,
+                                context = context,
+                                model = model,
+                                assistant = assistant,
+                                settings = settings
+                            )
+                            emit(
+                                GenerationChunk.Messages(
+                                    messages.visualTransforms(
+                                        transformers = outputTransformers,
+                                        context = context,
+                                        model = model,
+                                        assistant = assistant,
+                                        settings = settings
+                                    )
                                 )
                             )
-                        )
-                    },
-                    transformers = inputTransformers,
-                    model = model,
-                    providerImpl = providerImpl,
-                    provider = provider,
-                    tools = tools,
-                    memories = memories ?: emptyList(),
-                    stream = assistant.streamOutput,
-                    processingStatus = processingStatus,
-                    conversationSystemPrompt = conversationSystemPrompt,
-                    conversationId = conversationId,
-                    conversationModeInjectionIds = conversationModeInjectionIds,
-                    conversationLorebookIds = conversationLorebookIds,
-                    workspaceCwd = workspaceCwd,
-                )
+                        },
+                        transformers = inputTransformers,
+                        model = model,
+                        providerImpl = providerImpl,
+                        provider = provider,
+                        tools = tools,
+                        memories = memories ?: emptyList(),
+                        stream = assistant.streamOutput,
+                        processingStatus = processingStatus,
+                        conversationSystemPrompt = conversationSystemPrompt,
+                        conversationId = conversationId,
+                        conversationModeInjectionIds = conversationModeInjectionIds,
+                        conversationLorebookIds = conversationLorebookIds,
+                        workspaceCwd = workspaceCwd,
+                        onModelProgress = {
+                            progress()
+                            if (modelProgressTimeoutMillis != null && !progressLogged) {
+                                progressLogged = true
+                                Log.i(TAG, "PHONE_MODEL_PROGRESS")
+                            }
+                        },
+                    )
+                }
                 messages = messages.visualTransforms(
                     transformers = outputTransformers,
                     context = context,
@@ -376,6 +388,7 @@ class GenerationLoop(
         conversationModeInjectionIds: Set<Uuid> = emptySet(),
         conversationLorebookIds: Set<Uuid> = emptySet(),
         workspaceCwd: String? = null,
+        onModelProgress: () -> Unit = {},
     ) {
         val internalMessages = buildList {
             val system = buildString {
@@ -464,7 +477,9 @@ class GenerationLoop(
                                 if (retryCount > 0) {
                                     processingStatus.value = null
                                 }
-                                attemptMessages = streamChunkHandler.handle(attemptMessages, chunk)
+                                val updatedMessages = streamChunkHandler.handle(attemptMessages, chunk)
+                                if (updatedMessages != attemptMessages) onModelProgress()
+                                attemptMessages = updatedMessages
                                 onUpdateMessages(attemptMessages)
                             } catch (error: CancellationException) {
                                 throw error

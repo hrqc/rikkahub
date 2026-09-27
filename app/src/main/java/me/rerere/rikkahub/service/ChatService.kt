@@ -45,7 +45,11 @@ import me.rerere.rikkahub.AppScope
 import me.rerere.rikkahub.R
 import me.rerere.rikkahub.data.ai.GenerationChunk
 import me.rerere.rikkahub.data.ai.GenerationLoop
+import me.rerere.rikkahub.data.ai.ModelProgressTimeoutException
+import me.rerere.rikkahub.data.ai.PHONE_MODEL_PROGRESS_TIMEOUT_MILLIS
+import me.rerere.rikkahub.data.ai.PHONE_MODEL_PROGRESS_TIMEOUT_MESSAGE
 import me.rerere.rikkahub.data.ai.TranslationHandler
+import me.rerere.rikkahub.data.ai.withModelProgressTimeout
 import me.rerere.rikkahub.data.ai.mcp.McpManager
 import me.rerere.rikkahub.data.ai.tools.ChatToolFactory
 import me.rerere.rikkahub.data.ai.tools.InvalidMcpServerNamesException
@@ -756,6 +760,7 @@ class ChatService(
         val model = settings.findModelById(assistant.chatModelId ?: settings.chatModelId)
             ?: throw IllegalStateException("No chat model selected")
         val generationPhoneToken = expectedPhoneToken
+        val modelProgressTimeoutMillis = generationPhoneToken?.let { PHONE_MODEL_PROGRESS_TIMEOUT_MILLIS }
         if (generationPhoneToken != null) {
             if (generationPhoneToken.conversationId != conversationId.toString() ||
                 generationPhoneToken.assistantId != assistant.id.toString() || phoneIntentBinding != null ||
@@ -801,16 +806,25 @@ class ChatService(
             checkInvalidMessages(conversationId)
             val conversation = getConversationFlow(conversationId).value
 
-            val tools = try {
-                chatToolFactory.createTools(
-                    settings = settings,
-                    assistant = assistant,
-                    model = model,
-                    workspaceCwd = conversation.workspaceCwd,
-                    conversationId = conversationId.toString(),
-                    phoneIntentBinding = phoneIntentBinding,
-                    phoneSessionToken = generationPhoneToken,
-                )
+            if (generationPhoneToken != null) Log.i(TAG, "PHONE_MODEL_PREPARING")
+            val (tools, memories) = try {
+                withModelProgressTimeout(modelProgressTimeoutMillis) {
+                    val preparedTools = chatToolFactory.createTools(
+                        settings = settings,
+                        assistant = assistant,
+                        model = model,
+                        workspaceCwd = conversation.workspaceCwd,
+                        conversationId = conversationId.toString(),
+                        phoneIntentBinding = phoneIntentBinding,
+                        phoneSessionToken = generationPhoneToken,
+                    )
+                    val preparedMemories = if (assistant.useGlobalMemory) {
+                        memoryRepository.getGlobalMemories()
+                    } else {
+                        memoryRepository.getMemoriesOfAssistant(assistant.id.toString())
+                    }
+                    preparedTools to preparedMemories
+                }
             } catch (error: InvalidMcpServerNamesException) {
                 sessionManager.get(conversationId)?.messageQueue?.pause()
                 addError(
@@ -854,11 +868,7 @@ class ChatService(
                 conversationModeInjectionIds = conversation.modeInjectionIds,
                 conversationLorebookIds = conversation.lorebookIds,
                 workspaceCwd = conversation.workspaceCwd,
-                memories = if (assistant.useGlobalMemory) {
-                    memoryRepository.getGlobalMemories()
-                } else {
-                    memoryRepository.getMemoriesOfAssistant(assistant.id.toString())
-                },
+                memories = memories,
                 inputTransformers = buildList {
                     addAll(inputTransformers)
                     add(templateTransformer)
@@ -866,6 +876,7 @@ class ChatService(
                 },
                 outputTransformers = outputTransformers,
                 tools = tools,
+                modelProgressTimeoutMillis = modelProgressTimeoutMillis,
             ).onCompletion {
                 // 可能被取消了，或者意外结束，兜底更新
                 val updatedConversation = session.finishGeneration { conversation ->
@@ -909,6 +920,11 @@ class ChatService(
             appEventBus.tryEmit(AppEvent.ChatGenerationEnded(conversationId, senderName, null, redactNotificationContent))
             if (it is CancellationException) throw it
             sessionManager.get(conversationId)?.messageQueue?.pause()
+
+            if (it is ModelProgressTimeoutException && generationPhoneToken != null) {
+                Log.w(TAG, "PHONE_MODEL_TIMEOUT")
+                phoneController.pauseIfCurrent(generationPhoneToken, PHONE_MODEL_PROGRESS_TIMEOUT_MESSAGE)
+            }
 
             Log.w(TAG, "Generation failed (${it.javaClass.simpleName})")
             addError(it, conversationId, title = context.getString(R.string.error_title_generation))
