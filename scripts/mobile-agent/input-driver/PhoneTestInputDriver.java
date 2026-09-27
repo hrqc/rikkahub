@@ -3,6 +3,7 @@ package me.rerere.rikkahub.data.mobileagent.fixture;
 import android.app.Activity;
 import android.app.Instrumentation;
 import android.app.UiAutomation;
+import android.accessibilityservice.AccessibilityServiceInfo;
 import android.graphics.Rect;
 import android.os.Bundle;
 import android.os.SystemClock;
@@ -25,6 +26,11 @@ public final class PhoneTestInputDriver extends Instrumentation {
     @Override public void onStart() {
         Bundle result = new Bundle();
         try {
+            if ("inspect_tree_gaps".equals(arguments.getString("operation"))) {
+                inspectTreeGaps(result);
+                finish(Activity.RESULT_OK, result);
+                return;
+            }
             if ("inspect_test_ui".equals(arguments.getString("operation"))) {
                 inspectTestUi(result);
                 finish(Activity.RESULT_OK, result);
@@ -94,6 +100,13 @@ public final class PhoneTestInputDriver extends Instrumentation {
             result.putInt("characters", value.length());
             finish(Activity.RESULT_OK, result);
         } catch (Exception error) {
+            if (arguments != null && "inspect_tree_gaps".equals(arguments.getString("operation"))) {
+                result.clear();
+                result.putString("tree_gaps", "failed");
+                result.putString("reason", "Foreground or structural inspection unavailable");
+                finish(Activity.RESULT_CANCELED, result);
+                return;
+            }
             if (arguments != null && "assert_filehelper".equals(arguments.getString("operation"))) {
                 result.clear();
                 result.putString("filehelper_message", "failed");
@@ -104,6 +117,148 @@ public final class PhoneTestInputDriver extends Instrumentation {
             result.putString("test_input", "failed");
             result.putString("reason", error.getClass().getSimpleName() + ": " + error.getMessage());
             finish(Activity.RESULT_CANCELED, result);
+        }
+    }
+
+    /** Structural diagnostics only: this operation never requests node text or descriptions. */
+    private void inspectTreeGaps(Bundle result) {
+        String expected = arguments.getString("package", "me.rerere.rikkahub.debug");
+        if (!List.of("me.rerere.rikkahub.debug", "com.heytap.browser", "com.jingdong.app.mall",
+                "com.taobao.taobao", "com.xunmeng.pinduoduo", "com.sankuai.meituan").contains(expected)) {
+            throw new IllegalArgumentException("Package is outside test scope");
+        }
+        UiAutomation automation = getUiAutomation(UiAutomation.FLAG_DONT_SUPPRESS_ACCESSIBILITY_SERVICES);
+        AccessibilityServiceInfo info = automation.getServiceInfo();
+        if (info == null) throw new IllegalStateException("Automation service unavailable");
+        int previousFlags = info.flags;
+        ArrayDeque<GapNode> pending = new ArrayDeque<>();
+        try {
+            // Change only this instrumentation connection, never the installed control service.
+            info.flags = 80;
+            automation.setServiceInfo(info);
+            AccessibilityServiceInfo appliedInfo = automation.getServiceInfo();
+            int appliedFlags = appliedInfo == null ? -1 : appliedInfo.flags;
+            AccessibilityNodeInfo root = automation.getRootInActiveWindow();
+            if (root == null) throw new IllegalStateException("No active window");
+            if (!expected.contentEquals(root.getPackageName() == null ? "" : root.getPackageName())) {
+                root.recycle();
+                throw new IllegalStateException("Expected test app is not active");
+            }
+            int windowId = root.getWindowId();
+            pending.add(new GapNode(root, "/", 0));
+            StringBuilder output = new StringBuilder();
+            int visits = 0;
+            int missing = 0;
+            int reported = 0;
+            int protectedSkipped = 0;
+            int foreignSkipped = 0;
+            boolean nodeLimit = false;
+            boolean depthLimit = false;
+            boolean childLimit = false;
+            boolean timeLimit = false;
+            long startedAt = SystemClock.elapsedRealtime();
+            long deadline = startedAt + 2500;
+            while (!pending.isEmpty()) {
+                if (visits >= 768) { nodeLimit = true; break; }
+                if (SystemClock.elapsedRealtime() >= deadline) { timeLimit = true; break; }
+                requireGapWindow(automation, expected, windowId);
+                if (SystemClock.elapsedRealtime() >= deadline) { timeLimit = true; break; }
+                GapNode current = pending.removeFirst();
+                AccessibilityNodeInfo node = current.node;
+                visits++;
+                try {
+                    if (node.getWindowId() != windowId ||
+                            !expected.contentEquals(node.getPackageName() == null ? "" : node.getPackageName())) {
+                        foreignSkipped++;
+                        continue;
+                    }
+                    if (node.isPassword() || (android.os.Build.VERSION.SDK_INT >= 34 && node.isAccessibilityDataSensitive())) {
+                        protectedSkipped++;
+                        continue;
+                    }
+                    int children = node.getChildCount();
+                    if (current.depth >= 40) {
+                        if (children > 0) depthLimit = true;
+                        continue;
+                    }
+                    if (children > 128) childLimit = true;
+                    for (int index = 0; index < Math.min(children, 128); index++) {
+                        if (SystemClock.elapsedRealtime() >= deadline) { timeLimit = true; break; }
+                        if (visits + pending.size() >= 768) { nodeLimit = true; break; }
+                        AccessibilityNodeInfo child = android.os.Build.VERSION.SDK_INT >= 33
+                                ? node.getChild(index, 0) : node.getChild(index);
+                        if (child == null) {
+                            missing++;
+                            if (reported < 20) {
+                                Rect bounds = new Rect();
+                                node.getBoundsInScreen(bounds);
+                                output.append("parent=").append(current.path)
+                                    .append(" class=").append(gapMetadata(node.getClassName(), 160))
+                                    .append(" viewId=").append(gapMetadata(node.getViewIdResourceName(), 256))
+                                    .append(" bounds=").append(bounds.toShortString())
+                                    .append(" visible=").append(node.isVisibleToUser())
+                                    .append(" childCount=").append(children)
+                                    .append(" index=").append(index).append('\n');
+                                reported++;
+                            }
+                        } else {
+                            String path = "/".equals(current.path) ? "/" + index : current.path + "/" + index;
+                            pending.addLast(new GapNode(child, path, current.depth + 1));
+                        }
+                    }
+                } finally { node.recycle(); }
+            }
+            requireGapWindow(automation, expected, windowId);
+            long elapsed = SystemClock.elapsedRealtime() - startedAt;
+            if (elapsed >= 2500) timeLimit = true;
+            result.putString("tree_gaps", "inspected");
+            result.putString("gaps_b64", Base64.encodeToString(output.toString().getBytes(StandardCharsets.UTF_8), Base64.NO_WRAP));
+            result.putInt("visits", visits);
+            result.putInt("missing", missing);
+            result.putInt("reported", reported);
+            result.putInt("protected_skipped", protectedSkipped);
+            result.putInt("foreign_skipped", foreignSkipped);
+            result.putLong("elapsed_ms", elapsed);
+            result.putInt("requested_automation_flags", 80);
+            result.putInt("automation_flags", appliedFlags);
+            result.putString("traversal_budget", "nodes=768,depth=40,time_ms=2500,children=128,gap_records=20");
+            result.putBoolean("node_limit", nodeLimit);
+            result.putBoolean("depth_limit", depthLimit);
+            result.putBoolean("child_limit", childLimit);
+            result.putBoolean("time_limit", timeLimit);
+            result.putBoolean("partial", missing > 0 || nodeLimit || depthLimit || childLimit || timeLimit || foreignSkipped > 0 || protectedSkipped > 0);
+        } finally {
+            while (!pending.isEmpty()) pending.removeFirst().node.recycle();
+            info.flags = previousFlags;
+            automation.setServiceInfo(info);
+        }
+    }
+
+    private static void requireGapWindow(UiAutomation automation, String expected, int windowId) {
+        AccessibilityNodeInfo active = automation.getRootInActiveWindow();
+        if (active == null) throw new IllegalStateException("Active window unavailable");
+        try {
+            if (active.getWindowId() != windowId ||
+                    !expected.contentEquals(active.getPackageName() == null ? "" : active.getPackageName())) {
+                throw new IllegalStateException("Foreground changed");
+            }
+        } finally { active.recycle(); }
+    }
+
+    private static String gapMetadata(CharSequence value, int limit) {
+        if (value == null) return "";
+        String bounded = value.subSequence(0, Math.min(value.length(), limit)).toString();
+        return bounded.replace('\n', ' ').replace('\r', ' ').replace('\t', ' ');
+    }
+
+    private static final class GapNode {
+        final AccessibilityNodeInfo node;
+        final String path;
+        final int depth;
+        GapNode(AccessibilityNodeInfo node, String path, int depth) {
+            this.node = node;
+            this.path = path;
+            this.depth = depth;
         }
     }
 

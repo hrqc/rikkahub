@@ -1,8 +1,8 @@
 # V1 M2：公开资料研究、购物比较与 Root 验证
 
-更新日期：2026-09-26。本文记录本轮源码实现范围及验收边界，不代表完整 V1 已验收，V2 不在范围内。
+更新日期：2026-09-27。本文记录 197 版源码实现范围及验收边界，不代表完整 V1 已验收，V2 不在范围内。
 
-**本轮构建、安装和真机结果由主线在文末填写。填写前，只能表述为“已实现、待统一验证”，不能沿用上一版本的测试数字作为本轮通过证据。**
+**197 版构建、安装和真机证据记录在文末。合成设备回归、真实网页读取和模型操作购物应用是不同的验收项，不能相互代替。后续 198 版证据单独记录在 [M2_7_RELIABILITY.md](M2_7_RELIABILITY.md)，不混入本表。**
 
 ## 本轮入口和职责
 
@@ -108,23 +108,26 @@ Root 仍只提供受限输入能力。模型不获得任意 shell、Root 管理�
 - 百分比及复杂促销求解；任何“全网最低”“隐藏券保证”“质量最好”承诺。
 - 淘宝、京东、拼多多、美团各自的真实模型任务、免费领券/应用闭环，以及两台验收设备的完整兼容性验收。
 
-## 主线验证记录（待填）
+## 197 版主线验证记录
 
-以下项目必须根据本轮实际报告和设备证据填写；本文件编写过程没有运行构建、联网读取或手机测试。
+以下记录已核对本轮 XML、构建日志及 instrumentation 日志；安装、购物界面和悬浮窗状态来自主线本轮实机操作记录。模型的自然语言总结不能替代工具结果或独立正文核验。日志和 APK 位于仓库外的项目 `artifacts/` 目录，不提交到 Git。
 
 | 项目 | 本轮记录 |
 | --- | --- |
 | 源码分支、commit、tag、回滚点 | `feature/mobile-agent-v1` @ `3d84accd`；tag `mobile-agent-v1-m2.6-research-shopping`；回滚点 `cd843f1` / `mobile-agent-v1-m2.5-overlay-internal` |
 | APK versionName / versionCode、路径、SHA-256、签名 | `2.5.4-mobile-agent-v1-m2.6-research-shopping` / 197；`artifacts/v1-m2.6-research-shopping/RikkaHub-Mobile-Agent-v1-m2.6-197-arm64-debug.apk` SHA-256 `742F11EAB189A1BD044A96CE7BDA1FF1E991A9F2B838981C74A1959A096CC432`；测试 APK SHA-256 `6D0A4D92853DEA4186CE6600D4D877880E186EDF34276198221DECB1D95DE322`；apksigner verify 通过 |
-| JVM 选定回归：命令、报告时间、通过/失败/跳过 | 2026-09-26：30 个 suite、268 tests，0 failures、0 errors、0 skipped；日志 `artifacts/v1-m2/research197-unit-tests-final.log` |
-| 主 APK / instrumentation APK 构建 | 197 主 APK 与 instrumentation APK 构建成功；日志 `artifacts/v1-m2/research197-apk-build.log` |
-| 保留数据安装、启动、服务连接 | OnePlus Ace 5 Pro 覆盖安装成功且保留数据；无障碍服务曾被系统标为 crashed，按用户已授权范围重连后恢复 bound、无 crashed marker |
-| 公开正文：正常页、失败页、缓存复读、限制和引用 | APP 真机 Bing 搜索→`read_public_webpage` 连续两次调用通过；结果实际读取 2 个 `developer.android.google.cn` 官方来源，并明确 API 参考页超限。直连 `developer.android.com` 与 `raw.githubusercontent.com` 的独立网络 smoke 在该网络下失败，已归类为连接失败，未降级安全要求 |
-| 单平台多商品：同规格、运费/包装费、券资格与组合、未知条件 | 本地 DiscountEngine 与 shopping_compare 已实现并通过 JVM；真实京东页面因 ColorOS 系统“启动应用确认”弹窗待用户处理，未把未观察页面写成通过 |
+| JVM 选定回归：任务、报告时间、通过/失败/跳过 | 2026-09-26：`:app:testDebugUnitTest` 选定回归完成；XML 汇总为 30 个 suite、270 tests，0 failures、0 errors、0 skipped；日志 `artifacts/v1-m2/research197-unit-tests-final.log` |
+| 主 APK / instrumentation APK 构建 | 最终 197 主 APK 与 instrumentation APK 构建成功；日志 `artifacts/v1-m2/research197-apk-build-final.log` |
+| 保留数据安装、启动、服务连接 | 2026-09-27：最终 197 主 APK 与测试 APK 均已在 OnePlus Ace 5 Pro 覆盖安装，原数据保留；测试期间按用户已授权范围重连该无障碍服务，测试结束后再次恢复服务连接和 APP 启动 |
+| 合成设备回归及跳过记录 | `artifacts/v1-m2.6-research-shopping/device-smoke-reconnected.log`：3 项实际通过，无跳过；验证点击、长按、中文输入、滚动、返回、直接 STOP 与通知 STOP 的旧 token 失效，以及 API 34+ 窗口截图本地解码。Root 启用的用例包含真实 UID 复核，但动作仍优先使用标准 API，不能据此声称每个动作均由 Root 执行。旧 `device-smoke-root.log` 的 3 项均为 `AssumptionViolatedException` / 状态码 `-4`，属于服务未连接导致跳过，不能把 runner 的 `OK (3 tests)` 当作通过 |
+| 公开正文：正常页、失败页、缓存复读、限制和引用 | `artifacts/v1-m2.6-research-shopping/device-network-cn.log`：2026-09-27 独立真机网络测试 1 项实际通过，读取 `https://developer.android.google.cn/guide/topics/ui/accessibility/service`，取得 9,758 字符正文和 11 个链接，正文 SHA-256 为 `e83a1ab4584858f30913cc5e04cc39b5d63d82cb3f6718f39beafbe8dbee0ae3`；重新创建 Repository 后磁盘复读、正文哈希及跨聊天来源隔离断言通过。此前 APP 会话展示了 Bing 搜索和两次 `read_public_webpage` 调用及模型总结，但其逐条总结尚未独立核实。直连 `developer.android.com` 与 `raw.githubusercontent.com` 的先前 smoke 在设备网络下失败，不计为通过 |
+| 京东真实模型搜索与后续滚动 | 京东已在 ColorOS 系统启动确认中选择“仅本次允许”后打开。首次复杂任务续接约两分钟无观察，仍属待排查记录。随后在新聊天发送“在京东搜索 USB-C 数据线，展示搜索结果即可，不购买。”，APP 模型自行点击搜索、输入并展示第一屏搜索结果；返回聊天显示 16.0 秒完成，截图为 `artifacts/v1-m2.6-research-shopping/jd-model-search-results.png`。后续滚动的真实工具结果已打开核对：`accepted=false`、`code=INCOMPLETE_SCREEN`、detail 为无法完整确认页面安全状态。模型另报告观察结果 `inspectionIssues=[unavailable_child]`，但原始 observe 工具结果尚未打开核对，不能把这一原因视为已直接取证 |
+| 单平台多商品：同规格、运费/包装费、券资格与组合、未知条件 | 本地 DiscountEngine 与 shopping_compare 已实现并通过 JVM；京东第一屏搜索成功不等于完整候选比较，尚未完成同规格、费用、优惠资格与组合的真实模型闭环 |
 | 普通免费券领取/应用后的真实观察 | 未测；不以模型输出或搜索摘要代替真实领取证据 |
 | PaymentGuard：合成下单/付款/资产变更拦截 | JVM 覆盖付款词形、受限节点祖先/后代、坐标滑动和 Root 后备；未触碰真实结算页 |
 | Root：升级迁移、重启复核、偏好关闭、拒绝/撤权/恢复 | OnePlus 197 设备页一次显式只读 UID 检查显示“已验证 Root 权限”；自动复核及拒绝/撤权分支有 JVM 覆盖，尚未完成重启后聊天自动复核真机闭环 |
-| OnePlus Ace 5 Pro / OPPO Find X6 Pro 分别的验收范围 | OnePlus：本轮设备页和资料会话已测；OPPO 未连接，不能外推兼容性 |
-| 已知问题和下一步 | 需用户处理 ColorOS 启动确认后继续京东只读筛选；需用最新 APK 再跑官方中文网络 smoke；跨淘宝/京东/拼多多/美团一次授权、PDF/媒体、复杂折扣仍不在本轮完成范围 |
+| 悬浮窗 | 本轮真实京东任务已验证展开、暂停和返回聊天；恢复和悬浮窗 STOP 尚未在本轮真实任务中测试。合成测试中的直接/通知 STOP 不替代悬浮窗按钮验收 |
+| OnePlus Ace 5 Pro / OPPO Find X6 Pro 分别的验收范围 | OnePlus：最终 197 安装、3 项合成控机回归、1 项公开正文网络回归，以及上述聊天/悬浮窗步骤已测；OPPO 未连接，不能外推兼容性 |
+| 已知问题和下一步 | 核对原始 observe 结果，修复真实滚动的 `INCOMPLETE_SCREEN` 阻断并保留安全检查；继续排查首次复杂任务续接无观察，完成同规格候选比较、真实普通券条件与应用核验；补测 Root 重启自动复核及悬浮窗恢复/STOP。198 版修复与本轮新测试见独立报告。跨淘宝/京东/拼多多/美团一次授权、PDF/媒体、复杂折扣仍未完成 |
 
 相关源码集中于 `data/research/`、`data/shopping/`、`data/ai/tools/ResearchTools.kt`、`data/ai/tools/ShoppingTools.kt` 和 `data/mobileagent/`。实际测试以本轮 XML/构建日志及设备记录为准，不以“存在测试文件”代替通过结果。
