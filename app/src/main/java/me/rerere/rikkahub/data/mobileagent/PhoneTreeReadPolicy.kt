@@ -3,6 +3,7 @@ package me.rerere.rikkahub.data.mobileagent
 import java.security.MessageDigest
 
 internal const val PRODUCTION_PHONE_TREE_NODE_LIMIT = 768
+internal const val PHONE_TREE_READ_TIME_LIMIT_MILLIS = 2_000L
 
 // AccessibilityServiceInfo: INCLUDE_NOT_IMPORTANT_VIEWS | REPORT_VIEW_IDS | RETRIEVE_INTERACTIVE_WINDOWS.
 private const val PRODUCTION_PHONE_READ_FLAGS = 0x2 or 0x10 or 0x40
@@ -47,7 +48,7 @@ internal class PhoneTreeReadBudget(
     val issues = linkedSetOf<String>()
 
     fun visit(depth: Int, nowMillis: Long): Boolean {
-        if (visits >= maxVisits || depth > 40 || nowMillis - startedAtMillis > 2_000) {
+        if (visits >= maxVisits || depth > 40 || nowMillis - startedAtMillis > PHONE_TREE_READ_TIME_LIMIT_MILLIS) {
             markTruncated(when { visits >= maxVisits -> "visit_limit"; depth > 40 -> "depth_limit"; else -> "time_limit" })
             return false
         }
@@ -67,7 +68,7 @@ internal class PhoneTreeReadBudget(
     }
 
     fun canContinue(nowMillis: Long): Boolean {
-        if (visits >= maxVisits || nowMillis - startedAtMillis > 2_000) {
+        if (visits >= maxVisits || nowMillis - startedAtMillis > PHONE_TREE_READ_TIME_LIMIT_MILLIS) {
             markTruncated(if (visits >= maxVisits) "visit_limit" else "time_limit")
             return false
         }

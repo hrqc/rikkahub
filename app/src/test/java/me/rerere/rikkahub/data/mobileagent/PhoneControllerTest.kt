@@ -742,6 +742,68 @@ class PhoneControllerTest {
         }
     }
 
+    @Test fun `explicit platform challenges revoke complete and scroll-only observations and shopping evidence`() = runBlocking {
+        val challenges = listOf("京东验证", "请点击下方按钮完成安全验证", "拖动滑块完成验证")
+        for (challenge in challenges) for (description in listOf(false, true)) for (partial in listOf(false, true)) {
+            Fixture().use { f ->
+                val token = f.start()
+                val previous = f.controller.observe(token)
+                assertTrue(f.controller.shoppingEvidence(token).isNotEmpty())
+                f.backend.truncated = partial
+                f.backend.scrollOnly = partial
+                f.backend.inspectionIssues = if (partial) listOf("unavailable_child") else emptyList()
+                f.backend.extraNodes = listOf(PhoneNode("challenge", bounds = PhoneBounds(0, 0, 100, 100),
+                    text = if (description) "" else challenge, description = if (description) challenge else "", clickable = true))
+
+                expectCode("USER_HANDOVER_REQUIRED") { f.controller.observe(token) }
+
+                assertEquals(PhoneSessionStatus.PAUSED, f.controller.state.value.status)
+                assertFalse(f.backend.lastReadPermit!!.isValid())
+                assertTrue(f.controller.shoppingEvidence(token).isEmpty())
+                assertEquals(1, f.controller.state.value.audit.count { it.operation == "observe" })
+                assertFalse(f.controller.state.value.audit.toString().contains(challenge))
+                expectCode("SESSION_INVALID") { f.controller.act(token, previous.id, PhoneAction.Click("button")) }
+                val resumed = f.controller.resume()
+                assertTrue(f.controller.shoppingEvidence(resumed).isEmpty())
+                expectCode("STALE_SNAPSHOT") { f.controller.act(resumed, previous.id, PhoneAction.Click("button")) }
+                assertEquals(0, f.backend.actions)
+            }
+        }
+    }
+
+    @Test fun `challenge appearing after a native scroll pauses without a second action or product evidence`() = runBlocking {
+        Fixture().use { f ->
+            val token = f.start()
+            val previous = f.controller.observe(token)
+            f.backend.beforeRead = { f.backend.text = "京东验证" }
+
+            val result = f.controller.act(token, previous.id, PhoneAction.Scroll("scroll", true))
+
+            assertTrue(result.accepted)
+            assertFalse(result.screenChanged)
+            assertNull(result.observation)
+            assertEquals(PhoneSessionStatus.PAUSED, f.controller.state.value.status)
+            assertEquals(1, f.backend.actions)
+            assertTrue(f.controller.shoppingEvidence(token).isEmpty())
+            expectCode("SESSION_INVALID") { f.controller.act(token, previous.id, PhoneAction.Scroll("scroll", true)) }
+            val resumed = f.controller.resume()
+            assertTrue(f.controller.shoppingEvidence(resumed).isEmpty())
+            assertEquals(1, f.backend.actions)
+        }
+    }
+
+    @Test fun `ordinary product verification wording remains readable evidence`() = runBlocking {
+        for (text in listOf("产品质量经过测试验证", "实验验证结果", "快速验证产品性能")) Fixture().use { f ->
+            val token = f.start()
+            f.backend.text = text
+            val screen = f.controller.observe(token)
+            assertEquals(PhoneSessionStatus.RUNNING, f.controller.state.value.status)
+            assertFalse(screen.sensitive)
+            assertEquals(text, f.controller.shoppingEvidence(token).single().nodes.first().text)
+            assertEquals(0, f.backend.actions)
+        }
+    }
+
     @Test fun `coordinate swipe cannot activate payment sliders`() = runBlocking {
         Fixture().use { f ->
             val token = f.start()

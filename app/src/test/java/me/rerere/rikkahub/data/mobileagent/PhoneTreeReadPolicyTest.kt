@@ -28,6 +28,28 @@ class PhoneTreeReadPolicyTest {
         assertEquals("", sample.value)
     }
 
+    @Test fun `explicit platform challenges are redacted even beyond the public preview`() {
+        for (challenge in listOf("京东验证", "请点击下方按钮完成安全验证", "拖动滑块完成验证")) {
+            for (prefix in listOf("", "商品介绍".repeat(100))) {
+                val sample = samplePhoneNodeText(false) { prefix + challenge }
+                assertTrue(sample.sensitive)
+                assertFalse(sample.inspectionIncomplete)
+                assertEquals(prefix.isNotEmpty(), sample.truncated)
+                assertEquals("", sample.value)
+                assertEquals("", sample.contentFingerprint)
+            }
+        }
+    }
+
+    @Test fun `ordinary verification vocabulary is not a platform challenge`() {
+        listOf("产品质量经过测试验证", "实验验证结果", "快速验证产品性能").forEach { text ->
+            val sample = samplePhoneNodeText(false) { text }
+            assertFalse(sample.sensitive)
+            assertFalse(sample.inspectionIncomplete)
+            assertEquals(text, sample.value)
+        }
+    }
+
     @Test
     fun `oversize text is rejected without materializing the char sequence`() {
         val sample = samplePhoneNodeText(false) {

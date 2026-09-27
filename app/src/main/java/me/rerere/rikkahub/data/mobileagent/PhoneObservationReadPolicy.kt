@@ -3,6 +3,8 @@ package me.rerere.rikkahub.data.mobileagent
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.withTimeoutOrNull
 
+private const val PHONE_OBSERVATION_RETRY_DELAY_MILLIS = 120L
+
 /** A content revision may be retried; an identity change must never be crossed by a read. */
 internal data class PhoneObservationVersion(val windowId: Int?, val identity: Long, val revision: Long)
 
@@ -47,9 +49,14 @@ internal suspend fun <T : Any> readStablePhoneObservation(
                 if (checkedVersion().revision != before.revision) throw PhoneObservationInvalidated()
                 if (nowMillis() - startedAt >= 4_500) exhausted()
                 if (shouldRetry(result)) {
-                    // A caller may grant a narrower capability for this final, completed read.
+                    // Reserve the existing 2-second tree budget plus the 120ms retry pause.
+                    // If another full read cannot fit, only this completed, stable result may
+                    // receive the caller's explicitly narrower capability before the deadline.
+                    val remainingMillis = 4_500 - (nowMillis() - startedAt)
+                    val lastAvailableRead = attempt == 3 ||
+                        remainingMillis <= PHONE_TREE_READ_TIME_LIMIT_MILLIS + PHONE_OBSERVATION_RETRY_DELAY_MILLIS
                     // Never retain an earlier result across invalidation, timeout or failed capture.
-                    if (attempt != 3 || !acceptLastStable(result)) throw PhoneObservationInvalidated()
+                    if (!lastAvailableRead || !acceptLastStable(result)) throw PhoneObservationInvalidated()
                     if (checkedVersion().revision != before.revision) throw PhoneObservationInvalidated()
                     if (nowMillis() - startedAt >= 4_500) exhausted()
                 }
@@ -58,7 +65,7 @@ internal suspend fun <T : Any> readStablePhoneObservation(
                 // This also rechecks STOP, lock, service and package before waiting or reading again.
                 checkedVersion()
                 if (attempt == 3 || nowMillis() - startedAt >= 4_500) exhausted()
-                pause(120)
+                pause(PHONE_OBSERVATION_RETRY_DELAY_MILLIS)
             }
         }
         exhausted()

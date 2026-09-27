@@ -88,6 +88,147 @@ class PhoneObservationReadPolicyTest {
         assertEquals(3, f.waits)
     }
 
+    @Test fun `low remaining budget returns only the current completed limited read`() = runBlocking {
+        val f = ReadFixture()
+        val accepted = mutableListOf<String>()
+        val result = f.read(shouldRetry = { true }, acceptLastStable = { accepted += it; true }) {
+            f.now = if (f.reads == 1) 1_000 else 2_600
+            "partial-${f.reads}"
+        }
+        assertEquals("partial-2", result)
+        assertEquals(listOf("partial-2"), accepted)
+        assertEquals(2, f.reads)
+        assertEquals(1, f.waits)
+    }
+
+    @Test fun `limited early return includes exactly 2120ms remaining but not 2121ms`() = runBlocking {
+        listOf(2_121L, 2_120L, 2_119L).forEach { remaining ->
+            val f = ReadFixture()
+            val accepted = mutableListOf<String>()
+            val result = f.read(shouldRetry = { true }, acceptLastStable = { accepted += it; true }) {
+                if (f.reads == 1) f.now = 4_500 - remaining
+                "partial-${f.reads}"
+            }
+            val expectedReads = if (remaining == 2_121L) 2 else 1
+            assertEquals("partial-$expectedReads", result)
+            assertEquals(listOf(result), accepted)
+            assertEquals(expectedReads, f.reads)
+            assertEquals(expectedReads - 1, f.waits)
+        }
+    }
+
+    @Test fun `low budget aborted or invalidated read never revives an earlier eligible result`() = runBlocking {
+        listOf(false, true).forEach { changesRevision ->
+            val f = ReadFixture()
+            expectCode("PAGE_UNSTABLE") {
+                f.read(shouldRetry = { true }, acceptLastStable = { fail("No current stable result"); true }) {
+                    if (f.reads == 1) {
+                        f.now = 500
+                        "earlier-eligible"
+                    } else {
+                        if (f.reads == 2) f.now = 3_000
+                        if (!changesRevision) throw PhoneObservationInvalidated()
+                        f.current = f.current.copy(revision = f.current.revision + 1)
+                        "invalidated-${f.reads}"
+                    }
+                }
+            }
+            assertEquals(4, f.reads)
+        }
+    }
+
+    @Test fun `low budget ineligible result cannot use an earlier eligible capture`() = runBlocking {
+        val f = ReadFixture()
+        val checked = mutableListOf<String>()
+        expectCode("PAGE_UNSTABLE") {
+            f.read(shouldRetry = { true }, acceptLastStable = { checked += it; it == "earlier-eligible" }) {
+                if (f.reads == 1) {
+                    f.now = 500
+                    "earlier-eligible"
+                } else {
+                    if (f.reads == 2) f.now = 3_000
+                    "no-scroll-node"
+                }
+            }
+        }
+        assertEquals(listOf("no-scroll-node", "no-scroll-node", "no-scroll-node"), checked)
+        assertEquals(4, f.reads)
+    }
+
+    @Test fun `low budget does not opt default callers into limited acceptance`() = runBlocking {
+        val f = ReadFixture()
+        expectCode("PAGE_UNSTABLE") {
+            f.read(shouldRetry = { true }) {
+                if (f.reads == 1) f.now = 2_380
+                "partial"
+            }
+        }
+        assertEquals(4, f.reads)
+        assertEquals(3, f.waits)
+    }
+
+    @Test fun `sensitive and other inspection gaps never request early limited capability`() = runBlocking {
+        val cases = listOf(true to listOf("unavailable_child")) +
+            listOf("foreign_node", "children_limit", "visit_limit", "time_limit", "depth_limit", "text_limit")
+                .flatMap { listOf(false to listOf(it), false to listOf("unavailable_child", it)) }
+        cases.forEach { (sensitive, issues) ->
+            val f = ReadFixture()
+            val raw = f.read(
+                shouldRetry = { shouldRetryPhoneInspection(sensitive, true, issues) },
+                acceptLastStable = { fail("This inspection has no limited capability"); true },
+            ) {
+                f.now = 3_000
+                "raw-rejected-inspection"
+            }
+            // The backend/controller still handle this raw result; no limited grant was requested.
+            assertEquals("raw-rejected-inspection", raw)
+            assertEquals(1, f.reads)
+            assertEquals(0, f.waits)
+        }
+    }
+
+    @Test fun `early limited acceptance still rechecks stop version identity and deadline`() = runBlocking {
+        val cases: List<Pair<String, (ReadFixture) -> Unit>> = listOf(
+            "PAGE_UNSTABLE" to { f -> f.current = f.current.copy(revision = f.current.revision + 1) },
+            "STALE_WINDOW" to { f -> f.current = f.current.copy(identity = 2) },
+            "STALE_WINDOW" to { f -> f.current = f.current.copy(windowId = 2) },
+            "PAGE_UNSTABLE" to { f -> f.now = 4_500 },
+            "SESSION_INACTIVE" to { f -> f.denied = "SESSION_INACTIVE" },
+        )
+        cases.forEachIndexed { index, (code, invalidate) ->
+            val f = ReadFixture()
+            expectCode(code) {
+                f.read(shouldRetry = { true }, acceptLastStable = { invalidate(f); true }) {
+                    if (f.reads == 1) f.now = 3_000
+                    "partial-${f.reads}"
+                }
+            }
+            assertEquals(if (index == 0) 4 else 1, f.reads)
+        }
+    }
+
+    @Test fun `early candidate at 4500ms or cancellation is never accepted`() = runBlocking {
+        val late = ReadFixture()
+        expectCode("PAGE_UNSTABLE") {
+            late.read(shouldRetry = { true }, acceptLastStable = { fail("Deadline reached"); true }) {
+                late.now = 4_500
+                "late-partial"
+            }
+        }
+        assertEquals(1, late.reads)
+        assertEquals(0, late.waits)
+        val cancelled = ReadFixture()
+        val failure = runCatching {
+            cancelled.read(shouldRetry = { true }, acceptLastStable = { fail("Cancelled"); true }) {
+                cancelled.now = 3_000
+                throw CancellationException("stopped")
+            }
+        }.exceptionOrNull()
+        assertTrue(failure is CancellationException)
+        assertEquals(1, cancelled.reads)
+        assertEquals(0, cancelled.waits)
+    }
+
     @Test fun `partial capability never returns an earlier read when the final capture aborts`() = runBlocking {
         val f = ReadFixture()
         var capabilityChecks = 0

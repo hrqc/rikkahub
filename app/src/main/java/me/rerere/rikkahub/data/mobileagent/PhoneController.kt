@@ -549,6 +549,7 @@ object PhoneContentPolicy {
     private val markers = listOf(
         "支付密码", "付款码", "验证码", "一次性密码", "短信验证",
         "指纹验证", "人脸验证", "生物识别", "解锁密码", "超级用户", "安装未知应用",
+        "京东验证", "请点击下方按钮完成安全验证", "拖动滑块完成验证",
         "payment password", "one-time password", "verification code",
         "biometric", "enter pin", "enter password", "superuser", "sukisu", "magisk", "apatch",
     )
