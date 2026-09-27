@@ -66,7 +66,7 @@ internal class AccessibilityTreeReader {
         require(debugStructure == null || (BuildConfig.DEBUG && diagnosticProfile != null && diagnostics != null))
         val nodes = mutableListOf<PhoneNode>()
         val handles = linkedMapOf<String, AndroidNodeHandle>()
-        val budget = PhoneTreeReadBudget(SystemClock.elapsedRealtime(), diagnosticProfile?.nodeLimit ?: 512)
+        val budget = PhoneTreeReadBudget(SystemClock.elapsedRealtime(), diagnosticProfile?.nodeLimit ?: PRODUCTION_PHONE_TREE_NODE_LIMIT)
         val rootWindowId = if (diagnosticProfile != null) root.windowId else null
         val restrictedPaths = mutableListOf<List<Int>>()
         val nativeScrollNodeIds = mutableSetOf<String>()

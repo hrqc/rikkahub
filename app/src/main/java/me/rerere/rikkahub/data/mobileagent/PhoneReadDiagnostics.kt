@@ -16,7 +16,7 @@ internal enum class ReadDiagnosticProfile(val includeUnimportant: Boolean, val r
     REFRESH_PARENTS(false, true),
     INCLUDE_UNIMPORTANT_REFRESH_PARENTS(true, true);
 
-    val nodeLimit: Int get() = 768
+    val nodeLimit: Int get() = PRODUCTION_PHONE_TREE_NODE_LIMIT
     fun applyFlags(flags: Int): Int = if (includeUnimportant) flags or 2 else flags and 2.inv()
 }
 
@@ -71,7 +71,7 @@ internal class ReadDiagnosticAttempt(
     var profile = ReadDiagnosticProfile.DEFAULT
     var variantRead = false
     var serviceFlags: Int? = null
-    var treeNodeLimit = 512
+    var treeNodeLimit = PRODUCTION_PHONE_TREE_NODE_LIMIT
 }
 
 /** No node, text, description, image, exception message or model output is accepted by this model. */
@@ -116,7 +116,7 @@ internal class ReadDiagnosticCapture(
             put("limits", buildJsonObject {
                 put("durationMs", 15_000); put("samples", 7); put("attempts", 32)
                 put("events", 128); put("gapsPerAttempt", 20); put("exportBytes", maxBytes)
-                put("treeNodes", 512); put("treeDepth", 40); put("treeTimeMs", 2_000)
+                put("treeNodes", PRODUCTION_PHONE_TREE_NODE_LIMIT); put("treeDepth", 40); put("treeTimeMs", 2_000)
                 put("variantTreeNodes", profile.nodeLimit)
                 put("childrenPerNode", 128)
             })

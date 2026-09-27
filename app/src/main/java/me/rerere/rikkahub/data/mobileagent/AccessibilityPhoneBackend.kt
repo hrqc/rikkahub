@@ -558,6 +558,7 @@ class AccessibilityPhoneBackend(
                     acceptLastStable = { it.capability == PhoneSnapshotCapability.NATIVE_SCROLL_ONLY },
                 )
                 // Nothing is published until a whole read finishes at its original revision.
+                requireRevision(permit, captured.observation.windowRevision)
                 snapshot.set(captured)
                 diagnosticOutcome = if (captured.observation.scrollOnly) "OBSERVED_SCROLL_ONLY" else "OBSERVED"
                 diagnosticSnapshotId = captured.observation.id
@@ -729,6 +730,9 @@ class AccessibilityPhoneBackend(
         }
         if (!notifications.canPost()) fail("STOP_UNAVAILABLE", "STOP 通知不可用，请恢复通知权限后重新开启会话。")
         if (service.get() == null) fail("ACCESSIBILITY_DISCONNECTED", "无障碍服务尚未连接。")
+        if (!productionReadFlagsAvailable(permit)) {
+            fail("USER_REQUIRED", "无障碍扩展读取配置尚未生效，请重新连接“Mobile Agent 手机控制”服务后重新开始任务。")
+        }
         refreshEnvironment()
         if (mutableState.value.locked) fail("DEVICE_LOCKED", "设备已锁屏，请先手动解锁。")
         if (requireTarget && mutableState.value.foregroundPackage == null) {
@@ -740,6 +744,18 @@ class AccessibilityPhoneBackend(
         if (!requireTarget && mutableState.value.foregroundPackage !in setOf(context.packageName, permit.targetPackage)) {
             fail("FOREGROUND_CONFLICT", "前台不是本应用或目标应用，请用户确认后继续。")
         }
+    }
+
+    /** Read the actual configuration; never repair it while a production read or action is in flight. */
+    private fun productionReadFlagsAvailable(permit: PhonePermit): Boolean {
+        val connectedService = service.get()
+        val available = runCatching { hasProductionPhoneReadFlags(connectedService?.serviceInfo?.flags) }
+            .getOrDefault(false) && service.get() === connectedService
+        if (!available) {
+            // An old read may finish after a replacement grant; only invalidate its own snapshot.
+            snapshot.get()?.takeIf { it.token == permit.token }?.let { snapshot.compareAndSet(it, null) }
+        }
+        return available
     }
 
     private fun validAtRevision(permit: PhonePermit, expected: Long): Boolean =

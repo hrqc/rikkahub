@@ -2,6 +2,15 @@ package me.rerere.rikkahub.data.mobileagent
 
 import java.security.MessageDigest
 
+internal const val PRODUCTION_PHONE_TREE_NODE_LIMIT = 768
+
+// AccessibilityServiceInfo: INCLUDE_NOT_IMPORTANT_VIEWS | REPORT_VIEW_IDS | RETRIEVE_INTERACTIVE_WINDOWS.
+private const val PRODUCTION_PHONE_READ_FLAGS = 0x2 or 0x10 or 0x40
+
+/** Additional service flags are allowed; every flag needed by the production tree must remain set. */
+internal fun hasProductionPhoneReadFlags(flags: Int?): Boolean =
+    flags != null && (flags and PRODUCTION_PHONE_READ_FLAGS) == PRODUCTION_PHONE_READ_FLAGS
+
 internal data class PhoneTextSample(
     val value: String, val sensitive: Boolean, val truncated: Boolean,
     val inspectionIncomplete: Boolean = false, val requiresUserConfirmation: Boolean = false,
@@ -22,8 +31,11 @@ internal fun samplePhoneNodeText(protected: Boolean, read: () -> CharSequence?):
             .digest(full.toByteArray(Charsets.UTF_8)).joinToString("") { "%02x".format(it) })
 }
 
-internal class PhoneTreeReadBudget(private val startedAtMillis: Long, private val maxVisits: Int = 512) {
-    init { require(maxVisits in 1..768) }
+internal class PhoneTreeReadBudget(
+    private val startedAtMillis: Long,
+    private val maxVisits: Int = PRODUCTION_PHONE_TREE_NODE_LIMIT,
+) {
+    init { require(maxVisits in 1..PRODUCTION_PHONE_TREE_NODE_LIMIT) }
     var visits = 0
         private set
     private var emitted = 0

@@ -26,9 +26,9 @@ class PhoneReadDiagnosticProfileTest {
         assertEquals(80, ReadDiagnosticProfile.DEFAULT.applyFlags(82))
     }
 
-    @Test fun `normal budget still ends at 512 while explicit experiment reaches 768`() {
+    @Test fun `production and explicit diagnostic reads share the 768 node boundary`() {
         val normal = PhoneTreeReadBudget(0)
-        repeat(512) { assertTrue(normal.visit(0, 100)) }
+        repeat(768) { assertTrue(normal.visit(0, 100)) }
         assertFalse(normal.visit(0, 100))
         assertEquals(setOf("visit_limit"), normal.issues)
 
@@ -43,6 +43,24 @@ class PhoneReadDiagnosticProfileTest {
     @Test(expected = IllegalArgumentException::class)
     fun `experiment cannot increase the hard budget above 768`() {
         PhoneTreeReadBudget(0, 769)
+    }
+
+    @Test fun `normal diagnostic export reports the actual production node budget`() {
+        val window = ReadDiagnosticWindow(7, 2, 11, 1)
+        val capture = ReadDiagnosticCapture(token, "com.example.target", window, 82, 1, 36, "test",
+            now = { 1000 }, wallTime = { 1000 })
+        val sample = checkNotNull(capture.beginSample())
+        val attempt = checkNotNull(capture.beginAttempt(sample, window))
+        attempt.serviceFlags = 82
+        capture.endAttempt(attempt, window, "COMPLETE", emptyList(), false, false, false)
+        capture.endSample(sample, "COMPLETE", null, window)
+        val records = capture.finish().map { Json.parseToJsonElement(it).jsonObject }
+        val begin = records.single { it["recordType"]?.jsonPrimitive?.content == "begin" }
+        assertEquals(768, begin.getValue("limits").jsonObject.getValue("treeNodes").jsonPrimitive.int)
+        val row = records.single { it["recordType"]?.jsonPrimitive?.content == "attempt" }
+        assertEquals("normal_observe", row["readMode"]?.jsonPrimitive?.content)
+        assertEquals(768, row.getValue("treeNodeLimit").jsonPrimitive.int)
+        assertEquals(82, row.getValue("serviceFlags").jsonPrimitive.int)
     }
 
     @Test fun `restoration preserves unrelated flag changes and the original include bit`() {

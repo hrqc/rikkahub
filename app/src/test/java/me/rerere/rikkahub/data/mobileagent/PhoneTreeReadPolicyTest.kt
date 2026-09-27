@@ -57,10 +57,20 @@ class PhoneTreeReadPolicyTest {
     @Test
     fun `invisible containers consume visit budget even without emitted nodes`() {
         val budget = PhoneTreeReadBudget(0)
-        repeat(512) { assertTrue(budget.visit(0, 0)) }
+        repeat(768) { assertTrue(budget.visit(0, 0)) }
         assertFalse(budget.visit(0, 0))
         assertTrue(budget.truncated)
-        assertEquals(512, budget.visits)
+        assertEquals(768, budget.visits)
+    }
+
+    @Test fun `production read flags require all three bits while allowing unrelated flags`() {
+        assertTrue(hasProductionPhoneReadFlags(82))
+        assertTrue(hasProductionPhoneReadFlags(82 or 128 or 512))
+        assertFalse(hasProductionPhoneReadFlags(null))
+        assertFalse(hasProductionPhoneReadFlags(0))
+        listOf(2, 16, 64).forEach { requiredBit ->
+            assertFalse(hasProductionPhoneReadFlags((82 and requiredBit.inv()) or 128 or 512))
+        }
     }
 
     @Test
