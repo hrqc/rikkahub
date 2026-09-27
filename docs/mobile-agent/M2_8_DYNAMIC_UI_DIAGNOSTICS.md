@@ -40,3 +40,12 @@
 分支 `feature/mobile-agent-v1`。本批前安全点 `be6d89f97a630c9be3506d010cfb637b0ff7e0a9`，远程备份分支 `backup/v1-m2.7-pre-dynamic-ui-fix` 已推送。198 主 APK 源码为 `e0530732414e978381a5a1043c736790c7154f3d`，标签 `mobile-agent-v1-m2.7-reliability-internal` 已推送。回滚优先使用新恢复分支或 revert；不清除应用数据，不重写历史。
 
 用户已授权本专项审查通过的源码、测试、文档公开推送至 `hrqc/rikkahub`；APK、原始诊断、截图、聊天数据及密钥保留本地。最终源码 SHA、APK 文件名和 SHA-256 在本地 `BUILD_INFO.md` 与后续产物记录中登记。
+
+## 最终产物记录
+
+- APK 源码提交：`957561421667ccad8a62e074a868dd464f021f46`；之后纯文档提交不改变 APK 来源。
+- 内部标签：`mobile-agent-v1-m2.8-diagnostics-internal`，已与开发分支成功推送到用户 Fork。
+- 主 APK：`artifacts/v1-m2.8-dynamic-ui/RikkaHub-Mobile-Agent-v1-m2.8-199-95756142-arm64-debug.apk`，84,068,833 字节；SHA-256 `7FF43F53CA345EE4707A1B1E5EB781CAAD03DD85C4C8324DE270FD2CDA0446B4`。
+- 测试 APK：同目录 `Mobile-Agent-v1-m2.8-199-95756142-device-tests.apk`，1,343,919 字节；SHA-256 `E52691EDDA3F75242F94E5A2E3C9161C708C4241C91AD863525699BC0D922390`。
+- 两个最终 APK 签名校验通过，199 已安装。结束实测后唯一获准的无障碍服务为已绑定、无 crashed 标记，手机返回京东结果页。
+- 内部标签不表示商品列表已修复，更不表示用户已完成 V1 验收；历史失败和未完成项继续保留。
