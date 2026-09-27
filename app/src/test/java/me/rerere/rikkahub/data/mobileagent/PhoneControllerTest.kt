@@ -41,6 +41,7 @@ class PhoneControllerTest {
         var actions = 0
         var invalidations = 0
         var noticesEnded = 0
+        var lastReadPermit: PhonePermit? = null
         var onStop: ((PhoneBackendStopReason) -> Unit)? = null
         var beforeDispatch: suspend (PhonePermit) -> Unit = {}
         var beforeRead: suspend () -> Unit = {}
@@ -52,6 +53,7 @@ class PhoneControllerTest {
         override fun endSessionNotice() { noticesEnded++ }
         override fun invalidate() { invalidations++ }
         override suspend fun observe(permit: PhonePermit): PhoneObservation {
+            lastReadPermit = permit
             beforeRead()
             check(permit.isValid())
             reads++
@@ -75,6 +77,11 @@ class PhoneControllerTest {
     private inline fun expectCode(code: String, block: () -> Unit) {
         try { block(); fail("Expected $code") } catch (error: PhoneControlException) { assertEquals(code, error.code) }
     }
+
+    private val terminalInspectionFailures = mapOf(
+        "PAGE_UNSTABLE" to "目标页面在有限次读取后仍不稳定，任务已暂停；请等待页面稳定后手动继续。",
+        "INCOMPLETE_SCREEN" to "未能完整检查目标页面，任务已暂停；请检查页面后手动继续。",
+    )
 
     @Test fun `shopping evidence is bounded to real observations and current grant`() = runBlocking {
         Fixture().use { f ->
@@ -312,6 +319,134 @@ class PhoneControllerTest {
         }
     }
 
+    @Test fun `final inspection failure pauses observation and revokes its permit without exposing platform details`() = runBlocking {
+        terminalInspectionFailures.forEach { (code, reason) ->
+            Fixture().use { f ->
+                val token = f.start()
+                f.controller.observe(token)
+                assertTrue(f.controller.shoppingEvidence(token).isNotEmpty())
+                val invalidations = f.backend.invalidations
+                f.backend.beforeRead = { throw PhoneControlException(code, "private platform detail") }
+
+                expectCode(code) { f.controller.observe(token) }
+
+                assertEquals(PhoneSessionStatus.PAUSED, f.controller.state.value.status)
+                assertEquals(reason, f.controller.state.value.detail)
+                assertNotEquals(token.epoch, f.controller.state.value.token?.epoch)
+                assertNull(f.controller.activeToken("chat", "assistant"))
+                assertFalse(f.backend.lastReadPermit!!.isValid())
+                assertTrue(f.backend.invalidations > invalidations)
+                assertTrue(f.controller.shoppingEvidence(token).isEmpty())
+                assertFalse(f.controller.state.value.audit.toString().contains("private"))
+                expectCode("SESSION_INVALID") { f.controller.observe(token) }
+                assertEquals(0, f.backend.actions)
+            }
+        }
+    }
+
+    @Test fun `inspection failure after dispatch preserves acceptance and pauses without replaying the action`() = runBlocking {
+        terminalInspectionFailures.forEach { (code, reason) ->
+            Fixture().use { f ->
+                val token = f.start()
+                val snapshot = f.controller.observe(token)
+                var dispatchedPermit: PhonePermit? = null
+                f.backend.beforeDispatch = { dispatchedPermit = it }
+                f.backend.beforeRead = { throw PhoneControlException(code, "private post action detail") }
+
+                val result = f.controller.act(token, snapshot.id, PhoneAction.Click("button"))
+
+                assertTrue(result.accepted)
+                assertFalse(result.screenChanged)
+                assertNull(result.observation)
+                assertEquals("动作已提交，但未能验证后续页面；请检查并重新观察", result.detail)
+                assertEquals(PhoneSessionStatus.PAUSED, f.controller.state.value.status)
+                assertEquals(reason, f.controller.state.value.detail)
+                assertFalse(dispatchedPermit!!.isValid())
+                assertEquals(1, f.backend.actions)
+                assertFalse(f.controller.state.value.audit.toString().contains("private"))
+                expectCode("SESSION_INVALID") { f.controller.act(token, snapshot.id, PhoneAction.Click("button")) }
+
+                val resumed = f.controller.resume()
+                expectCode("STALE_SNAPSHOT") { f.controller.act(resumed, snapshot.id, PhoneAction.Click("button")) }
+                assertEquals(1, f.backend.actions)
+                assertEquals(PhoneSessionStatus.RUNNING, f.controller.state.value.status)
+            }
+        }
+    }
+
+    @Test fun `incomplete post dispatch observation stays unverified and cannot be replayed after resume`() = runBlocking {
+        Fixture().use { f ->
+            val token = f.start()
+            val snapshot = f.controller.observe(token)
+            f.backend.beforeRead = {
+                assertEquals(1, f.backend.actions)
+                f.backend.truncated = true
+                f.backend.text = "private incomplete result"
+            }
+
+            val result = f.controller.act(token, snapshot.id, PhoneAction.Click("button"))
+
+            assertTrue(result.accepted)
+            assertFalse(result.screenChanged)
+            assertNull(result.observation)
+            assertEquals("动作已提交，但未能验证后续页面；请检查并重新观察", result.detail)
+            assertEquals(PhoneSessionStatus.PAUSED, f.controller.state.value.status)
+            assertEquals(terminalInspectionFailures.getValue("INCOMPLETE_SCREEN"), f.controller.state.value.detail)
+            assertTrue(f.controller.shoppingEvidence(token).isEmpty())
+            assertEquals(1, f.controller.state.value.audit.count { it.operation == "observe" })
+            assertFalse(f.controller.state.value.audit.toString().contains("private"))
+            assertFalse(f.backend.lastReadPermit!!.isValid())
+            assertEquals(2, f.backend.reads)
+            expectCode("SESSION_INVALID") { f.controller.act(token, snapshot.id, PhoneAction.Click("button")) }
+
+            val resumed = f.controller.resume()
+            assertNotEquals(token.epoch, resumed.epoch)
+            expectCode("STALE_SNAPSHOT") { f.controller.act(resumed, snapshot.id, PhoneAction.Click("button")) }
+            assertTrue(f.controller.shoppingEvidence(resumed).isEmpty())
+            assertEquals(1, f.backend.actions)
+        }
+    }
+
+    @Test(timeout = 5_000)
+    fun `late inspection failure cannot pause or invalidate a replacement session or resumed epoch`() = runBlocking {
+        for (code in terminalInspectionFailures.keys) {
+            for (replaceSession in listOf(false, true)) {
+                Fixture().use { f ->
+                    val old = f.start()
+                    val reading = CompletableDeferred<Unit>()
+                    val release = CompletableDeferred<Unit>()
+                    f.backend.beforeRead = {
+                        reading.complete(Unit)
+                        release.await()
+                        throw PhoneControlException(code, "late private failure")
+                    }
+                    val pending = async { runCatching { f.controller.observe(old) } }
+                    reading.await()
+                    val oldPermit = f.backend.lastReadPermit!!
+                    val current = if (replaceSession) f.start() else {
+                        f.controller.pause()
+                        f.controller.resume()
+                    }
+                    val stateBeforeFailure = f.controller.state.value
+                    val invalidations = f.backend.invalidations
+                    release.complete(Unit)
+
+                    val error = pending.await().exceptionOrNull()
+                    assertTrue(error is PhoneControlException)
+                    assertEquals(code, (error as PhoneControlException).code)
+                    assertEquals(stateBeforeFailure, f.controller.state.value)
+                    assertEquals(current, f.controller.activeToken("chat", "assistant"))
+                    assertEquals(invalidations, f.backend.invalidations)
+                    assertFalse(oldPermit.isValid())
+                    assertEquals(0, f.backend.actions)
+                    f.backend.beforeRead = {}
+                    f.controller.observe(current)
+                    assertTrue(f.backend.lastReadPermit!!.isValid())
+                }
+            }
+        }
+    }
+
     @Test fun `snapshot revision and age are checked before every action`() = runBlocking {
         Fixture().use { f ->
             val token = f.start()
@@ -421,13 +556,33 @@ class PhoneControllerTest {
         }
     }
 
-    @Test fun `truncated observations cannot be used for actions or screenshots`() = runBlocking {
-        Fixture().use { f ->
-            f.backend.truncated = true
-            val token = f.start(allowScreenshots = true)
-            val snapshot = f.controller.observe(token)
-            expectCode("INCOMPLETE_SCREEN") { f.controller.act(token, snapshot.id, PhoneAction.Click("button")) }
-            expectCode("INCOMPLETE_SCREEN") { f.controller.act(token, snapshot.id, PhoneAction.Screenshot) }
+    @Test fun `incomplete observations are never published and revoke previous action and screenshot snapshots`() = runBlocking {
+        for (action in listOf(PhoneAction.Click("button"), PhoneAction.Screenshot)) {
+            for (hasPreviousObservation in listOf(false, true)) {
+                Fixture().use { f ->
+                    val token = f.start(allowScreenshots = true)
+                    val previous = if (hasPreviousObservation) f.controller.observe(token) else null
+                    val publishedCount = f.controller.state.value.audit.count { it.operation == "observe" }
+                    f.backend.truncated = true
+                    f.backend.text = "private incomplete page"
+
+                    expectCode("INCOMPLETE_SCREEN") { f.controller.observe(token) }
+
+                    assertEquals(PhoneSessionStatus.PAUSED, f.controller.state.value.status)
+                    assertEquals(terminalInspectionFailures.getValue("INCOMPLETE_SCREEN"), f.controller.state.value.detail)
+                    assertFalse(f.backend.lastReadPermit!!.isValid())
+                    assertTrue(f.controller.shoppingEvidence(token).isEmpty())
+                    assertEquals(publishedCount, f.controller.state.value.audit.count { it.operation == "observe" })
+                    assertFalse(f.controller.state.value.audit.toString().contains("private"))
+                    assertEquals(0, f.backend.actions)
+                    expectCode("SESSION_INVALID") { f.controller.act(token, previous?.id, action) }
+
+                    val resumed = f.controller.resume()
+                    expectCode("STALE_SNAPSHOT") { f.controller.act(resumed, previous?.id, action) }
+                    assertTrue(f.controller.shoppingEvidence(resumed).isEmpty())
+                    assertEquals(0, f.backend.actions)
+                }
+            }
         }
     }
 
@@ -438,7 +593,11 @@ class PhoneControllerTest {
             val screen = f.controller.observe(token)
             assertTrue(screen.previewTruncated)
             assertFalse(screen.truncated)
+            assertEquals(PhoneSessionStatus.RUNNING, f.controller.state.value.status)
+            assertTrue(f.controller.shoppingEvidence(token).isNotEmpty())
             assertTrue(f.controller.act(token, screen.id, PhoneAction.Scroll("scroll", true)).accepted)
+            assertEquals(token, f.controller.activeToken("chat", "assistant"))
+            assertEquals(1, f.backend.actions)
         }
         listOf("确认付款", "提交订单", "开通会员", "免费试用", "使用积分").forEach { label ->
             Fixture().use { f ->

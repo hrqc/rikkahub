@@ -38,7 +38,9 @@ V1 only. V2 remains out of scope until the user explicitly accepts all V1 core t
 
 ## Current checkpoint
 
-Version 198 (2.5.4-mobile-agent-v1-m2.7-reliability) is built and installed, source 0530732414e978381a5a1043c736790c7154f3d. Its 283 targeted JVM tests and four independent device tests pass. The real JD result page still returns PAGE_UNSTABLE; subsequent diagnostics are waiting for the user to complete JD security verification. Full comparison is not accepted. Public push is pending explicit confirmation after automatic approval review rejected publication. See [M2_7_RELIABILITY.md](M2_7_RELIABILITY.md).
+Version 199 (`2.5.4-mobile-agent-v1-m2.8-dynamic-ui-diagnostics`) is built and installed with existing data retained. D1 adds production-source bounded diagnostics, explicit pause on final incomplete/unstable reads and honest unknown outcomes for interrupted phone tools. 301 selected JVM tests and 8 decoder tests pass. Four distinct device checks pass across separate runs; earlier startup and screenshot failures remain documented. Production JD results still reproduce six persistent missing children and now end PAUSED with zero dispatched actions. Shopping acceptance is still pending. See [M2_8_DYNAMIC_UI_DIAGNOSTICS.md](M2_8_DYNAMIC_UI_DIAGNOSTICS.md) and [the root-cause investigation](DYNAMIC_UI_ROOT_CAUSE_REPORT.md).
+
+The user completed JD verification and explicitly authorized public publication of this sprint's reviewed source, tests and documents. The pre-sprint branch and backup at `be6d89f97a630c9be3506d010cfb637b0ff7e0a9`, and the version 198 internal tag at `e0530732414e978381a5a1043c736790c7154f3d`, have been pushed. Raw phone evidence and APKs remain local.
 
 ## Version 197 evidence
 

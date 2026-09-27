@@ -127,6 +127,16 @@ public final class PhoneTestInputDriver extends Instrumentation {
                 "com.taobao.taobao", "com.xunmeng.pinduoduo", "com.sankuai.meituan").contains(expected)) {
             throw new IllegalArgumentException("Package is outside test scope");
         }
+        String treeFlags = arguments.getString("tree_flags", "80");
+        if (!"80".equals(treeFlags) && !"82".equals(treeFlags)) {
+            throw new IllegalArgumentException("Unsupported tree flags");
+        }
+        int requestedFlags = "82".equals(treeFlags) ? 82 : 80;
+        String childFetch = arguments.getString("child_fetch", "explicit");
+        if (!"explicit".equals(childFetch) && !"default".equals(childFetch)) {
+            throw new IllegalArgumentException("Unsupported child fetch strategy");
+        }
+        boolean explicitChildFetch = "explicit".equals(childFetch) && android.os.Build.VERSION.SDK_INT >= 33;
         UiAutomation automation = getUiAutomation(UiAutomation.FLAG_DONT_SUPPRESS_ACCESSIBILITY_SERVICES);
         AccessibilityServiceInfo info = automation.getServiceInfo();
         if (info == null) throw new IllegalStateException("Automation service unavailable");
@@ -134,12 +144,27 @@ public final class PhoneTestInputDriver extends Instrumentation {
         ArrayDeque<GapNode> pending = new ArrayDeque<>();
         try {
             // Change only this instrumentation connection, never the installed control service.
-            info.flags = 80;
+            info.flags = requestedFlags;
             automation.setServiceInfo(info);
             AccessibilityServiceInfo appliedInfo = automation.getServiceInfo();
             int appliedFlags = appliedInfo == null ? -1 : appliedInfo.flags;
-            AccessibilityNodeInfo root = automation.getRootInActiveWindow();
-            if (root == null) throw new IllegalStateException("No active window");
+            long rootWaitStartedAt = SystemClock.elapsedRealtime();
+            long rootWaitDeadline = rootWaitStartedAt + 2000;
+            AccessibilityNodeInfo root = null;
+            // Retry only a missing initial root; never wait through a known foreground mismatch.
+            // Binder calls are not interruptible here, so refuse any root returned after the budget.
+            while (root == null && SystemClock.elapsedRealtime() < rootWaitDeadline) {
+                root = automation.getRootInActiveWindow();
+                if (root == null) {
+                    long remaining = rootWaitDeadline - SystemClock.elapsedRealtime();
+                    if (remaining > 0) SystemClock.sleep(Math.min(100, remaining));
+                }
+            }
+            long rootWaitElapsed = SystemClock.elapsedRealtime() - rootWaitStartedAt;
+            if (root == null || rootWaitElapsed >= 2000) {
+                if (root != null) root.recycle();
+                throw new IllegalStateException("Initial active window unavailable within budget");
+            }
             if (!expected.contentEquals(root.getPackageName() == null ? "" : root.getPackageName())) {
                 root.recycle();
                 throw new IllegalStateException("Expected test app is not active");
@@ -185,7 +210,7 @@ public final class PhoneTestInputDriver extends Instrumentation {
                     for (int index = 0; index < Math.min(children, 128); index++) {
                         if (SystemClock.elapsedRealtime() >= deadline) { timeLimit = true; break; }
                         if (visits + pending.size() >= 768) { nodeLimit = true; break; }
-                        AccessibilityNodeInfo child = android.os.Build.VERSION.SDK_INT >= 33
+                        AccessibilityNodeInfo child = explicitChildFetch
                                 ? node.getChild(index, 0) : node.getChild(index);
                         if (child == null) {
                             missing++;
@@ -219,8 +244,12 @@ public final class PhoneTestInputDriver extends Instrumentation {
             result.putInt("protected_skipped", protectedSkipped);
             result.putInt("foreign_skipped", foreignSkipped);
             result.putLong("elapsed_ms", elapsed);
-            result.putInt("requested_automation_flags", 80);
+            result.putInt("requested_automation_flags", requestedFlags);
             result.putInt("automation_flags", appliedFlags);
+            result.putString("requested_child_fetch", childFetch);
+            result.putString("child_fetch", explicitChildFetch ? "explicit" : "default");
+            result.putInt("root_wait_budget_ms", 2000);
+            result.putLong("root_wait_elapsed_ms", rootWaitElapsed);
             result.putString("traversal_budget", "nodes=768,depth=40,time_ms=2500,children=128,gap_records=20");
             result.putBoolean("node_limit", nodeLimit);
             result.putBoolean("depth_limit", depthLimit);

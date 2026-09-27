@@ -29,6 +29,7 @@ import kotlinx.coroutines.sync.Mutex
 import kotlinx.coroutines.sync.withLock
 import kotlinx.coroutines.withContext
 import kotlinx.coroutines.withTimeoutOrNull
+import me.rerere.rikkahub.BuildConfig
 import me.rerere.rikkahub.service.MobileAgentNotifications
 import java.io.ByteArrayOutputStream
 import java.io.File
@@ -60,10 +61,13 @@ class AccessibilityPhoneBackend(
     private val service = AtomicReference<AccessibilityService?>(null)
     private val activeNotice = AtomicReference<SessionNotice?>(null)
     private val snapshot = AtomicReference<Snapshot?>(null)
+    private val readDiagnostics = AtomicReference<ReadDiagnosticCapture?>(null)
+    private val readDiagnosticAuthority = ReadDiagnosticAuthority()
     // Accessed only on Main. Contains package metadata, never accessibility text or event.source.
     private val windowPackages = mutableMapOf<Int, String>()
     private var controlOverlayWindowId: Int? = null
     private val recentEvents = ArrayDeque<EventMetadata>()
+    private var lastWindowCount: Int? = null
 
     private data class SessionNotice(val token: PhoneSessionToken, val targetPackage: String, val onStop: (PhoneBackendStopReason) -> Unit)
     private data class Snapshot(val token: PhoneSessionToken, val observation: PhoneObservation, val tree: AndroidTreeCapture)
@@ -82,11 +86,15 @@ class AccessibilityPhoneBackend(
 
     override fun showSessionNotice(token: PhoneSessionToken, targetPackage: String, onStop: (PhoneBackendStopReason) -> Unit): Boolean {
         if (!notifications.show(token, targetPackage)) return false
+        readDiagnostics.get()?.takeIf { it.token != token }?.stop(ReadDiagnosticStop.REPLACED)
         activeNotice.set(SessionNotice(token, targetPackage, onStop))
+        readDiagnosticAuthority.activate(token)
         return true
     }
 
     override fun endSessionNotice() {
+        readDiagnosticAuthority.revoke()
+        readDiagnostics.get()?.stop(ReadDiagnosticStop.SESSION_INVALIDATED)
         activeNotice.set(null)
         notifications.cancel()
     }
@@ -158,9 +166,65 @@ class AccessibilityPhoneBackend(
         }
         refreshEnvironment()
         val current = mutableState.value
+        recordReadDiagnosticEvent(event)
         if (current.locked || (activeNotice.get()?.targetPackage?.let { current.foregroundPackage != it } == true)) {
             rootExecutor.cancel()
         }
+    }
+
+    /** Debug instrumentation only. A handle grants no reads or actions by itself. */
+    internal suspend fun beginReadDiagnostics(token: PhoneSessionToken): ReadDiagnosticCapture = withContext(Dispatchers.Main.immediate) {
+        if (!BuildConfig.DEBUG) fail("DIAGNOSTICS_DISABLED", "诊断仅用于调试构建。")
+        val notice = activeNotice.get()?.takeIf { it.token == token && readDiagnosticAuthority.allows(token) }
+            ?: fail("SESSION_INACTIVE", "诊断必须绑定当前授权。")
+        refreshEnvironment()
+        val current = mutableState.value
+        if (service.get() == null || current.locked || current.foregroundPackage != notice.targetPackage || activeNotice.get()?.token != token) {
+            fail("FOREGROUND_CONFLICT", "诊断目标必须保持在前台。")
+        }
+        if (readDiagnostics.get()?.isRecording() == true) fail("DIAGNOSTICS_BUSY", "已有只读诊断正在记录。")
+        val info = service.get()?.serviceInfo
+        readDiagnosticAuthority.whileAuthorized(token) {
+            ReadDiagnosticCapture(
+                token, notice.targetPackage, readDiagnosticWindow(), info?.flags, info?.eventTypes,
+                Build.VERSION.SDK_INT, BuildConfig.VERSION_NAME,
+                now = SystemClock::elapsedRealtime, wallTime = System::currentTimeMillis,
+                maxBytes = 112 * 1024,
+            ).also { readDiagnostics.set(it) }
+        } ?: fail("SESSION_INACTIVE", "诊断授权已失效。")
+    }
+
+    internal fun finishReadDiagnostics(handle: ReadDiagnosticCapture): List<String> {
+        readDiagnostics.compareAndSet(handle, null)
+        return handle.finish()
+    }
+
+    private fun readDiagnosticWindow() = ReadDiagnosticWindow(
+        mutableState.value.windowId, windowIdentity.get(), revision.get(), lastWindowCount,
+    )
+
+    private fun currentReadDiagnostics(token: PhoneSessionToken): ReadDiagnosticCapture? {
+        val capture = readDiagnostics.get() ?: return null
+        if (!capture.isRecording()) return null
+        val current = mutableState.value
+        if (capture.token != token || !readDiagnosticAuthority.allows(token) || activeNotice.get()?.token != capture.token || !current.connected || current.locked) {
+            capture.stop(ReadDiagnosticStop.SESSION_INVALIDATED)
+            return null
+        }
+        if (current.foregroundPackage != capture.targetPackage || current.windowId != capture.initialWindow.windowId ||
+            windowIdentity.get() != capture.initialWindow.identity
+        ) {
+            capture.stop(ReadDiagnosticStop.WINDOW_CHANGED)
+            return null
+        }
+        return capture
+    }
+
+    private fun recordReadDiagnosticEvent(event: AccessibilityEvent) {
+        val token = readDiagnostics.get()?.token ?: return
+        val capture = currentReadDiagnostics(token) ?: return
+        // Only primitive event metadata; never event.source, className, text or description.
+        capture.event(event.eventType, event.windowId, event.contentChangeTypes, event.windowChanges, event.eventTime, readDiagnosticWindow())
     }
 
     /** On-demand test diagnostics only: no nodes, window titles, event text, or persistent logs. */
@@ -189,6 +253,8 @@ class AccessibilityPhoneBackend(
     }
 
     override fun invalidate() {
+        readDiagnosticAuthority.revoke()
+        readDiagnostics.get()?.stop(ReadDiagnosticStop.SESSION_INVALIDATED)
         windowIdentity.incrementAndGet()
         revision.incrementAndGet()
         snapshot.set(null)
@@ -198,8 +264,14 @@ class AccessibilityPhoneBackend(
 
     override suspend fun observe(permit: PhonePermit): PhoneObservation = operationLock.withLock {
         withContext(Dispatchers.Main.immediate) {
+            var diagnostic: ReadDiagnosticCapture? = null
+            var diagnosticSample: ReadDiagnosticSample? = null
+            var diagnosticOutcome = "OBSERVATION_UNAVAILABLE"
+            var diagnosticSnapshotId: String? = null
             try {
                 requirePermit(permit)
+                diagnostic = currentReadDiagnostics(permit.token)
+                diagnosticSample = diagnostic?.beginSample()
                 val captured = readStablePhoneObservation(
                     nowMillis = SystemClock::elapsedRealtime,
                     version = {
@@ -208,52 +280,77 @@ class AccessibilityPhoneBackend(
                         PhoneObservationVersion(current.windowId, windowIdentity.get(), current.windowRevision)
                     },
                     capture = { version ->
-                        val root = authorizedRoot(permit)
+                        val attempt = diagnosticSample?.let { diagnostic?.beginAttempt(it, readDiagnosticWindow()) }
+                        var attemptOutcome = "OBSERVATION_UNAVAILABLE"
+                        var inspectedTree: AndroidTreeCapture? = null
                         try {
-                            val tree = withContext(Dispatchers.Default) {
-                                val readContext = currentCoroutineContext()
-                                if (!readContext.isActive || !validAtRevision(permit, version.revision) || !root.refresh()) {
-                                    throw TreeReadAborted()
+                            val root = authorizedRoot(permit)
+                            try {
+                                val tree = withContext(Dispatchers.Default) {
+                                    val readContext = currentCoroutineContext()
+                                    if (!readContext.isActive || !validAtRevision(permit, version.revision)) throw TreeReadAborted()
+                                    attempt?.rootRefresh = ReadDiagnosticOperation.FAILED
+                                    val refreshed = root.refresh()
+                                    attempt?.rootRefresh = if (refreshed) ReadDiagnosticOperation.SUCCEEDED else ReadDiagnosticOperation.FAILED
+                                    if (!refreshed) throw TreeReadAborted()
+                                    // Reacquiring a root can still return cached metadata. Refresh before
+                                    // capture, then verify identity before any node content is inspected.
+                                    if (root.windowId != version.windowId || root.packageName?.toString() != permit.targetPackage) {
+                                        fail("FOREGROUND_CONFLICT", "刷新后目标窗口身份已改变，请重新观察。")
+                                    }
+                                    reader.capture(root, permit.targetPackage, diagnostics = attempt?.tree) {
+                                        readContext.isActive && validAtRevision(permit, version.revision)
+                                    }
                                 }
-                                // Reacquiring a root can still return cached metadata. Refresh before
-                                // capture, then verify identity before any node content is inspected.
-                                if (root.windowId != version.windowId || root.packageName?.toString() != permit.targetPackage) {
-                                    fail("FOREGROUND_CONFLICT", "刷新后目标窗口身份已改变，请重新观察。")
+                                inspectedTree = tree
+                                requireRevision(permit, version.revision)
+                                if (Build.VERSION.SDK_INT >= 33 && shouldRetryPhoneInspection(
+                                        tree.sensitive, tree.truncated, tree.inspectionIssues,
+                                    )
+                                ) {
+                                    // Discard stale descendant metadata only for this verified target.
+                                    // The retry policy discards this entire capture; no old paths are reused.
+                                    attempt?.cacheClear = ReadDiagnosticOperation.FAILED
+                                    val cleared = service.get()?.clearCachedSubtree(root)
+                                    attempt?.cacheClear = if (cleared == true) ReadDiagnosticOperation.SUCCEEDED else ReadDiagnosticOperation.FAILED
                                 }
-                                reader.capture(root, permit.targetPackage) {
-                                    readContext.isActive && validAtRevision(permit, version.revision)
-                                }
-                            }
-                            requireRevision(permit, version.revision)
-                            if (Build.VERSION.SDK_INT >= 33 && shouldRetryPhoneInspection(
-                                    tree.sensitive, tree.truncated, tree.inspectionIssues,
+                                val observation = PhoneObservation(
+                                    id = UUID.randomUUID().toString(),
+                                    packageName = permit.targetPackage,
+                                    windowId = root.windowId,
+                                    windowRevision = version.revision,
+                                    capturedAtMillis = System.currentTimeMillis(),
+                                    nodes = if (tree.sensitive) tree.nodes.map { it.copy(text = "", description = "") } else tree.nodes,
+                                    truncated = tree.truncated,
+                                    sensitive = tree.sensitive,
+                                    fingerprint = tree.fingerprint,
+                                    previewTruncated = tree.previewTruncated,
+                                    inspectionIssues = tree.inspectionIssues,
                                 )
-                            ) {
-                                // Discard stale descendant metadata only for this verified target.
-                                // The retry policy discards this entire capture; no old paths are reused.
-                                service.get()?.clearCachedSubtree(root)
+                                attemptOutcome = when { tree.sensitive -> "SENSITIVE"; tree.truncated -> "INCOMPLETE"; else -> "COMPLETE" }
+                                Snapshot(permit.token, observation, tree)
+                            } catch (_: TreeReadAborted) {
+                                throw PhoneObservationInvalidated()
+                            } catch (error: PhoneControlException) {
+                                if (error.code == "STALE_WINDOW") throw PhoneObservationInvalidated()
+                                throw error
+                            } finally {
+                                recycleNode(root)
                             }
-                            val observation = PhoneObservation(
-                                id = UUID.randomUUID().toString(),
-                                packageName = permit.targetPackage,
-                                windowId = root.windowId,
-                                windowRevision = version.revision,
-                                capturedAtMillis = System.currentTimeMillis(),
-                                nodes = if (tree.sensitive) tree.nodes.map { it.copy(text = "", description = "") } else tree.nodes,
-                                truncated = tree.truncated,
-                                sensitive = tree.sensitive,
-                                fingerprint = tree.fingerprint,
-                                previewTruncated = tree.previewTruncated,
-                                inspectionIssues = tree.inspectionIssues,
-                            )
-                            Snapshot(permit.token, observation, tree)
-                        } catch (_: TreeReadAborted) {
-                            throw PhoneObservationInvalidated()
-                        } catch (error: PhoneControlException) {
-                            if (error.code == "STALE_WINDOW") throw PhoneObservationInvalidated()
+                        } catch (error: Exception) {
+                            attemptOutcome = when (error) {
+                                is PhoneObservationInvalidated -> "INVALIDATED"
+                                is PhoneControlException -> error.code
+                                is CancellationException -> "CANCELLED"
+                                else -> "OBSERVATION_UNAVAILABLE"
+                            }
                             throw error
                         } finally {
-                            recycleNode(root)
+                            if (attempt != null) diagnostic?.endAttempt(
+                                attempt, readDiagnosticWindow(), attemptOutcome,
+                                inspectedTree?.inspectionIssues.orEmpty(), inspectedTree?.truncated,
+                                inspectedTree?.previewTruncated, inspectedTree?.sensitive,
+                            )
                         }
                     },
                     shouldRetry = { captured ->
@@ -264,13 +361,19 @@ class AccessibilityPhoneBackend(
                 )
                 // Nothing is published until a whole read finishes at its original revision.
                 snapshot.set(captured)
+                diagnosticOutcome = "OBSERVED"
+                diagnosticSnapshotId = captured.observation.id
                 captured.observation
             } catch (error: PhoneControlException) {
+                diagnosticOutcome = error.code
                 throw error
             } catch (cancelled: CancellationException) {
+                diagnosticOutcome = "CANCELLED"
                 throw cancelled
             } catch (_: Exception) {
                 throw PhoneControlException("OBSERVATION_UNAVAILABLE", "当前窗口暂时无法读取，请重新打开目标应用。")
+            } finally {
+                diagnosticSample?.let { diagnostic?.endSample(it, diagnosticOutcome, diagnosticSnapshotId, readDiagnosticWindow()) }
             }
         }
     }
@@ -385,8 +488,10 @@ class AccessibilityPhoneBackend(
     private fun refreshEnvironment() {
         val connectedService = service.get()
         var windowId: Int? = null
+        lastWindowCount = null
         if (connectedService != null) {
             withWindows { windows ->
+                lastWindowCount = windows.size
                 windowId = selectedWindow(windows)?.id
             }
         }

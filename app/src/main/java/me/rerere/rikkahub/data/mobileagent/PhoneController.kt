@@ -337,6 +337,9 @@ class PhoneController(
             pauseWith(PhoneSessionStatus.PAUSED, "当前页面涉及密码、支付或授权，请用户接手", token)
             fail("USER_HANDOVER_REQUIRED", "当前页面需要用户接手，未提供敏感界面内容")
         }
+        if (raw.truncated) {
+            fail("INCOMPLETE_SCREEN", "无法完整确认页面安全状态，未发布本次页面或购物证据")
+        }
         val safe = raw.copy(
             nodes = raw.nodes.map { it.copy(text = it.text.take(300), description = it.description.take(300),
                 requiresUserConfirmation = it.requiresUserConfirmation || PhonePurchasePolicy.requiresUser(it.text + "\n" + it.description)) }.take(100),
@@ -472,9 +475,17 @@ class PhoneController(
     }
 
     private fun pauseForSafetyFailure(token: PhoneSessionToken, failure: PhoneControlException) {
-        if (failure.code in setOf("USER_REQUIRED", "USER_HANDOVER_REQUIRED", "PURCHASE_CONFIRMATION_REQUIRED", "ACTION_RESULT_UNKNOWN", "DEVICE_LOCKED", "FOREGROUND_CONFLICT", "STOP_UNAVAILABLE", "ACCESSIBILITY_DISCONNECTED")) {
-            pauseWith(PhoneSessionStatus.PAUSED, "当前环境需要用户接手，请检查后恢复", token)
+        val reason = when (failure.code) {
+            "PAGE_UNSTABLE" -> "目标页面在有限次读取后仍不稳定，任务已暂停；请等待页面稳定后手动继续。"
+            "INCOMPLETE_SCREEN" -> "未能完整检查目标页面，任务已暂停；请检查页面后手动继续。"
+            "USER_REQUIRED", "USER_HANDOVER_REQUIRED", "PURCHASE_CONFIRMATION_REQUIRED", "ACTION_RESULT_UNKNOWN",
+            "DEVICE_LOCKED", "FOREGROUND_CONFLICT", "STOP_UNAVAILABLE", "ACCESSIBILITY_DISCONNECTED" ->
+                "当前环境需要用户接手，请检查后恢复"
+            else -> return
         }
+        // Backend retries have already finished. Revoke only this exact grant, including
+        // when a submitted action could not be observed; never retry its dispatch here.
+        pauseWith(PhoneSessionStatus.PAUSED, reason, token)
     }
 
     private fun actionKey(action: PhoneAction, before: PhoneObservation?): String {

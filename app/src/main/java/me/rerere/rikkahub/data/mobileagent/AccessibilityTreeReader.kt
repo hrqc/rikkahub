@@ -51,7 +51,7 @@ internal class AccessibilityTreeReader {
         const val MAX_CHILDREN = 128
     }
 
-    fun capture(root: AccessibilityNodeInfo, targetPackage: String, isValid: () -> Boolean): AndroidTreeCapture {
+    fun capture(root: AccessibilityNodeInfo, targetPackage: String, diagnostics: ReadDiagnosticTree? = null, isValid: () -> Boolean): AndroidTreeCapture {
         val nodes = mutableListOf<PhoneNode>()
         val handles = linkedMapOf<String, AndroidNodeHandle>()
         val budget = PhoneTreeReadBudget(SystemClock.elapsedRealtime())
@@ -66,8 +66,10 @@ internal class AccessibilityTreeReader {
         fun visit(node: AccessibilityNodeInfo, path: List<Int>, parentId: String?, depth: Int) {
             check()
             if (!budget.visit(depth, SystemClock.elapsedRealtime())) return
+            diagnostics?.visited()
             // Embedded nodes from a different package are never included or descended into.
             if (node.packageName?.toString() != targetPackage) {
+                diagnostics?.foreign(path)
                 budget.markTruncated("foreign_node")
                 return
             }
@@ -78,10 +80,13 @@ internal class AccessibilityTreeReader {
             if (signature.inspectionIncomplete) budget.markTruncated("text_limit")
             if (signature.requiresUserConfirmation) restrictedPaths += path
             val hasContent = signature.text.isNotBlank() || signature.description.isNotBlank()
-            val include = node.isVisibleToUser && (hasContent || signature.clickable || signature.longClickable ||
+            val isVisible = node.isVisibleToUser
+            val include = isVisible && (hasContent || signature.clickable || signature.longClickable ||
                 signature.editable || signature.scrollable || signature.password || depth == 0)
             var effectiveParent = parentId
+            var wasEmitted = false
             if (include && budget.include(signature.text.length + signature.description.length)) {
+                wasEmitted = true
                 val id = "n${nodes.size}"
                 effectiveParent = id
                 nodes += PhoneNode(
@@ -103,14 +108,23 @@ internal class AccessibilityTreeReader {
                 handles[id] = AndroidNodeHandle(path, signature)
             }
             // Descendants may repeat the password text without setting isPassword themselves.
-            if (signature.sensitive) return
+            if (signature.sensitive) {
+                diagnostics?.protectedSubtree(path, isVisible, wasEmitted)
+                return
+            }
             val children = node.childCount
+            diagnostics?.node(path, signature.role, signature.viewId,
+                PhoneBounds(signature.left, signature.top, signature.right, signature.bottom),
+                isVisible, children, signature.scrollable, node.isFocused, wasEmitted)
             if (children > MAX_CHILDREN) budget.markTruncated("children_limit")
             for (index in 0 until minOf(children, MAX_CHILDREN)) {
                 check()
                 if (!budget.canContinue(SystemClock.elapsedRealtime())) break
                 val child = child(node, index)
                 if (child == null) {
+                    diagnostics?.gap(path, signature.role, signature.viewId,
+                        PhoneBounds(signature.left, signature.top, signature.right, signature.bottom),
+                        isVisible, children, index)
                     budget.markTruncated("unavailable_child")
                     continue
                 }
