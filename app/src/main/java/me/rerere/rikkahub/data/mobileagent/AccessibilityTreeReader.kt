@@ -198,34 +198,10 @@ internal class AccessibilityTreeReader {
         }
         // Preview omission must not omit safety inspection or freshness of the remaining tree.
         val fingerprint = digest(inspectedSignatures.joinToString("\n") { it.toString() })
-        val searchCandidates = signaturesByPath.filterValues(::isJdSearchNavigationSignature)
-        val clickProofs = if (budget.truncated || sensitive) emptyList() else if (searchCandidates.size > 1) {
-            // Two structural candidates already prove ambiguity, including candidates outside preview.
-            searchCandidates.entries.take(2).map { (path, _) ->
-                PhoneClickRevalidationProof("", path, "", "", "", "", PhoneClickRevalidationScope.JD_SEARCH_NAVIGATION,
-                    restricted = true)
-            }
-        } else searchCandidates.map { (path, signature) ->
-            val ancestors = (0 until path.size).map { signaturesByPath.getValue(path.take(it)) }
-            val context = phoneClickRevalidationContext(path, signaturesByPath)
-            fun subtreeHash(prefix: List<Int>): String = digest(signaturesByPath.entries
-                .filter { (nodePath, _) -> nodePath.take(prefix.size) == prefix }
-                .joinToString("\n") { (nodePath, value) -> "${nodePath.drop(prefix.size)}:$value" })
-            val node = guardedNodes.firstOrNull { handles[it.id]?.path == path }
-            PhoneClickRevalidationProof(
-                nodeId = node?.id.orEmpty(), path = path, signatureFingerprint = digest(signature.toString()),
-                subtreeFingerprint = subtreeHash(path),
-                ancestorFingerprint = digest(ancestors.joinToString("\n") {
-                    // Dynamic contents belong to the explicitly selected semantic context below.
-                    it.copy(text = "", description = "", contentFingerprint = "").toString()
-                }),
-                contextFingerprint = context?.fingerprint.orEmpty(), scope = PhoneClickRevalidationScope.JD_SEARCH_NAVIGATION,
-                hasSemanticLabel = signature.text.isNotBlank() || signature.description.isNotBlank(),
-                truncated = signature.truncated || signature.inspectionIncomplete || signature.metadataTruncated,
-                restricted = context == null || node == null || node.requiresUserConfirmation || !node.enabled || !node.clickable ||
-                    node.password || ancestors.any { it.sensitive || it.inspectionIncomplete || it.requiresUserConfirmation || !it.enabled },
-            )
-        }
+        val clickProofs = buildPhoneClickRevalidationProofs(
+            signaturesByPath, guardedNodes.associateBy { handles.getValue(it.id).path },
+            sensitive = sensitive, truncated = budget.truncated,
+        )
         return AndroidTreeCapture(guardedNodes, handles, budget.truncated, sensitive, fingerprint,
             budget.previewTruncated, budget.issues.toList(), restrictedPaths.toList(), nativeScrollNodeIds.toSet(),
             content?.finish(inspectionComplete = !budget.truncated, sensitive = sensitive), clickProofs)

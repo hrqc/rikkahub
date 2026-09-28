@@ -581,9 +581,7 @@ class AccessibilityPhoneBackend(
                 val executable = captured.copy(tree = captured.tree.copy(readOnlyContent = null))
                 snapshot.set(executable)
                 if (executable.capability == PhoneSnapshotCapability.FULL &&
-                    executable.tree.clickRevalidationProofs.singleOrNull()?.let {
-                        matchPhoneClickRevalidation(it, executable.tree.clickRevalidationProofs, false, false) != null
-                    } == true) clickAnchor.set(executable)
+                    hasEligiblePhoneClickRevalidationProof(executable.tree.clickRevalidationProofs)) clickAnchor.set(executable)
                 diagnosticOutcome = if (captured.observation.scrollOnly) "OBSERVED_SCROLL_ONLY" else "OBSERVED"
                 diagnosticSnapshotId = captured.observation.id
                 captured.observation.copy(readOnlyContent = captured.tree.readOnlyContent?.takeIf {
@@ -931,7 +929,7 @@ class AccessibilityPhoneBackend(
                 val dispatched = node.performAction(AccessibilityNodeInfo.ACTION_CLICK)
                 return PhoneBackendResult(dispatched, if (dispatched) "已请求原生搜索导航；必须观察并核实实际查询词。"
                     else "平台未接受原生搜索点击；未执行后备动作或重试。",
-                    beforeActionFingerprint = latest.fingerprint)
+                    beforeActionFingerprint = latest.fingerprint, executor = PhoneActionExecutor.ACCESSIBILITY)
             } finally { recycleNode(node) }
         } finally { recycleNode(root) }
     }
