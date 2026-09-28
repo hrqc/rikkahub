@@ -1,6 +1,7 @@
 package me.rerere.rikkahub.data.mobileagent
 
 import kotlinx.coroutines.flow.StateFlow
+import kotlinx.serialization.SerialName
 import kotlinx.serialization.Serializable
 import kotlinx.serialization.Transient
 
@@ -132,12 +133,20 @@ sealed interface PhoneAction {
     data object Screenshot : PhoneAction
 }
 
+/** Identifies the executor that returned a result, not proof of dispatch or task completion. */
+@Serializable
+enum class PhoneActionExecutor(val wireName: String) {
+    @SerialName("root_input") ROOT_INPUT("root_input"),
+    @SerialName("accessibility") ACCESSIBILITY("accessibility"),
+}
+
 data class PhoneBackendResult(
     val accepted: Boolean,
     val detail: String,
     val screenshotUri: String? = null,
     // Host-only baseline from a fresh validation read; never part of model-facing output.
     internal val beforeActionFingerprint: String? = null,
+    val executor: PhoneActionExecutor? = null,
 )
 
 @Serializable
@@ -147,6 +156,7 @@ data class PhoneActionResult(
     val detail: String,
     val observation: PhoneObservation? = null,
     val screenshotUri: String? = null,
+    val executor: PhoneActionExecutor? = null,
 )
 
 /** Messages must be fixed local descriptions, never raw platform errors or user input. */

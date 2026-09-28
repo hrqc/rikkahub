@@ -15,10 +15,12 @@ internal data class PhoneActionReceipt(
     val postObserveError: String? = null,
     val observationVerified: Boolean = false,
     val screenChanged: Boolean? = null,
+    val executor: PhoneActionExecutor? = null,
 ) {
     fun output(): List<UIMessagePart> = listOf(UIMessagePart.Text(buildJsonObject {
         put("status", "interrupted")
         put("accepted", accepted)
+        executor?.let { put("executor", it.wireName) }
         put("execution_outcome", when {
             !accepted -> "not_accepted"
             observationVerified -> "accepted_observed"
@@ -111,7 +113,9 @@ internal class PhoneActionReceiptRecorder(
     fun forAction(token: PhoneSessionToken, action: PhoneAction): PhoneActionReceiptRecorder? =
         takeIf { this.token == token && phoneActionReceiptOperation(action)?.let { phoneToolPrefix(token) + it } == key.toolName }
 
-    fun backendResult(accepted: Boolean) = ledger.update(key) { it ?: PhoneActionReceipt(accepted) }
+    fun backendResult(accepted: Boolean, executor: PhoneActionExecutor? = null) = ledger.update(key) {
+        it ?: PhoneActionReceipt(accepted, executor = executor)
+    }
 
     fun postObserveFailed(code: String) = ledger.update(key) { receipt ->
         receipt?.let {

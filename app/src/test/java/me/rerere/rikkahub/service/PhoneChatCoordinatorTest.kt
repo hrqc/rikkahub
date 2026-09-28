@@ -23,10 +23,11 @@ class PhoneChatCoordinatorTest {
         val apps: List<PhoneTargetApp> = listOf(PhoneTargetApp("com.example.calc", "计算器")),
         dispatcher: CoroutineDispatcher = Dispatchers.Unconfined,
         selectRoot: suspend () -> Boolean = { false },
+        now: () -> Long = System::currentTimeMillis,
     ) : AutoCloseable {
         val scope = CoroutineScope(SupervisorJob() + dispatcher)
         val backend = Backend()
-        val controller = PhoneController(backend, "com.example.agent", scope = scope, settleMillis = 0)
+        val controller = PhoneController(backend, "com.example.agent", scope = scope, settleMillis = 0, now = now)
         val intents = PhoneIntentStore()
         val host = Host()
         val coordinator = PhoneChatCoordinator(
@@ -84,19 +85,80 @@ class PhoneChatCoordinatorTest {
         override val state = MutableStateFlow(PhoneBackendState(true, 1, "com.example.agent", 1, false))
         var opens = 0
         var observations = 0
+        var observeFailure: PhoneControlException? = null
+        var openFailure: PhoneControlException? = null
+        var duringOpen: () -> Unit = {}
         override fun isTargetAllowed(packageName: String) = packageName.startsWith("com.example.")
         override fun showSessionNotice(token: PhoneSessionToken, targetPackage: String, onStop: (PhoneBackendStopReason) -> Unit) = true
         override fun endSessionNotice() = Unit
         override fun invalidate() = Unit
         override suspend fun observe(permit: PhonePermit): PhoneObservation {
             observations++
+            observeFailure?.let { throw it }
             return PhoneObservation("snapshot$observations", permit.targetPackage, 2, 1, System.currentTimeMillis(), emptyList(), false, false, "page")
         }
         override suspend fun execute(permit: PhonePermit, observation: PhoneObservation?, action: PhoneAction): PhoneBackendResult {
             assertEquals(PhoneAction.OpenApp, action)
             opens++
+            openFailure?.let { throw it }
             state.value = state.value.copy(foregroundPackage = permit.targetPackage, windowId = 2)
+            duringOpen()
             return PhoneBackendResult(true, "opened")
+        }
+    }
+
+    @Test fun `ready app with unstable tree starts one model run and leaves observation to its tools`() = runBlocking {
+        Fixture().use { f ->
+            f.backend.observeFailure = PhoneControlException("PAGE_UNSTABLE", "fixed unstable tree")
+            val proposal = f.propose("帮我在计算器里查询资料")!!
+            f.await(PhoneChatPhase.CONFIRM)
+            f.coordinator.accept(proposal.id, "com.example.calc")
+            f.await(PhoneChatPhase.RUNNING)
+            assertEquals(1, f.backend.opens)
+            assertEquals(0, f.backend.observations)
+            assertEquals(0, f.controller.state.value.observationsUsed)
+            assertEquals(1, f.host.submitted.size)
+            val token = f.host.submitted.single().second
+            assertTrue(f.controller.shoppingEvidence(token).isEmpty())
+            val read = runCatching { f.controller.observe(token) }
+            assertEquals("PAGE_UNSTABLE", (read.exceptionOrNull() as PhoneControlException).code)
+            f.await(PhoneChatPhase.PAUSED)
+            assertEquals(1, f.backend.observations)
+            assertEquals(1, f.host.submitted.size)
+        }
+    }
+
+    @Test fun `preparation preserves the original pause reason instead of invalid session until expiry`() = runBlocking {
+        var clock = 1_000L
+        Fixture(now = { clock }).use { f ->
+            val reason = "固定准备失败：停止通知不可用"
+            f.backend.duringOpen = { f.controller.pauseIfCurrent(f.controller.state.value.token!!, reason) }
+            f.propose("打开计算器")
+            val paused = f.await(PhoneChatPhase.PAUSED)
+            assertEquals(reason, paused.detail)
+            assertTrue(f.host.submitted.isEmpty())
+            assertEquals(0, f.backend.observations)
+            yield() // Let the launch coroutine retain the already visible pause before expiry.
+            clock += f.controller.state.value.durationLimitMillis + 1
+            runCatching { f.controller.observe(f.controller.state.value.token!!) }
+            val ended = f.await(PhoneChatPhase.ENDED)
+            assertTrue(ended.detail.contains("本次会话已到时间上限"))
+            assertTrue(ended.detail.contains(reason))
+            assertTrue(f.host.submitted.isEmpty())
+        }
+    }
+
+    @Test fun `preparation backend refusal retains its fixed reason and never submits a model run`() = runBlocking {
+        Fixture().use { f ->
+            val reason = "停止通知不可用，未执行启动"
+            f.backend.openFailure = PhoneControlException("STOP_UNAVAILABLE", reason)
+            f.propose("打开计算器")
+            val paused = f.await(PhoneChatPhase.PAUSED)
+            assertEquals(reason, paused.detail)
+            assertEquals(f.controller.state.value.detail, paused.detail)
+            assertTrue(f.host.submitted.isEmpty())
+            assertEquals(1, f.backend.opens)
+            assertEquals(0, f.backend.observations)
         }
     }
 

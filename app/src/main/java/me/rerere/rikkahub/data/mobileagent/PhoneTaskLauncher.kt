@@ -21,12 +21,12 @@ class PhoneTaskLauncher(
                 requireActive(token)
                 // Exactly one launch. An OEM confirmation belongs to the user; while it is
                 // visible, only passive window metadata is consulted, never its node tree.
-                val result = controller.act(token, null, PhoneAction.OpenApp)
+                val result = controller.openForTaskPreparation(token)
                 if (!result.accepted) {
                     throw PhoneControlException("TARGET_OPEN_REJECTED", "未能打开目标应用，未发送模型请求，请检查后恢复。")
                 }
-                // OpenApp may have been accepted before its post-action observation succeeds.
-                // Keep waiting only if the original authorization is still running.
+                // Preparation uses window metadata only. The model's first observe must still
+                // establish its own complete action snapshot and shopping evidence.
                 combine(controller.state, backend.state) { session, environment ->
                     requireActive(token, session, environment)
                     environment.foregroundPackage == session.targetPackage && environment.windowId != null
@@ -42,7 +42,8 @@ class PhoneTaskLauncher(
             controller.pauseIfCurrent(token, "目标应用准备已取消，未发送模型请求，请检查后恢复")
             throw cancelled
         } catch (error: Exception) {
-            controller.pauseIfCurrent(token, "目标应用尚未准备就绪，未发送模型请求，请检查后恢复")
+            controller.pauseIfCurrent(token, (error as? PhoneControlException)?.message
+                ?: "目标应用尚未准备就绪，未发送模型请求，请检查后恢复")
             throw error
         }
     }

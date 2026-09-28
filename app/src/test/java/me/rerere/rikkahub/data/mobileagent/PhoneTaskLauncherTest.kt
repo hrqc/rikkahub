@@ -39,6 +39,7 @@ class PhoneTaskLauncherTest {
         var opens = 0
         var reads = 0
         var acceptsOpen = true
+        var foregroundAfterOpen = "com.oem.permission"
         var duringOpen: () -> Unit = {}
         override fun isTargetAllowed(packageName: String) = packageName == "com.example.target"
         override fun showSessionNotice(token: PhoneSessionToken, targetPackage: String, onStop: (PhoneBackendStopReason) -> Unit) = true
@@ -46,16 +47,35 @@ class PhoneTaskLauncherTest {
         override fun invalidate() = Unit
         override suspend fun observe(permit: PhonePermit): PhoneObservation {
             reads++
-            error("Preparation must not read the OEM permission window")
+            throw PhoneControlException("PAGE_UNSTABLE", "页面尚未稳定，不能发布观察")
         }
         override suspend fun execute(permit: PhonePermit, observation: PhoneObservation?, action: PhoneAction): PhoneBackendResult {
             assertEquals(PhoneAction.OpenApp, action)
             assertTrue(permit.isValid())
             opens++
-            state.value = state.value.copy(foregroundPackage = "com.oem.permission", windowId = 2)
+            state.value = state.value.copy(foregroundPackage = foregroundAfterOpen, windowId = 2)
             duringOpen()
             opened.complete(Unit)
             return PhoneBackendResult(acceptsOpen, "launch dispatched")
+        }
+    }
+
+    @Test fun `ready target can start the model before its tree becomes stable without publishing evidence`() = runBlocking {
+        Fixture().use { f ->
+            val token = f.start()
+            f.backend.foregroundAfterOpen = "com.example.target"
+            f.submit(token)
+            assertEquals(1, f.modelCalls)
+            assertEquals(1, f.backend.opens)
+            assertEquals(0, f.backend.reads)
+            assertEquals(0, f.controller.state.value.observationsUsed)
+            assertTrue(f.controller.shoppingEvidence(token).isEmpty())
+            assertEquals(token, f.controller.activeToken("chat", "assistant"))
+            // Model observation still has the original safety failure and cannot get a snapshot.
+            val observation = runCatching { f.controller.observe(token) }
+            assertEquals("PAGE_UNSTABLE", (observation.exceptionOrNull() as PhoneControlException).code)
+            assertEquals(PhoneSessionStatus.PAUSED, f.controller.state.value.status)
+            assertEquals(1, f.backend.reads)
         }
     }
 
@@ -120,6 +140,7 @@ class PhoneTaskLauncherTest {
             val result = runCatching { f.submit(token) }
             assertTrue(result.isFailure)
             assertEquals(PhoneSessionStatus.PAUSED, f.controller.state.value.status)
+            assertTrue(f.controller.state.value.detail.contains("用户暂停"))
             assertEquals(0, f.modelCalls)
             assertEquals(1, f.backend.opens)
         }
@@ -131,6 +152,7 @@ class PhoneTaskLauncherTest {
             val result = runCatching { f.submit(f.start()) }
             assertEquals("TARGET_OPEN_REJECTED", (result.exceptionOrNull() as PhoneControlException).code)
             assertEquals(PhoneSessionStatus.PAUSED, f.controller.state.value.status)
+            assertTrue(f.controller.state.value.detail.contains("未能打开目标应用"))
             assertEquals(0, f.modelCalls)
             assertEquals(1, f.backend.opens)
         }

@@ -1,12 +1,68 @@
 package me.rerere.rikkahub.data.mobileagent
 
 import kotlinx.coroutines.runBlocking
+import kotlinx.coroutines.CancellationException
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
+import org.junit.Assert.assertSame
 import org.junit.Assert.assertTrue
 import org.junit.Test
 
 class PhoneActionRouterTest {
+    @Test fun `selected root scroll returns acceptance or rejection without native redispatch`() = runBlocking {
+        for (accepted in listOf(true, false)) {
+            var rootCalls = 0
+            var nativeCalls = 0
+            val rootResult = PhoneBackendResult(accepted, "fixed Root result", executor = PhoneActionExecutor.ROOT_INPUT)
+            val result = preferredRootScrollOrStandard(
+                root = { rootCalls++; rootResult },
+                standard = { nativeCalls++; PhoneBackendResult(true, "must not run") },
+            )
+            assertSame(rootResult, result)
+            assertEquals(PhoneActionExecutor.ROOT_INPUT, result.executor)
+            assertEquals(1, rootCalls)
+            assertEquals(0, nativeCalls)
+        }
+    }
+
+    @Test fun `ineligible root scroll leaves the existing standard route intact`() = runBlocking {
+        val order = mutableListOf<String>()
+        val nativeResult = PhoneBackendResult(true, "native", executor = PhoneActionExecutor.ACCESSIBILITY)
+        val result = preferredRootScrollOrStandard(
+            root = { order += "Root not selected"; null },
+            standard = { order += "native"; nativeResult },
+        )
+        assertSame(nativeResult, result)
+        assertEquals(listOf("Root not selected", "native"), order)
+    }
+
+    @Test fun `root scroll unknown result or stale validation cannot fall back to native`() = runBlocking {
+        for (code in listOf("ACTION_RESULT_UNKNOWN", "STALE_WINDOW", "STALE_SNAPSHOT")) {
+            var nativeCalls = 0
+            val error = runCatching {
+                preferredRootScrollOrStandard(
+                    root = { throw PhoneControlException(code, "fixed failure") },
+                    standard = { nativeCalls++; PhoneBackendResult(true, "must not run") },
+                )
+            }.exceptionOrNull()
+            assertTrue(error is PhoneControlException)
+            assertEquals(code, (error as PhoneControlException).code)
+            assertEquals(0, nativeCalls)
+        }
+    }
+
+    @Test fun `cancelled root scroll never dispatches another executor`() = runBlocking {
+        var nativeCalls = 0
+        val error = runCatching {
+            preferredRootScrollOrStandard(
+                root = { throw CancellationException("stopped") },
+                standard = { nativeCalls++; PhoneBackendResult(true, "must not run") },
+            )
+        }.exceptionOrNull()
+        assertTrue(error is CancellationException)
+        assertEquals(0, nativeCalls)
+    }
+
     @Test fun `an accepted node action never consults or invokes root`() = runBlocking {
         val result = standardActionThenRoot(
             standard = { true },

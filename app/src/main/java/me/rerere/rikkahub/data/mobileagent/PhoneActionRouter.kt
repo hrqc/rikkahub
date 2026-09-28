@@ -7,9 +7,15 @@ internal suspend fun standardActionThenRoot(
     validateFresh: suspend () -> Unit,
     root: suspend () -> PhoneBackendResult,
 ): PhoneBackendResult {
-    if (standard()) return PhoneBackendResult(true, "系统已接受本次动作，仍需重新观察确认结果。")
-    if (!rootEligible()) return PhoneBackendResult(false, "系统未接受本次动作；请重新观察或由用户接手。")
+    if (standard()) return PhoneBackendResult(true, "系统已接受本次动作，仍需重新观察确认结果。", executor = PhoneActionExecutor.ACCESSIBILITY)
+    if (!rootEligible()) return PhoneBackendResult(false, "系统未接受本次动作；请重新观察或由用户接手。", executor = PhoneActionExecutor.ACCESSIBILITY)
     validateFresh()
-    if (!rootEligible()) return PhoneBackendResult(false, "Root 当前不可用，未执行后备动作；请重新观察。")
+    if (!rootEligible()) return PhoneBackendResult(false, "Root 当前不可用，未执行后备动作；请重新观察。", executor = PhoneActionExecutor.ACCESSIBILITY)
     return root()
 }
+
+/** Null means no Root route was selected. Rejection, unknown outcome and cancellation never retry. */
+internal suspend fun preferredRootScrollOrStandard(
+    root: suspend () -> PhoneBackendResult?,
+    standard: suspend () -> PhoneBackendResult,
+): PhoneBackendResult = root() ?: standard()

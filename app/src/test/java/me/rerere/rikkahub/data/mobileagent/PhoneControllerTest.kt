@@ -17,6 +17,116 @@ import org.junit.Assert.*
 import org.junit.Test
 
 class PhoneControllerTest {
+    @Test fun `returned executor metadata survives every action result branch and accepted receipt`() = runBlocking {
+        for (executor in PhoneActionExecutor.entries) {
+            for (outcome in listOf("accepted", "rejected", "post_observe_failed", "screenshot")) Fixture().use { f ->
+                val token = f.start(allowScreenshots = true)
+                val screen = f.controller.observe(token)
+                f.backend.executor = executor
+                f.backend.accepts = outcome != "rejected"
+                if (outcome == "post_observe_failed") {
+                    f.backend.beforeRead = { throw PhoneControlException("PAGE_UNSTABLE", "fixed post action failure") }
+                }
+                val ledger = PhoneActionReceiptLedger(token)
+                val name = phoneToolPrefix(token) + "click"
+                val recorder = ledger.beginCall("message", "call", name)!!.forTool(token, name)!!
+                val result = if (outcome == "screenshot") {
+                    f.controller.act(token, screen.id, PhoneAction.Screenshot)
+                } else {
+                    f.controller.act(token, screen.id, PhoneAction.Click("button"), recorder)
+                }
+                assertEquals(executor, result.executor)
+                assertEquals(outcome != "rejected", result.accepted)
+                if (outcome != "screenshot") {
+                    assertEquals(executor, recorder.knownResult()!!.executor)
+                    assertEquals(result.accepted, recorder.knownResult()!!.accepted)
+                    if (outcome == "post_observe_failed") {
+                        assertFalse(recorder.knownResult()!!.observationVerified)
+                        assertEquals("PAGE_UNSTABLE", recorder.knownResult()!!.postObserveError)
+                    }
+                }
+                assertEquals(1, f.backend.actions)
+            }
+        }
+    }
+
+    @Test fun `host preparation opens once without reading or granting a snapshot`() = runBlocking {
+        Fixture().use { f ->
+            val token = f.start()
+            f.backend.beforeRead = { throw PhoneControlException("PAGE_UNSTABLE", "fixed unstable page") }
+            assertTrue(f.controller.openForTaskPreparation(token).accepted)
+            assertEquals(1, f.backend.actions)
+            assertEquals(0, f.backend.reads)
+            assertEquals(1, f.controller.state.value.actionsUsed)
+            assertEquals(0, f.controller.state.value.observationsUsed)
+            assertTrue(f.controller.shoppingEvidence(token).isEmpty())
+            expectCode("STALE_SNAPSHOT") { f.controller.act(token, "invented", PhoneAction.Click("button")) }
+            expectCode("CONTENT_UNAVAILABLE") { f.controller.readObservedContent(token, "invented") }
+            assertEquals(1, f.backend.actions)
+            expectCode("PAGE_UNSTABLE") { f.controller.observe(token) }
+            assertEquals(PhoneSessionStatus.PAUSED, f.controller.state.value.status)
+        }
+    }
+
+    @Test fun `model open app retains post action inspection and pauses on unstable tree`() = runBlocking {
+        Fixture().use { f ->
+            val token = f.start()
+            f.backend.beforeRead = { throw PhoneControlException("PAGE_UNSTABLE", "fixed unstable page") }
+            val result = f.controller.act(token, null, PhoneAction.OpenApp)
+            assertTrue(result.accepted)
+            assertNull(result.observation)
+            assertEquals(1, f.backend.actions)
+            assertEquals(1, f.controller.state.value.observationsUsed)
+            assertEquals(PhoneSessionStatus.PAUSED, f.controller.state.value.status)
+            assertTrue(f.controller.state.value.detail.contains("不稳定"))
+        }
+    }
+
+    @Test fun `host preparation rejects revoked grants and unrelated foreground before dispatch`() = runBlocking {
+        for (cause in listOf("stop", "lock", "disconnect", "foreground")) Fixture().use { f ->
+            val token = f.start()
+            when (cause) {
+                "stop" -> f.controller.stop()
+                "lock" -> f.backend.state.value = f.backend.state.value.copy(locked = true)
+                "disconnect" -> f.backend.state.value = f.backend.state.value.copy(connected = false)
+                else -> f.backend.state.value = f.backend.state.value.copy(foregroundPackage = "com.example.other")
+            }
+            val result = runCatching { f.controller.openForTaskPreparation(token) }
+            assertTrue(result.exceptionOrNull() is PhoneControlException)
+            assertEquals(0, f.backend.actions)
+            assertEquals(0, f.backend.reads)
+        }
+    }
+
+    @Test fun `host preparation preserves partial page restriction after resume`() = runBlocking {
+        Fixture().use { f ->
+            val token = f.start()
+            f.backend.truncated = true
+            f.backend.scrollOnly = true
+            f.backend.inspectionIssues = listOf("unavailable_child")
+            f.controller.observe(token)
+            expectCode("SCROLL_ONLY") { f.controller.openForTaskPreparation(token) }
+            f.controller.pause()
+            val resumed = f.controller.resume()
+            expectCode("SCROLL_ONLY") { f.controller.openForTaskPreparation(resumed) }
+            assertEquals(0, f.backend.actions)
+        }
+    }
+
+    @Test fun `host preparation spends the normal action budget without consuming observations`() = runBlocking {
+        Fixture().use { f ->
+            val token = f.start()
+            val limit = f.controller.state.value.actionLimit
+            repeat(limit) { assertTrue(f.controller.openForTaskPreparation(token).accepted) }
+            expectCode("ACTION_LIMIT") { f.controller.openForTaskPreparation(token) }
+            assertEquals(limit, f.backend.actions)
+            assertEquals(limit, f.controller.state.value.actionsUsed)
+            assertEquals(0, f.controller.state.value.observationsUsed)
+            assertEquals(0, f.backend.reads)
+            assertEquals(PhoneSessionStatus.PAUSED, f.controller.state.value.status)
+        }
+    }
+
     @Test fun `click refresh eligibility cannot extend age change windows or refresh another action`() = runBlocking {
         for (failure in listOf("age", "window", "other_action")) Fixture().use { f ->
             val token = f.start()
@@ -220,6 +330,7 @@ class PhoneControllerTest {
         var fingerprint = "page"
         var changes = true
         var accepts = true
+        var executor: PhoneActionExecutor? = null
         var allowClickRevalidation = false
         var beforeActionFingerprint: String? = null
         var reads = 0
@@ -261,7 +372,7 @@ class PhoneControllerTest {
             if (changes) fingerprint = "changed$actions"
             afterDispatch()
             return PhoneBackendResult(accepts, "platform result", if (action == PhoneAction.Screenshot) "content://test/window" else null,
-                beforeActionFingerprint = beforeActionFingerprint)
+                beforeActionFingerprint = beforeActionFingerprint, executor = executor)
         }
     }
 

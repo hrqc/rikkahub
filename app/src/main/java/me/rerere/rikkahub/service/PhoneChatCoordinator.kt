@@ -73,6 +73,7 @@ class PhoneChatCoordinator(
 
     private class Task(val binding: PhoneIntentBinding, val target: PhoneTargetApp, val token: PhoneSessionToken) {
         var generation: Job? = null
+        var preparationFailure: String? = null
     }
 
     init {
@@ -109,7 +110,10 @@ class PhoneChatCoordinator(
                     PhoneSessionStatus.STOPPED, PhoneSessionStatus.EXPIRED -> {
                         controller.taskControls.unregister(task)
                         cancelAfterControl(task.generation)
-                        mutableState.value = taskState(task, PhoneChatPhase.ENDED, session.detail)
+                        val detail = if (session.status == PhoneSessionStatus.EXPIRED && task.preparationFailure != null) {
+                            "${session.detail}；启动准备未完成：${task.preparationFailure}"
+                        } else session.detail
+                        mutableState.value = taskState(task, PhoneChatPhase.ENDED, detail)
                     }
                     else -> Unit
                 }
@@ -343,14 +347,31 @@ class PhoneChatCoordinator(
             }
         } catch (cancelled: CancellationException) {
             controller.pauseIfCurrent(task.token, "任务准备已取消，请检查后继续")
+            rememberPreparationFailure(task)
             throw cancelled
         } catch (error: Exception) {
-            controller.pauseIfCurrent(task.token, "未能继续执行，请检查后手动恢复")
-            if (currentTask === task) mutableState.value = taskState(
-                task,
-                if (controller.state.value.status in setOf(PhoneSessionStatus.STOPPED, PhoneSessionStatus.EXPIRED)) PhoneChatPhase.ENDED else PhoneChatPhase.PAUSED,
-                message(error),
-            )
+            controller.pauseIfCurrent(task.token, message(error))
+            rememberPreparationFailure(task)
+            if (currentTask === task) {
+                val session = controller.state.value
+                val ownFailure = session.token?.sessionId == task.token.sessionId &&
+                    session.status in setOf(PhoneSessionStatus.PAUSED, PhoneSessionStatus.WAITING_FOR_FOREGROUND,
+                        PhoneSessionStatus.STOPPED, PhoneSessionStatus.EXPIRED)
+                mutableState.value = taskState(
+                    task,
+                    if (ownFailure && session.status in setOf(PhoneSessionStatus.STOPPED, PhoneSessionStatus.EXPIRED)) PhoneChatPhase.ENDED else PhoneChatPhase.PAUSED,
+                    if (ownFailure) session.detail else message(error),
+                )
+            }
+        }
+    }
+
+    private fun rememberPreparationFailure(task: Task) {
+        if (currentTask !== task || task.generation != null || task.preparationFailure != null) return
+        val session = controller.state.value
+        if (session.token?.sessionId == task.token.sessionId &&
+            session.status in setOf(PhoneSessionStatus.PAUSED, PhoneSessionStatus.WAITING_FOR_FOREGROUND)) {
+            task.preparationFailure = session.detail
         }
     }
 

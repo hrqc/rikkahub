@@ -267,6 +267,26 @@ class PhoneController(
         guarded(token) { capture(token) }
     }
 
+    /** Host launch preparation only: no tree read, action snapshot, or shopping evidence. */
+    internal suspend fun openForTaskPreparation(token: PhoneSessionToken): PhoneBackendResult = operations.withLock {
+        guarded(token) {
+            authorize(token)
+            checkOpenApp(token)
+            beginAction(token, null)
+            val result = try {
+                backend.execute(permit(token), null, PhoneAction.OpenApp)
+            } catch (error: PhoneControlException) {
+                // The launcher has no model tool result to retain this fixed preparation error.
+                // Preserve it before the generic action guard can replace the pause reason.
+                pauseIfCurrent(token, error.message ?: "目标应用启动失败，未发送模型请求")
+                throw error
+            }
+            authorize(token)
+            record(token, PhoneAction.OpenApp, if (result.accepted) "已请求启动，等待目标应用就绪" else "平台未接受启动")
+            result
+        }
+    }
+
     suspend fun act(token: PhoneSessionToken, snapshotId: String?, action: PhoneAction): PhoneActionResult =
         act(token, snapshotId, action, null)
 
@@ -298,50 +318,23 @@ class PhoneController(
             authorize(token)
             val before = if (action == PhoneAction.OpenApp) null else requireObservation(token, snapshotId, action)
             if (action == PhoneAction.OpenApp) {
-                if (synchronized(gate) { restrictedToNativeScroll }) {
-                    fail("SCROLL_ONLY", "当前页面检查不完整，仅允许原生节点滚动；请先重新观察。")
-                }
-                val foreground = backend.state.value.foregroundPackage
-                if (foreground != ownPackageName && foreground != state.value.targetPackage) {
-                    pauseWith(PhoneSessionStatus.WAITING_FOR_FOREGROUND, "前台不是本应用或目标应用，请确认后恢复", token)
-                    fail("FOREGROUND_CHANGED", "需要用户确认当前前台应用")
-                }
+                checkOpenApp(token)
             } else {
                 checkAction(before!!, action)
             }
-            synchronized(gate) {
-                authorize(token)
-                val current = mutableState.value
-                if (current.actionsUsed >= current.actionLimit) {
-                    pauseWith(PhoneSessionStatus.PAUSED, "已到本次操作次数上限")
-                    fail("ACTION_LIMIT", "已到本次操作次数上限")
-                }
-                if (current.observationsUsed >= current.observationLimit) {
-                    pauseWith(PhoneSessionStatus.PAUSED, "观察预算不足，不能验证下一步动作")
-                    fail("OBSERVATION_LIMIT", "观察预算不足")
-                }
-                if (before?.scrollOnly == true) {
-                    if (partialScrolls >= 5) {
-                        pauseWith(PhoneSessionStatus.PAUSED, "页面持续无法完整读取，已达到五次受限滚动上限", token)
-                        fail("SCROLL_ONLY_LIMIT", "已达到本任务受限滚动上限，请检查页面；未确认商品筛选完成")
-                    }
-                    partialScrolls++
-                }
-                observation = null // A snapshot is single-use, including rejected platform actions.
-                mutableState.value = current.copy(actionsUsed = current.actionsUsed + 1,
-                    activity = PhoneActivity.ACTING, activityStartedAtMillis = now())
-            }
+            beginAction(token, before)
             val result = backend.execute(permit(token), before, action)
             // Metadata only, before authorization checks or suspension can lose the returned result.
-            receipt?.backendResult(result.accepted)
+            receipt?.backendResult(result.accepted, result.executor)
             authorize(token)
             if (!result.accepted) {
                 record(token, action, "平台未接受动作")
-                return@guarded PhoneActionResult(false, detail = result.detail)
+                return@guarded PhoneActionResult(false, detail = result.detail, executor = result.executor)
             }
             if (action == PhoneAction.Screenshot) {
                 record(token, action, "已获取目标窗口截图")
-                return@guarded PhoneActionResult(true, detail = "仅取得本次目标窗口截图", screenshotUri = result.screenshotUri)
+                return@guarded PhoneActionResult(true, detail = "仅取得本次目标窗口截图", screenshotUri = result.screenshotUri,
+                    executor = result.executor)
             }
             delay(settleMillis)
             val after = try {
@@ -351,7 +344,8 @@ class PhoneController(
                 receipt?.postObserveFailed(error.code)
                 pauseForSafetyFailure(token, error)
                 if (state.value.token?.sessionId != token.sessionId) throw error
-                return@guarded PhoneActionResult(true, detail = "动作已提交，但未能验证后续页面；请检查并重新观察")
+                return@guarded PhoneActionResult(true, detail = "动作已提交，但未能验证后续页面；请检查并重新观察",
+                    executor = result.executor)
             }
             val beforeFingerprint = result.beforeActionFingerprint ?: before?.fingerprint
             val changed = beforeFingerprint == null || beforeFingerprint != after.fingerprint
@@ -364,8 +358,43 @@ class PhoneController(
                 record(token, action, if (changed) "页面已变化" else "页面未确认变化")
                 if (unchangedActions >= 3) pauseWith(PhoneSessionStatus.PAUSED, "同一动作连续三次未观察到变化，请人工检查", token)
             }
-            PhoneActionResult(true, changed, if (changed) "动作已提交且观察到页面变化；仍需核对任务目标" else "动作已提交，但页面未确认变化", after)
+            PhoneActionResult(true, changed, if (changed) "动作已提交且观察到页面变化；仍需核对任务目标" else "动作已提交，但页面未确认变化", after,
+                executor = result.executor)
         }
+    }
+
+    private fun checkOpenApp(token: PhoneSessionToken) {
+        if (synchronized(gate) { restrictedToNativeScroll }) {
+            fail("SCROLL_ONLY", "当前页面检查不完整，仅允许原生节点滚动；请先重新观察。")
+        }
+        val foreground = backend.state.value.foregroundPackage
+        if (foreground != ownPackageName && foreground != state.value.targetPackage) {
+            pauseWith(PhoneSessionStatus.WAITING_FOR_FOREGROUND, "前台不是本应用或目标应用，请确认后恢复", token)
+            fail("FOREGROUND_CHANGED", "需要用户确认当前前台应用")
+        }
+    }
+
+    private fun beginAction(token: PhoneSessionToken, before: PhoneObservation?) = synchronized(gate) {
+        authorize(token)
+        val current = mutableState.value
+        if (current.actionsUsed >= current.actionLimit) {
+            pauseWith(PhoneSessionStatus.PAUSED, "已到本次操作次数上限", token)
+            fail("ACTION_LIMIT", "已到本次操作次数上限")
+        }
+        if (current.observationsUsed >= current.observationLimit) {
+            pauseWith(PhoneSessionStatus.PAUSED, "观察预算不足，不能验证下一步动作", token)
+            fail("OBSERVATION_LIMIT", "观察预算不足")
+        }
+        if (before?.scrollOnly == true) {
+            if (partialScrolls >= 5) {
+                pauseWith(PhoneSessionStatus.PAUSED, "页面持续无法完整读取，已达到五次受限滚动上限", token)
+                fail("SCROLL_ONLY_LIMIT", "已达到本任务受限滚动上限，请检查页面；未确认商品筛选完成")
+            }
+            partialScrolls++
+        }
+        observation = null // A snapshot is single-use, including rejected platform actions.
+        mutableState.value = current.copy(actionsUsed = current.actionsUsed + 1,
+            activity = PhoneActivity.ACTING, activityStartedAtMillis = now())
     }
 
     private suspend fun capture(token: PhoneSessionToken): PhoneObservation {

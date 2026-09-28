@@ -208,6 +208,21 @@ class PhoneActionReceiptLedgerTest {
     }
 
     @Test
+    fun `root executor survives failed post observation without claiming completion`() {
+        val ledger = PhoneActionReceiptLedger(token)
+        val recorder = ledger.recorder()
+        recorder.backendResult(true, PhoneActionExecutor.ROOT_INPUT)
+        recorder.postObserveFailed("PAGE_UNSTABLE")
+        recorder.backendResult(false, PhoneActionExecutor.ACCESSIBILITY)
+        val receipt = checkNotNull(ledger.freeze().find(token, key))
+        val result = Json.parseToJsonElement((receipt.output().single() as UIMessagePart.Text).text).jsonObject
+        assertEquals("root_input", result.getValue("executor").jsonPrimitive.content)
+        assertEquals("accepted_unverified", result.getValue("execution_outcome").jsonPrimitive.content)
+        assertEquals("false", result.getValue("post_observation_verified").jsonPrimitive.content)
+        assertFalse(result.containsKey("screenChanged"))
+    }
+
+    @Test
     fun `backend rejection does not claim non execution or invent an observation`() {
         val ledger = PhoneActionReceiptLedger(token)
         val recorder = ledger.recorder()
