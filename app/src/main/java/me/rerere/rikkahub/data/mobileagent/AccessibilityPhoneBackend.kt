@@ -483,7 +483,7 @@ class AccessibilityPhoneBackend(
                                     if (root.windowId != version.windowId || root.packageName?.toString() != permit.targetPackage) {
                                         fail("FOREGROUND_CONFLICT", "刷新后目标窗口身份已改变，请重新观察。")
                                     }
-                                    reader.capture(root, permit.targetPackage, diagnostics = attempt?.tree) {
+                                    reader.capture(root, permit.targetPackage, diagnostics = attempt?.tree, collectReadOnlyContent = true) {
                                         readContext.isActive && validAtRevision(permit, version.revision)
                                     }
                                 }
@@ -559,10 +559,14 @@ class AccessibilityPhoneBackend(
                 )
                 // Nothing is published until a whole read finishes at its original revision.
                 requireRevision(permit, captured.observation.windowRevision)
-                snapshot.set(captured)
+                // Retain only executable state. Read-only text is transferred once to the
+                // controller and is never part of the backend's saved action snapshot.
+                snapshot.set(captured.copy(tree = captured.tree.copy(readOnlyContent = null)))
                 diagnosticOutcome = if (captured.observation.scrollOnly) "OBSERVED_SCROLL_ONLY" else "OBSERVED"
                 diagnosticSnapshotId = captured.observation.id
-                captured.observation
+                captured.observation.copy(readOnlyContent = captured.tree.readOnlyContent?.takeIf {
+                    !captured.observation.truncated && !captured.observation.sensitive && !captured.observation.scrollOnly
+                })
             } catch (error: PhoneControlException) {
                 diagnosticOutcome = error.code
                 throw error
@@ -788,7 +792,7 @@ class AccessibilityPhoneBackend(
 
     private fun validatedSnapshot(permit: PhonePermit, observation: PhoneObservation?): Snapshot {
         val stored = snapshot.get() ?: fail("STALE_SNAPSHOT", "界面快照已失效，请重新观察。")
-        if (observation == null || stored.token != permit.token || stored.observation != observation ||
+        if (observation == null || stored.token != permit.token || stored.observation != observation.withoutReadOnlyContentMetadata() ||
             System.currentTimeMillis() - observation.capturedAtMillis !in 0..15_000) {
             fail("STALE_SNAPSHOT", "界面快照不属于当前会话或已过期。")
         }

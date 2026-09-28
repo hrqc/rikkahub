@@ -100,6 +100,14 @@ public final class PhoneTestInputDriver extends Instrumentation {
             result.putInt("characters", value.length());
             finish(Activity.RESULT_OK, result);
         } catch (Exception error) {
+            if (arguments != null && "inspect_test_ui".equals(arguments.getString("operation"))) {
+                result.remove("ui_b64");
+                result.putString("ui_status", "failed");
+                if (!result.containsKey("ui_error_code")) result.putString("ui_error_code", "INSPECTION_FAILED");
+                result.putString("reason", "UI inspection unavailable");
+                finish(Activity.RESULT_CANCELED, result);
+                return;
+            }
             if (arguments != null && "inspect_tree_gaps".equals(arguments.getString("operation"))) {
                 result.clear();
                 result.putString("tree_gaps", "failed");
@@ -293,17 +301,38 @@ public final class PhoneTestInputDriver extends Instrumentation {
 
     /** Local USB diagnostics for this task's foreground apps, without suppressing accessibility. */
     private void inspectTestUi(Bundle result) {
+        result.putString("ui_status", "failed");
+        result.putString("ui_error_code", "INSPECTION_FAILED");
+        result.putInt("root_attempts", 0);
+        result.putLong("root_wait_ms", 0);
+        result.putBoolean("root_found", false);
+        result.putBoolean("root_package_matched", false);
+        result.putBoolean("automation_service_flags_known", false);
         String expected = arguments.getString("package", "me.rerere.rikkahub.debug");
         if (!List.of("me.rerere.rikkahub.debug", "com.heytap.browser", "com.jingdong.app.mall",
                 "com.taobao.taobao", "com.xunmeng.pinduoduo", "com.sankuai.meituan").contains(expected)) {
+            result.putString("ui_error_code", "TARGET_NOT_ALLOWED");
             throw new IllegalArgumentException("Package is outside test scope");
         }
-        AccessibilityNodeInfo root = getUiAutomation(UiAutomation.FLAG_DONT_SUPPRESS_ACCESSIBILITY_SERVICES).getRootInActiveWindow();
-        if (root == null) throw new IllegalStateException("No active window");
-        if (!expected.contentEquals(root.getPackageName() == null ? "" : root.getPackageName())) {
-            root.recycle();
-            throw new IllegalStateException("Expected test app is not active");
+        result.putString("ui_error_code", "UI_AUTOMATION_UNAVAILABLE");
+        UiAutomation automation = getUiAutomation(UiAutomation.FLAG_DONT_SUPPRESS_ACCESSIBILITY_SERVICES);
+        if (automation == null) throw new IllegalStateException("Automation unavailable");
+        AccessibilityNodeInfo root;
+        try {
+            root = awaitTestUiRoot(automation, expected, result);
+        } finally {
+            // Metadata of this instrumentation connection only; never set service flags.
+            try {
+                AccessibilityServiceInfo info = automation.getServiceInfo();
+                if (info != null) {
+                    result.putInt("automation_service_flags", info.flags);
+                    result.putBoolean("automation_service_flags_known", true);
+                }
+            } catch (Exception ignored) {
+                result.putBoolean("automation_service_flags_known", false);
+            }
         }
+        result.putString("ui_error_code", "INSPECTION_FAILED");
         ArrayDeque<AccessibilityNodeInfo> pending = new ArrayDeque<>();
         pending.add(root);
         StringBuilder output = new StringBuilder();
@@ -337,6 +366,45 @@ public final class PhoneTestInputDriver extends Instrumentation {
             result.putBoolean("partial", !pending.isEmpty());
         } finally { while (!pending.isEmpty()) pending.removeFirst().recycle(); }
         result.putString("ui_b64", Base64.encodeToString(output.toString().getBytes(StandardCharsets.UTF_8), Base64.NO_WRAP));
+        result.putString("ui_error_code", "NONE");
+        result.putString("ui_status", "ok");
+    }
+
+    /** A fresh instrumentation connection may initially have no active accessibility root. */
+    private AccessibilityNodeInfo awaitTestUiRoot(UiAutomation automation, String expected, Bundle result) {
+        long startedAt = SystemClock.elapsedRealtime();
+        long deadline = startedAt + 2000;
+        AccessibilityNodeInfo root = null;
+        result.putString("ui_error_code", "ROOT_READ_FAILED");
+        try {
+            for (int attempt = 0; attempt < 20 && SystemClock.elapsedRealtime() < deadline; attempt++) {
+                result.putInt("root_attempts", attempt + 1);
+                root = automation.getRootInActiveWindow();
+                result.putBoolean("root_found", root != null);
+                if (root != null) {
+                    if (SystemClock.elapsedRealtime() >= deadline) {
+                        result.putString("ui_error_code", "ROOT_WAIT_TIMEOUT");
+                        throw new IllegalStateException("Root arrived after wait budget");
+                    }
+                    boolean matches = expected.contentEquals(root.getPackageName() == null ? "" : root.getPackageName());
+                    result.putBoolean("root_package_matched", matches);
+                    if (!matches) {
+                        result.putString("ui_error_code", "FOREGROUND_MISMATCH");
+                        throw new IllegalStateException("Expected test app is not active");
+                    }
+                    AccessibilityNodeInfo accepted = root;
+                    root = null; // Transfer ownership to the existing bounded traversal.
+                    return accepted;
+                }
+                long remaining = deadline - SystemClock.elapsedRealtime();
+                if (attempt < 19 && remaining > 0) SystemClock.sleep(Math.min(100, remaining));
+            }
+            result.putString("ui_error_code", "ROOT_UNAVAILABLE");
+            throw new IllegalStateException("No active window within wait budget");
+        } finally {
+            result.putLong("root_wait_ms", SystemClock.elapsedRealtime() - startedAt);
+            if (root != null) root.recycle();
+        }
     }
 
     private void assertFilehelper(Bundle result) {

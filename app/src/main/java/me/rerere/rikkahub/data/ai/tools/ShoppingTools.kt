@@ -32,6 +32,8 @@ fun createShoppingTools(
             """
                 shopping_compare 是本地只读计算工具，适用于淘宝、京东、拼多多、美团等页面可见的商品或外卖费用，不包含任何平台私有接口。
                 先使用本次 phone observe 读取真实页面，再逐项引用返回的 snapshot_id、node_id 和原文 quote；工具不接受模型自报 verified、authorized 或旧授权证据。
+                单个候选的 product_identity、specification 和 unit_price 必须引用同一 snapshot_id，不能将不同页面的标题、规格或单价拼成一个候选；candidate_evidence_mismatch 时重新观察，在同一快照内补齐，不能改写引用绕过。不同候选可分别来自不同快照以继续跨页预筛；同快照只是最低约束，不证明节点属于同一商品或SKU，product_binding_verified 仍为 false。
+                宿主标记 truncated 的节点只能阅读，不能用于正式比较；incomplete_evidence 表示正文截断可能隐藏价格或优惠条件，需取得完整节点证据。缩短quote、更换候选ID或自报truncated=false不能绕过，不要将片段当完整费用规则。
                 仅比较商品身份（品牌、型号/版本）、规格与数量一致的候选。食品还需口味、分量、套餐内容一致；无法确认一致就分组或报告不具有可比性，不把小份/不同版本假装最低价。
                 用户要求自主购物筛选时，先观察并翻页收集至少3个不同候选，逐组核对同身份、同规格、同数量；重复出现的同一商品不能换ID凑数，无法确认是否重复时明确说明。
                 每次翻页只使用本次最新快照，读取动作结果里的新 observation 或重新 observe 后再记录候选；最多5次翻页，连续2页无新增候选即停止。预算、暂停或安全限制更早触发时立即停止，不能为了凑数重复动作。

@@ -55,6 +55,7 @@ import me.rerere.rikkahub.data.ai.tools.ChatToolFactory
 import me.rerere.rikkahub.data.ai.tools.InvalidMcpServerNamesException
 import me.rerere.rikkahub.data.ai.tools.isPhoneToolName
 import me.rerere.rikkahub.data.ai.tools.interruptedToolResult
+import me.rerere.rikkahub.data.ai.tools.phoneToolPrefix
 import me.rerere.rikkahub.data.ai.tools.shouldUseExternalWebSearch
 import me.rerere.rikkahub.data.ai.transformers.Base64ImageToLocalFileTransformer
 import me.rerere.rikkahub.data.ai.transformers.DocumentAsPromptTransformer
@@ -105,6 +106,24 @@ private data class PhoneGenerationRun(val token: PhoneSessionToken, val job: Job
 internal fun isRevokedPhoneGeneration(run: PhoneSessionToken, state: PhoneSessionToken): Boolean =
     run.conversationId == state.conversationId && run.assistantId == state.assistantId &&
         run.sessionId == state.sessionId && run.epoch < state.epoch
+
+/** Finalize only this grant's unresolved calls; an emitted call does not prove dispatch occurred. */
+internal fun finishUnresolvedPhoneTools(conversation: Conversation, token: PhoneSessionToken): Conversation {
+    if (conversation.id.toString() != token.conversationId || conversation.assistantId.toString() != token.assistantId) {
+        return conversation
+    }
+    val prefix = phoneToolPrefix(token)
+    val nodes = conversation.messageNodes.map { node ->
+        val current = node.currentMessage
+        val finished = current.finishPendingTools { tool ->
+            if (tool.toolName.startsWith(prefix)) interruptedToolResult(tool) else tool
+        }
+        if (finished == current) node else node.copy(messages = node.messages.map { message ->
+            if (message.id == current.id) finished else message
+        })
+    }
+    return if (nodes == conversation.messageNodes) conversation else conversation.copy(messageNodes = nodes)
+}
 
 internal fun backgroundTextGenerationParams(
     model: Model,
@@ -786,6 +805,7 @@ class ChatService(
                 initialConversation.currentMessages.any { message ->
                     message.getTools().any { isPhoneToolName(it.toolName) }
                 }
+        var unresolvedPhoneTools = false
 
         val result = runCatching {
 
@@ -881,7 +901,12 @@ class ChatService(
             ).onCompletion {
                 // 可能被取消了，或者意外结束，兜底更新
                 val updatedConversation = session.finishGeneration { conversation ->
-                    saveConversation(conversationId, conversation)
+                    // finishGeneration saves under NonCancellable, including cancelled streams.
+                    // Also reject an apparently normal completion that left only tool arguments.
+                    val finished = generationPhoneToken?.let { finishUnresolvedPhoneTools(conversation, it) }
+                        ?: conversation
+                    unresolvedPhoneTools = finished != conversation
+                    saveConversation(conversationId, finished)
                 }
 
                 // 生成结束：取消 Live Update 通知，后台时发送完成通知
@@ -922,15 +947,24 @@ class ChatService(
             if (it is CancellationException) throw it
             sessionManager.get(conversationId)?.messageQueue?.pause()
 
-            if (it is ModelProgressTimeoutException && generationPhoneToken != null) {
-                Log.w(TAG, "PHONE_MODEL_TIMEOUT")
-                phoneController.pauseIfCurrent(generationPhoneToken, PHONE_MODEL_PROGRESS_TIMEOUT_MESSAGE)
-            }
-
             Log.w(TAG, "Generation failed (${it.javaClass.simpleName})")
             addError(it, conversationId, title = context.getString(R.string.error_title_generation))
             Logging.log(TAG, "Generation failed (${it.javaClass.simpleName})")
+            // Preserve the original error before revocation cancels this generation's job.
+            generationPhoneToken?.let { token ->
+                if (it is ModelProgressTimeoutException) Log.w(TAG, "PHONE_MODEL_TIMEOUT")
+                phoneController.pauseIfCurrent(token, if (it is ModelProgressTimeoutException) {
+                    PHONE_MODEL_PROGRESS_TIMEOUT_MESSAGE
+                } else {
+                    "模型执行异常中断，请查看错误详情；手机动作结果可能未知，继续前请先观察核对。"
+                })
+            }
         }.onSuccess {
+            if (unresolvedPhoneTools && generationPhoneToken != null) {
+                phoneController.pauseIfCurrent(generationPhoneToken,
+                    "本轮模型执行未返回手机工具结果，执行状态未知；继续前请先观察核对，不得直接重放。")
+                return@onSuccess
+            }
             val finalConversation = getConversationFlow(conversationId).value
 
             sessionManager.launchWithSession(conversationId) {
@@ -940,7 +974,7 @@ class ChatService(
                 generateSuggestion(conversationId, finalConversation)
             }
         }
-        return result.isSuccess
+        return result.isSuccess && !unresolvedPhoneTools
     }
 
     // ---- 检查无效消息 ----

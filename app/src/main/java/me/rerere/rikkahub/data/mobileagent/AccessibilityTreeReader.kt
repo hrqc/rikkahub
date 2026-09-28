@@ -46,6 +46,7 @@ internal data class AndroidTreeCapture(
     val inspectionIssues: List<String>,
     val restrictedPaths: List<List<Int>>,
     val nativeScrollNodeIds: Set<String>,
+    val readOnlyContent: PhoneReadOnlyContent? = null,
 )
 
 /** Reads only the already authorized root supplied by the backend. Never queries windows itself. */
@@ -60,6 +61,7 @@ internal class AccessibilityTreeReader {
         diagnostics: ReadDiagnosticTree? = null,
         diagnosticProfile: ReadDiagnosticProfile? = null,
         debugStructure: PhoneDebugStructureCapture? = null,
+        collectReadOnlyContent: Boolean = false,
         isValid: () -> Boolean,
     ): AndroidTreeCapture {
         require(diagnosticProfile == null || diagnostics != null)
@@ -71,6 +73,7 @@ internal class AccessibilityTreeReader {
         val restrictedPaths = mutableListOf<List<Int>>()
         val nativeScrollNodeIds = mutableSetOf<String>()
         val inspectedSignatures = mutableListOf<AndroidNodeSignature>()
+        val content = if (collectReadOnlyContent) PhoneReadOnlyContentCollector() else null
         var sensitive = false
 
         fun check() {
@@ -141,6 +144,15 @@ internal class AccessibilityTreeReader {
                 diagnostics?.protectedSubtree(path, isVisible, wasEmitted)
                 return
             }
+            content?.add(
+                previewNodeId = if (wasEmitted) effectiveParent else null,
+                visible = isVisible,
+                password = signature.password,
+                sensitive = signature.sensitive,
+                text = signature.text,
+                description = signature.description,
+                fieldsTruncated = signature.truncated,
+            )
             val children = node.childCount
             debugStructure?.recordNode(path, PhoneDebugNodeShape(
                 className = signature.role, viewId = signature.viewId,
@@ -183,7 +195,8 @@ internal class AccessibilityTreeReader {
         // Preview omission must not omit safety inspection or freshness of the remaining tree.
         val fingerprint = digest(inspectedSignatures.joinToString("\n") { it.toString() })
         return AndroidTreeCapture(guardedNodes, handles, budget.truncated, sensitive, fingerprint,
-            budget.previewTruncated, budget.issues.toList(), restrictedPaths.toList(), nativeScrollNodeIds.toSet())
+            budget.previewTruncated, budget.issues.toList(), restrictedPaths.toList(), nativeScrollNodeIds.toSet(),
+            content?.finish(inspectionComplete = !budget.truncated, sensitive = sensitive))
     }
 
     /** Returns an owned fresh node; the caller must recycle it on API < 33. */

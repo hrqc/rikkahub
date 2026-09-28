@@ -35,7 +35,7 @@ class PhoneController(
     val taskControls = PhoneTaskControlRegistry { state.value }
     private var epoch = 0L
     private var observation: PhoneObservation? = null
-    private val evidence = ArrayDeque<ShoppingObservedEvidence>()
+    private val evidence = ArrayDeque<StoredPhoneContent>()
     private var enteredTarget = false
     private var lastUnchangedAction: String? = null
     private var unchangedActions = 0
@@ -142,7 +142,16 @@ class PhoneController(
 
     /** Only the current grant may use a bounded history of actual, non-sensitive observations. */
     fun shoppingEvidence(token: PhoneSessionToken): List<ShoppingObservedEvidence> = synchronized(gate) {
-        if (!valid(token)) emptyList() else evidence.toList()
+        if (!valid(token)) emptyList() else evidence.map { it.evidence }
+    }
+
+    /** Reads saved text only; does not refresh snapshots, change budgets or access the device. */
+    fun readObservedContent(token: PhoneSessionToken, snapshotId: String, cursor: String = "0"): PhoneObservedContentPage = synchronized(gate) {
+        authorize(token)
+        if (restrictedToNativeScroll) fail("SCROLL_ONLY", "当前页面仅可原生滚动，请先取得完整观察再读取正文")
+        val saved = evidence.firstOrNull { it.evidence.snapshotId == snapshotId }
+            ?: fail("CONTENT_UNAVAILABLE", "本次授权未保留该页正文，请重新观察；旧授权或已淘汰证据不可恢复")
+        saved.page(cursor)
     }
 
     /** UI events carry the exact displayed epoch; validation and owner callbacks are atomic. */
@@ -347,7 +356,8 @@ class PhoneController(
             pauseWith(PhoneSessionStatus.WAITING_FOR_FOREGROUND, "前台应用已改变", token)
             fail("FOREGROUND_CHANGED", "前台应用已改变，未提供界面内容")
         }
-        if (raw.sensitive || raw.nodes.any { it.password || PhoneContentPolicy.isSensitive(it.text + "\n" + it.description) }) {
+        if (raw.sensitive || raw.nodes.any { it.password || PhoneContentPolicy.isSensitive(it.text + "\n" + it.description) } ||
+            raw.readOnlyContent?.nodes?.any { PhoneContentPolicy.isSensitive(it.text + "\n" + it.description) } == true) {
             pauseWith(PhoneSessionStatus.PAUSED, "当前页面涉及密码、支付或授权，请用户接手", token)
             fail("USER_HANDOVER_REQUIRED", "当前页面需要用户接手，未提供敏感界面内容")
         }
@@ -365,6 +375,10 @@ class PhoneController(
             else raw.nodes.map { it.copy(text = it.text.take(300), description = it.description.take(300),
                 requiresUserConfirmation = it.requiresUserConfirmation || PhonePurchasePolicy.requiresUser(it.text + "\n" + it.description)) }.take(100),
             previewTruncated = raw.previewTruncated || raw.nodes.size > 100,
+            readOnlyContent = null,
+            readOnlyContentAvailable = !scrollOnly,
+            readOnlyContentTruncated = !scrollOnly && (raw.readOnlyContent?.let { it.truncated || it.nodes.any { node -> node.truncated } }
+                ?: (raw.previewTruncated || raw.nodes.size > 100)),
         )
         synchronized(gate) {
             authorize(token)
@@ -372,14 +386,26 @@ class PhoneController(
             observation = safe
             restrictedToNativeScroll = scrollOnly
             if (!scrollOnly) {
-                evidence.removeAll { it.snapshotId == safe.id }
-                evidence.addLast(ShoppingObservedEvidence(safe.id, safe.packageName, safe.nodes.map {
-                    ShoppingObservedNode(it.id, it.text, it.description)
-                }))
+                val content = raw.readOnlyContent?.nodes?.map {
+                    ShoppingObservedNode(it.id, it.text.take(300), it.description.take(300),
+                        truncated = it.truncated || it.text.length > 300 || it.description.length > 300)
+                } ?: safe.nodes.map { ShoppingObservedNode(it.id, it.text, it.description) }
+                // Copy the backend list and bound the retained prefix independently.
+                val bounded = mutableListOf<ShoppingObservedNode>()
+                var characters = 0
+                for (node in content) {
+                    val size = node.text.length + node.description.length
+                    if (bounded.size >= 768 || characters + size > 64_000) break
+                    bounded += node
+                    characters += size
+                }
+                evidence.removeAll { it.evidence.snapshotId == safe.id }
+                evidence.addLast(StoredPhoneContent(ShoppingObservedEvidence(safe.id, safe.packageName, bounded.toList()),
+                    safe.readOnlyContentTruncated || bounded.size < content.size))
             }
             // Keep comparison evidence across list pages and detail visits; action snapshots
             // remain single-use and retain their independent 10-second freshness check.
-            while (evidence.size > 32 || evidence.sumOf { page -> page.nodes.sumOf { it.text.length + it.description.length } } > 256_000) {
+            while (evidence.size > 32 || evidence.sumOf { page -> page.evidence.nodes.sumOf { it.text.length + it.description.length } } > 256_000) {
                 evidence.removeFirst()
             }
             val current = mutableState.value

@@ -135,6 +135,8 @@ fun createPhoneTools(
                 遇到系统授权弹窗，应停止手机操作并请用户处理；不要点击授权选项，也不要反复调用 open_app。
                 工具调用被拒绝不代表任务已完成；只能依据重新观察到的目标应用状态判断结果。
                 previewTruncated 仅表示给模型的展示经过裁切，truncated 才表示整页检查未完成；后者为 true 时读取 inspectionIssues 并报告实际原因，不要猜成权限丢失。
+                完整观察 readOnlyContentAvailable=true 时，可用 ${prefix}read_observed_content 分页补齐该快照保留的正文，首次cursor填"0"，随后只使用nextCursor；没有nextCursor就停止。购物先补齐相关正文再决定翻页，不要因100节点预览未显示价格或评价就认定页面没有。
+                正文分页是本授权内保存的历史证据，不重新读取手机、不刷新动作快照。n*沿用预览引用，r*只供阅读与引用，不能点击或输入；要操作仍须最新observe中的节点。contentTruncated=true表示正文保留预算不足或字段被裁切，不能宣称已读完全部内容；节点truncated=true只能作为线索，不能据此确认价格、券条件或完整评价，应继续读取可完整显示这些条件的页面。分页顺序不是页面空间顺序。
                 scrollOnly=true 表示页面检查不完整且宿主仅提供原生滚动节点；只能调用当前 scroll，不能点击、输入、滑动、返回、截图或 open_app，也不能将这一页用于确认商品或评价。
                 受限滚动后必须核对新观察；页面恢复完整后才收集商品。购物最多向前翻页五次，连续两页没有新增可核验候选就停止并说明不足，不能在读不完整时反复滚动。
                 requiresUserConfirmation=true 的节点可用于读取价格/优惠信息，但不得点击或输入；最终下单、付款、会员/试用/积分/储值由用户亲自处理。
@@ -145,6 +147,11 @@ fun createPhoneTools(
                 STALE_WINDOW 表示窗口或快照已改变，不等于系统权限被关闭；至多重新观察一次，仍失败就报告实际错误并暂停等待，不循环消耗任务预算。
             """.trimIndent(),
         ) { listOf(UIMessagePart.Text(json.encodeToString(controller.observe(token)))) },
+        tool("read_observed_content", "分批读取本授权已完整观察并保留的页面正文，不操作手机，不产生新的动作许可。",
+            mapOf("snapshot_id" to "本次授权真实完整observe的id。", "cursor" to "首次填字符串0，随后填上次nextCursor；为null时停止。")) {
+            listOf(UIMessagePart.Text(json.encodeToString(controller.readObservedContent(token,
+                it.requiredString("snapshot_id"), it.requiredString("cursor")))))
+        },
         tool("click", "点击已观察到的节点。$actionResultHint", node) {
             act(it, PhoneAction.Click(it.requiredString("node_id")))
         },

@@ -1,22 +1,100 @@
 package me.rerere.rikkahub.service
 
 import kotlinx.serialization.json.JsonPrimitive
+import kotlinx.serialization.json.Json
+import kotlinx.serialization.json.jsonObject
+import kotlinx.serialization.json.jsonPrimitive
+import me.rerere.ai.core.MessageRole
 import me.rerere.ai.core.ReasoningLevel
 import me.rerere.ai.provider.BuiltInTools
 import me.rerere.ai.provider.CustomBody
 import me.rerere.ai.provider.CustomHeader
 import me.rerere.ai.provider.Model
 import me.rerere.rikkahub.data.ai.tools.shouldUseExternalWebSearch
+import me.rerere.rikkahub.data.ai.tools.phoneToolPrefix
+import me.rerere.ai.ui.UIMessage
+import me.rerere.ai.ui.UIMessagePart
+import me.rerere.rikkahub.data.mobileagent.PhoneSessionToken
 import me.rerere.rikkahub.data.model.Assistant
 import me.rerere.rikkahub.data.model.Conversation
+import me.rerere.rikkahub.data.model.MessageNode
+import me.rerere.rikkahub.data.model.toMessageNode
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
 import org.junit.Assert.assertNotEquals
+import org.junit.Assert.assertSame
 import org.junit.Assert.assertTrue
 import org.junit.Test
 import kotlin.uuid.Uuid
 
 class ChatServiceTest {
+    @Test
+    fun `ending a phone generation records unknown for unresolved calls and preserves real results`() {
+        val id = Uuid.random()
+        val assistant = Uuid.random()
+        val token = PhoneSessionToken(id.toString(), assistant.toString(), "first-session", 1)
+        val pending = UIMessagePart.Tool("pending", phoneToolPrefix(token) + "click", "{\"node_id\":\"n32\"}")
+        val completed = UIMessagePart.Tool("completed", phoneToolPrefix(token) + "scroll", "{}",
+            output = listOf(UIMessagePart.Text("{\"accepted\":true,\"screenChanged\":true}")))
+        val other = UIMessagePart.Tool("other", "read_public_webpage", "{}")
+        val explanation = UIMessagePart.Text("已有真实观察")
+        val message = UIMessage(role = MessageRole.ASSISTANT, parts = listOf(explanation, completed, pending, other))
+        val conversation = Conversation(id = id, assistantId = assistant, messageNodes = listOf(message.toMessageNode()))
+
+        val finished = finishUnresolvedPhoneTools(conversation, token)
+        val parts = finished.currentMessages.single().parts
+        assertEquals(explanation, parts[0])
+        assertEquals(completed, parts[1])
+        assertEquals(other, parts[3])
+        val interrupted = parts[2] as UIMessagePart.Tool
+        assertEquals(pending.input, interrupted.input)
+        assertEquals(pending.toolCallId, interrupted.toolCallId)
+        assertFalse(interrupted.canResumeExecution)
+        val result = Json.parseToJsonElement((interrupted.output.single() as UIMessagePart.Text).text).jsonObject
+        assertEquals("interrupted", result.getValue("status").jsonPrimitive.content)
+        assertEquals("unknown", result.getValue("execution_outcome").jsonPrimitive.content)
+        assertFalse(result.containsKey("accepted"))
+        assertTrue(result.getValue("detail").jsonPrimitive.content.contains("不得直接重放"))
+        assertSame(finished, finishUnresolvedPhoneTools(finished, token))
+    }
+
+    @Test
+    fun `old grant cleanup leaves replacement epoch other session and unselected response untouched`() {
+        val id = Uuid.random()
+        val assistant = Uuid.random()
+        val old = PhoneSessionToken(id.toString(), assistant.toString(), "first-session", 1)
+        val resumed = old.copy(epoch = 2)
+        val replacement = old.copy(sessionId = "second-session")
+        fun call(token: PhoneSessionToken, callId: String) =
+            UIMessagePart.Tool(callId, phoneToolPrefix(token) + "click", "{}")
+        val selected = UIMessage(role = MessageRole.ASSISTANT,
+            parts = listOf(call(old, "old"), call(resumed, "resumed"), call(replacement, "replacement")))
+        val unselected = UIMessage(role = MessageRole.ASSISTANT, parts = listOf(call(old, "unselected")))
+        val conversation = Conversation(id = id, assistantId = assistant,
+            messageNodes = listOf(MessageNode(messages = listOf(unselected, selected), selectIndex = 1)))
+
+        val finished = finishUnresolvedPhoneTools(conversation, old)
+        assertEquals(unselected, finished.messageNodes.single().messages[0])
+        val calls = finished.currentMessages.single().getTools()
+        assertTrue(calls[0].isExecuted)
+        assertFalse(calls[1].isExecuted)
+        assertFalse(calls[2].isExecuted)
+        assertSame(conversation, finishUnresolvedPhoneTools(conversation, old.copy(conversationId = Uuid.random().toString())))
+        assertSame(conversation, finishUnresolvedPhoneTools(conversation, old.copy(assistantId = Uuid.random().toString())))
+    }
+
+    @Test
+    fun `a phone generation with all results stays unchanged at completion`() {
+        val id = Uuid.random()
+        val assistant = Uuid.random()
+        val token = PhoneSessionToken(id.toString(), assistant.toString(), "session", 1)
+        val completed = UIMessagePart.Tool("done", phoneToolPrefix(token) + "observe", "{}",
+            output = listOf(UIMessagePart.Text("真实结果")))
+        val message = UIMessage(role = MessageRole.ASSISTANT, parts = listOf(completed, UIMessagePart.Text("最终说明")))
+        val conversation = Conversation(id = id, assistantId = assistant, messageNodes = listOf(message.toMessageNode()))
+        assertSame(conversation, finishUnresolvedPhoneTools(conversation, token))
+    }
+
     @Test
     fun `fork conversation inherits folder and workspace context`() {
         val source = Conversation(

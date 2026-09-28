@@ -230,6 +230,9 @@ class ReviewEvidenceAnalyzer {
             if (node == null || !(node.text.contains(ref.quote) || node.description.contains(ref.quote))) {
                 throw ReviewEvidenceException("unverified_evidence", "引用未对应本次宿主观察中的唯一节点原文，不能使用模型改写、旧快照或自行提供的评价。")
             }
+            if (node.truncated) throw ReviewEvidenceException(
+                "incomplete_evidence", "所引用评价正文或标签节点已被截断，不能用于评价证据分析或样本计数；请取得完整节点证据，缩短quote不能消除宿主截断状态。",
+            )
         }
 
         fun packageName(ref: ShoppingEvidenceRef): String = observed.single { it.snapshotId == ref.snapshotId }.packageName

@@ -263,6 +263,35 @@ class PhoneChatCoordinatorTest {
         }
     }
 
+    @Test fun `failed or cancelled generation pauses instead of reporting normal completion`() = runBlocking {
+        for (failed in listOf(true, false)) Fixture().use { f ->
+            f.propose("打开计算器")
+            f.await(PhoneChatPhase.RUNNING)
+            val generation = f.host.runs.single()
+            if (failed) generation.completeExceptionally(IllegalStateException("synthetic generation failure"))
+            else generation.cancel()
+            val state = f.await(PhoneChatPhase.PAUSED)
+            assertEquals(PhoneSessionStatus.PAUSED, f.controller.state.value.status)
+            assertTrue(state.detail.contains("结果可能未知"))
+            assertFalse(state.detail.contains("本轮模型执行已结束"))
+            assertNull(f.controller.activeToken("chat", "assistant"))
+            assertEquals(1, f.host.submitted.size)
+        }
+    }
+
+    @Test fun `late failure of an old generation cannot pause a replacement phone session`() = runBlocking {
+        Fixture().use { f ->
+            f.propose("打开计算器")
+            f.await(PhoneChatPhase.RUNNING)
+            val oldGeneration = f.host.runs.single()
+            val replacement = f.controller.start("other-chat", "assistant", "com.example.calc")
+            oldGeneration.completeExceptionally(IllegalStateException("late old failure"))
+            yield()
+            assertEquals(PhoneSessionStatus.RUNNING, f.controller.state.value.status)
+            assertEquals(replacement, f.controller.activeToken("other-chat", "assistant"))
+        }
+    }
+
     @Test fun `pause retains original task and resume uses a fresh token`() = runBlocking {
         Fixture().use { f ->
             f.propose("打开计算器")

@@ -35,6 +35,27 @@ class PhoneToolsTest {
     private val empty = JsonObject(emptyMap())
 
     @Test
+    fun `content tool reads retained page only and expires with its grant`() = runBlocking {
+        val backend = FakeBackend()
+        val controller = controller(backend)
+        try {
+            val token = controller.start("conversation", "assistant", "target")
+            val observed = controller.observe(token)
+            val tool = createPhoneTools(controller, token, Json).first { it.name.endsWith("_read_observed_content") }
+            val arguments = buildJsonObject { put("snapshot_id", observed.id); put("cursor", "0") }
+            val result = Json.parseToJsonElement(tool.execute(arguments).filterIsInstance<UIMessagePart.Text>().single().text).jsonObject
+            assertEquals(observed.id, result["snapshotId"]?.jsonPrimitive?.content)
+            assertEquals(1, backend.observations)
+            assertEquals(0, backend.actions)
+            assertEquals("invalid_arguments", errorCode(tool.execute(buildJsonObject { put("snapshot_id", observed.id); put("cursor", 0) })))
+            controller.pause()
+            controller.resume()
+            assertEquals("SESSION_INVALID", errorCode(tool.execute(arguments)))
+            assertEquals(1, backend.observations)
+        } finally { controller.close() }
+    }
+
+    @Test
     fun `resuming changes namespace and old tool closure cannot observe`() = runBlocking {
         val backend = FakeBackend()
         val controller = controller(backend)
@@ -182,7 +203,7 @@ class PhoneToolsTest {
         try {
             val token = controller.start("conversation", "assistant", "target")
             val tools = createPhoneTools(controller, token, Json)
-            assertEquals(8, tools.size)
+            assertEquals(9, tools.size)
             tools.forEach { tool ->
                 assertTrue(tool.name.matches(Regex("phone_[a-f0-9]{12}_[0-9]+_[a-z_]+")))
                 assertTrue(tool.name.length <= 64)

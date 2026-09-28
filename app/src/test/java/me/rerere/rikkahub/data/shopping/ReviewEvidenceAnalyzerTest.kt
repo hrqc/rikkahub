@@ -50,6 +50,49 @@ class ReviewEvidenceAnalyzerTest {
         }
     }
 
+    @Test fun `truncated body or optional label rejects analysis and post-computation revalidation`() {
+        for (description in listOf(false, true)) {
+            val f = Fixture()
+            val body = f.ref(longReview, description = description)
+            val rating = f.ref("评分3/5", description = description)
+            val critical = f.ref("差评", description = description)
+            val followUp = f.ref("追加评价", description = description)
+            val request = ReviewEvidenceRequest(listOf(ReviewEvidenceGroup("a", listOf(ReviewEvidenceSample(body, rating, critical, followUp)))))
+            val analyzer = ReviewEvidenceAnalyzer()
+            assertEquals(1, analyzer.analyze(request, f.observed()).sourceNodeSamples)
+            listOf(body, rating, critical, followUp).forEach { ref ->
+                val observed = f.observed().map { page -> page.copy(nodes = page.nodes.map { node ->
+                    node.copy(truncated = node.nodeId == ref.nodeId)
+                }) }
+                assertRejected("incomplete_evidence") { analyzer.analyze(request, observed) }
+                assertRejected("incomplete_evidence") { analyzer.verifyEvidence(request, observed) }
+            }
+        }
+    }
+
+    @Test fun `shortening a truncated body quote cannot turn it into a complete review sample`() {
+        val f = Fixture()
+        val body = f.ref(longReview.repeat(8) + "后续追评说明出现故障")
+        val observed = f.observed().map { page -> page.copy(nodes = page.nodes.map { it.copy(text = it.text.take(240), truncated = true) }) }
+        val fragment = body.copy(quote = longReview)
+        val request = ReviewEvidenceRequest(listOf(group(fragment, fragment.copy(quote = "接口连接比较稳定"))))
+        assertRejected("incomplete_evidence") { ReviewEvidenceAnalyzer().analyze(request, observed) }
+        assertRejected("unverified_evidence") {
+            ReviewEvidenceAnalyzer().analyze(ReviewEvidenceRequest(listOf(group(fragment.copy(quote = "不存在的评价正文")))), observed)
+        }
+    }
+
+    @Test fun `unreferenced truncated nodes do not prevent analysis of intact fragments or verify independence`() {
+        val f = Fixture()
+        val body = f.ref(longReview)
+        val observed = f.observed().map { it.copy(nodes = it.nodes + ShoppingObservedNode("other", "omitted tail", truncated = true)) }
+        val result = ReviewEvidenceAnalyzer().analyze(ReviewEvidenceRequest(listOf(group(body))), observed)
+        assertEquals(1, result.sourceNodeSamples)
+        assertNull(result.independentReviewCount)
+        assertFalse(result.productBindingVerified)
+        assertTrue(result.repetitionIndicators.isEmpty())
+    }
+
     @Test fun `quote cannot span text and description or resolve ambiguous host ids`() {
         val evidence = listOf(ShoppingObservedEvidence("page", "shop", listOf(ShoppingObservedNode("n", "正文", "标签"))))
         val request = ReviewEvidenceRequest(listOf(group(ShoppingEvidenceRef("page", "n", "正文\n标签"))))

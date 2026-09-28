@@ -37,6 +37,7 @@ class PhoneControllerTest {
         var password = false
         var text = "Safe button"
         var extraNodes = emptyList<PhoneNode>()
+        var readOnlyContent: PhoneReadOnlyContent? = null
         var fingerprint = "page"
         var changes = true
         var accepts = true
@@ -67,6 +68,7 @@ class PhoneControllerTest {
                     PhoneNode("scroll", bounds = PhoneBounds(0, 100, 100, 500), scrollable = true)) + extraNodes,
                 truncated, sensitive, fingerprint, previewTruncated = previewTruncated,
                 inspectionIssues = inspectionIssues, scrollOnly = scrollOnly,
+                readOnlyContent = readOnlyContent,
             )
         }
         override suspend fun execute(permit: PhonePermit, observation: PhoneObservation?, action: PhoneAction): PhoneBackendResult {
@@ -86,6 +88,124 @@ class PhoneControllerTest {
         "PAGE_UNSTABLE" to "目标页面在有限次读取后仍不稳定，任务已暂停；请等待页面稳定后手动继续。",
         "INCOMPLETE_SCREEN" to "未能完整检查目标页面，任务已暂停；请检查页面后手动继续。",
     )
+
+    @Test fun `retained content exposes later text without refreshing snapshots or granting actions`() = runBlocking {
+        Fixture().use { f ->
+            val token = f.start()
+            f.backend.readOnlyContent = PhoneReadOnlyContent(listOf(PhoneReadOnlyContentNode("button", "Safe button")) +
+                List(120) { PhoneReadOnlyContentNode("r$it", "Visible product $it", "Price description $it") })
+            val screen = f.controller.observe(token)
+            assertNull(screen.readOnlyContent)
+            assertTrue(screen.readOnlyContentAvailable)
+            assertFalse(screen.readOnlyContentTruncated)
+            val all = mutableListOf<PhoneReadOnlyContentNode>()
+            var cursor: String? = "0"
+            while (cursor != null) {
+                val page = f.controller.readObservedContent(token, screen.id, cursor)
+                assertTrue(page.nodes.size <= 40)
+                assertTrue(page.nodes.sumOf { it.text.length + it.description.length } <= 8_000)
+                assertFalse(page.grantsActionPermission)
+                all += page.nodes
+                cursor = page.nextCursor
+            }
+            assertEquals(121, all.size)
+            assertEquals("Visible product 119", all.last().text)
+            assertEquals(1, all.count { it.id == "button" })
+            assertEquals(all.map { it.id }, f.controller.shoppingEvidence(token).single().nodes.map { it.nodeId })
+            assertEquals(1, f.backend.reads)
+            assertEquals(1, f.controller.state.value.observationsUsed)
+            assertEquals(0, f.controller.state.value.actionsUsed)
+            expectCode("UNKNOWN_NODE") { f.controller.act(token, screen.id, PhoneAction.Click("r119")) }
+            assertEquals(0, f.backend.actions)
+            f.time += 10_001
+            assertEquals(40, f.controller.readObservedContent(token, screen.id).nodes.size)
+            expectCode("STALE_SNAPSHOT") { f.controller.act(token, screen.id, PhoneAction.Click("button")) }
+        }
+    }
+
+    @Test fun `content pagination is bounded and rejects invalid cursor without device access`() = runBlocking {
+        Fixture().use { f ->
+            val token = f.start()
+            f.backend.readOnlyContent = PhoneReadOnlyContent(List(300) {
+                PhoneReadOnlyContentNode("r$it", "x".repeat(240), "y".repeat(240))
+            }, truncated = true)
+            val screen = f.controller.observe(token)
+            val page = f.controller.readObservedContent(token, screen.id)
+            assertEquals(16, page.nodes.size)
+            assertEquals("16", page.nextCursor)
+            assertTrue(page.contentTruncated)
+            assertTrue(screen.readOnlyContentTruncated)
+            assertTrue(f.controller.shoppingEvidence(token).single().nodes.sumOf { it.text.length + it.description.length } <= 64_000)
+            for (cursor in listOf("-1", "01", "", "1.0", "1000000", "9999")) {
+                expectCode("INVALID_CONTENT_CURSOR") { f.controller.readObservedContent(token, screen.id, cursor) }
+            }
+            assertEquals(1, f.backend.reads)
+            assertEquals(0, f.backend.actions)
+        }
+    }
+
+    @Test fun `partial pages cannot publish or reopen retained content`() = runBlocking {
+        Fixture().use { f ->
+            val token = f.start()
+            val complete = f.controller.observe(token)
+            f.backend.truncated = true
+            f.backend.scrollOnly = true
+            f.backend.inspectionIssues = listOf("unavailable_child")
+            f.backend.readOnlyContent = PhoneReadOnlyContent(listOf(PhoneReadOnlyContentNode("r0", "not evidence")))
+            val partial = f.controller.observe(token)
+            assertFalse(partial.readOnlyContentAvailable)
+            assertNull(partial.readOnlyContent)
+            expectCode("SCROLL_ONLY") { f.controller.readObservedContent(token, complete.id) }
+            expectCode("SCROLL_ONLY") { f.controller.readObservedContent(token, partial.id) }
+            assertEquals(listOf(complete.id), f.controller.shoppingEvidence(token).map { it.snapshotId })
+        }
+    }
+
+    @Test fun `content is revoked by hidden sensitive text pause stop and epoch replacement`() = runBlocking {
+        Fixture().use { f ->
+            val token = f.start()
+            val safe = f.controller.observe(token)
+            f.backend.readOnlyContent = PhoneReadOnlyContent(listOf(PhoneReadOnlyContentNode("r0", "京东验证")))
+            expectCode("USER_HANDOVER_REQUIRED") { f.controller.observe(token) }
+            expectCode("SESSION_INVALID") { f.controller.readObservedContent(token, safe.id) }
+            val resumed = f.controller.resume()
+            expectCode("CONTENT_UNAVAILABLE") { f.controller.readObservedContent(resumed, safe.id) }
+            expectCode("SESSION_INVALID") { f.controller.readObservedContent(token, safe.id) }
+            f.backend.readOnlyContent = null
+            val current = f.controller.observe(resumed)
+            f.controller.stop()
+            expectCode("SESSION_INVALID") { f.controller.readObservedContent(resumed, current.id) }
+        }
+    }
+
+    @Test fun `evicted content cannot be fetched through an old cursor`() = runBlocking {
+        Fixture().use { f ->
+            val token = f.start()
+            val first = f.controller.observe(token)
+            repeat(32) { f.controller.observe(token) }
+            expectCode("CONTENT_UNAVAILABLE") { f.controller.readObservedContent(token, first.id, "0") }
+            assertEquals(33, f.backend.reads)
+        }
+    }
+
+    @Test fun `field clipping follows evidence and page output without becoming an action`() = runBlocking {
+        Fixture().use { f ->
+            val token = f.start()
+            f.backend.readOnlyContent = PhoneReadOnlyContent(listOf(
+                PhoneReadOnlyContentNode("r0", "Price prefix", truncated = true),
+                PhoneReadOnlyContentNode("r1", "Complete visible text"),
+            ), truncated = true)
+            val screen = f.controller.observe(token)
+            val page = f.controller.readObservedContent(token, screen.id)
+            assertTrue(page.contentTruncated)
+            assertTrue(page.nodes.first().truncated)
+            assertFalse(page.nodes.last().truncated)
+            assertTrue(f.controller.shoppingEvidence(token).single().nodes.first().truncated)
+            assertFalse(f.controller.shoppingEvidence(token).single().nodes.last().truncated)
+            assertNull(screen.readOnlyContent)
+            assertEquals(0, f.backend.actions)
+        }
+    }
 
     @Test fun `scroll only observation strips product text and actions without adding shopping evidence`() = runBlocking {
         Fixture().use { f ->

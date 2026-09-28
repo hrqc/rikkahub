@@ -328,7 +328,12 @@ class PhoneChatCoordinator(
             if (currentTask !== task) return
             val session = controller.state.value
             if (session.token?.sessionId != task.token.sessionId) return
-            if (session.status in setOf(PhoneSessionStatus.PAUSED, PhoneSessionStatus.WAITING_FOR_FOREGROUND)) {
+            if (generation.isCancelled && session.status == PhoneSessionStatus.RUNNING) {
+                // join only waits; cancellation or failure is not a successful model completion.
+                controller.pauseIfCurrent(task.token,
+                    "模型执行已中断，手机动作结果可能未知；请先观察核对后再继续。")
+                mutableState.value = taskState(task, PhoneChatPhase.PAUSED, controller.state.value.detail)
+            } else if (session.status in setOf(PhoneSessionStatus.PAUSED, PhoneSessionStatus.WAITING_FOR_FOREGROUND)) {
                 mutableState.value = taskState(task, PhoneChatPhase.PAUSED, session.detail)
             } else {
                 controller.taskControls.unregister(task)

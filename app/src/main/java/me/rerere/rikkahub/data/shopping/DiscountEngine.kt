@@ -7,7 +7,8 @@ import java.util.Locale
 
 /** Supplied by the host from real observations in the current grant, never by tool arguments. */
 data class ShoppingObservedEvidence(val snapshotId: String, val packageName: String, val nodes: List<ShoppingObservedNode>)
-data class ShoppingObservedNode(val nodeId: String, val text: String, val description: String = "")
+/** Truncation is host metadata; model evidence arguments cannot override it. */
+data class ShoppingObservedNode(val nodeId: String, val text: String, val description: String = "", val truncated: Boolean = false)
 
 @Serializable
 data class ShoppingEvidenceRef(
@@ -163,6 +164,7 @@ data class ShoppingComparisonResult(
     val limitations: List<String> = listOf(
         "排序仅限本次已观察证据中商品身份、规格和数量相同的候选，不是全平台最低价。",
         "当前仅核对引用来自真实观察节点，尚未核证标题、规格、价格、店铺和优惠属于同一商品；候选ID或条数不能证明不同SKU，排序不是最终最优。",
+        "单个候选的商品身份、规格和单价必须来自同一快照；此约束只拦截跨快照拼接，不证明同页节点属于同一商品或SKU。",
         "跨快照相同标题和规格仅标记可能重复，可能是同一商品再次出现，也可能是不同店铺同款；不会自动合并或宣称已确认独立商品。",
         "可确认实付基于页面提取的已知价格、费用及已可用优惠；领取后方案仍须实际免费领取成功并在结算页复核。",
         "评分、评价数量和质量证据分别展示；评分高不等于质量最好，页面宣传不构成质量保证。",
@@ -264,6 +266,9 @@ class DiscountEngine(private val nowMillis: () -> Long = System::currentTimeMill
             checkInput(numberAppears(candidate.quantity.toString(), it.quote), "商品数量未在引用证据中出现。")
         }
         evidence.money(candidate.unitPrice)
+        if (coreRefs(candidate).map { it.snapshotId }.distinct().size != 1) throw ShoppingComparisonException(
+            "candidate_evidence_mismatch", "单个候选的商品身份、规格和单价必须引用同一快照，不能跨页拼接；请重新观察并在同一快照内补齐。不同候选可分别来自不同快照，同快照也不证明商品或SKU归属。",
+        )
         candidate.shipping?.let { evidence.money(it, allowFree = true) }
         candidate.otherFees?.let { evidence.money(it, allowFree = true) }
         checkInput(candidate.qualityEvidence.size <= 8 && candidate.unknowns.size <= 20 && candidate.unknowns.all { it.length <= 300 }, "候选证据或未知条件过长。")
@@ -281,7 +286,7 @@ class DiscountEngine(private val nowMillis: () -> Long = System::currentTimeMill
                 checkInput(numberAppears(rating.reviewCount.toString(), rating.reviewCountEvidence.quote), "仅接受页面明确评价数量，不把模糊销量或万+转换成精确评价数。")
             }
         }
-        val refs = listOf(candidate.productIdentity.evidence, candidate.specification.evidence, candidate.unitPrice.evidence) +
+        val refs = coreRefs(candidate) +
             listOfNotNull(candidate.quantityEvidence, candidate.shipping?.evidence, candidate.otherFees?.evidence, candidate.rating?.evidence, candidate.rating?.reviewCountEvidence) +
             candidate.qualityEvidence.map { it.evidence }
         checkInput(refs.map(evidence::source).distinct().size == 1, "单个候选必须来自同一应用，不能拼接不同店铺页面的价格。")
@@ -362,6 +367,9 @@ class DiscountEngine(private val nowMillis: () -> Long = System::currentTimeMill
             if (snapshot == null || node == null || !(node.text + "\n" + node.description).contains(ref.quote)) {
                 throw ShoppingComparisonException("unverified_evidence", "证据未命中本次授权的真实观察，请重新观察并引用原始节点，不得自报已核验。")
             }
+            if (node.truncated) throw ShoppingComparisonException(
+                "incomplete_evidence", "所引用节点正文已被截断，可能缺少价格、规格或优惠限制，不能用于正式比较；请取得完整节点证据，缩短quote不能消除宿主截断状态。",
+            )
             return snapshot.packageName
         }
         fun fact(fact: ShoppingFact) {

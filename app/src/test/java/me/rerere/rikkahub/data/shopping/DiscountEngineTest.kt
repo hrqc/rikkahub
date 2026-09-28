@@ -70,6 +70,80 @@ class DiscountEngineTest {
         }
     }
 
+    @Test fun `candidate core facts cannot splice valid same-app evidence across snapshots`() {
+        val f = Fixture()
+        val original = f.candidate()
+        val nextPage = "next-page"
+        val observed = f.observed() + f.observed().single().copy(snapshotId = nextPage)
+        val mismatched = listOf(
+            original.copy(productIdentity = original.productIdentity.copy(
+                evidence = original.productIdentity.evidence.copy(snapshotId = nextPage),
+            )),
+            original.copy(specification = original.specification.copy(
+                evidence = original.specification.evidence.copy(snapshotId = nextPage),
+            )),
+            original.copy(unitPrice = original.unitPrice.copy(
+                evidence = original.unitPrice.evidence.copy(snapshotId = nextPage),
+            )),
+        )
+        mismatched.forEach { candidate ->
+            val error = runCatching {
+                DiscountEngine { 1_000 }.compare(ShoppingComparisonRequest(candidates = listOf(candidate)), observed)
+            }.exceptionOrNull()
+            assertTrue(error is ShoppingComparisonException)
+            assertEquals("candidate_evidence_mismatch", (error as ShoppingComparisonException).code)
+        }
+    }
+
+    @Test fun `three candidates on separate snapshots remain eligible for a limited price prefilter`() {
+        val f = Fixture()
+        val originals = listOf(f.candidate("expensive", "29.90"), f.candidate("cheap", "9.90"), f.candidate("middle", "19.90"))
+        val candidates = originals.mapIndexed { index, candidate ->
+            val snapshot = "page-$index"
+            candidate.copy(
+                productIdentity = candidate.productIdentity.copy(evidence = candidate.productIdentity.evidence.copy(snapshotId = snapshot)),
+                specification = candidate.specification.copy(evidence = candidate.specification.evidence.copy(snapshotId = snapshot)),
+                unitPrice = candidate.unitPrice.copy(evidence = candidate.unitPrice.evidence.copy(snapshotId = snapshot)),
+                quantityEvidence = null, shipping = null, otherFees = null, priceBeforeListedCoupons = false,
+            )
+        }
+        val observed = candidates.map { candidate ->
+            val ids = setOf(candidate.productIdentity.evidence.nodeId, candidate.specification.evidence.nodeId, candidate.unitPrice.evidence.nodeId)
+            ShoppingObservedEvidence(candidate.productIdentity.evidence.snapshotId, "shop", f.observed().single().nodes.filter { it.nodeId in ids })
+        }
+        val result = DiscountEngine { 1_000 }.compare(ShoppingComparisonRequest(candidates = candidates), observed)
+        val group = result.groups.single()
+        assertEquals(listOf("cheap", "middle", "expensive"), group.displayedSubtotalPrefilter.rankedCandidates.map { it.id })
+        assertEquals(listOf(990L, 1990L, 2990L), group.displayedSubtotalPrefilter.rankedCandidates.map { it.merchandiseSubtotalCents })
+        assertEquals(ShoppingRankingBasis.DISPLAYED_SUBTOTAL, group.rankingBasis)
+        assertTrue(group.lowestConfirmedCandidateIds.isEmpty())
+        assertFalse(group.displayedSubtotalPrefilter.isPayable)
+        assertFalse(group.displayedSubtotalPrefilter.isFinalBest)
+        assertFalse(result.productBindingVerified)
+        assertEquals(candidates.map { it.id }, result.possibleDuplicateCandidateIds)
+        assertTrue(result.limitations.any { "不证明同页节点属于同一商品或SKU" in it })
+    }
+
+    @Test fun `duplicate evidence remains rejected among otherwise valid cross-page candidates`() {
+        val f = Fixture()
+        val first = f.candidate("first")
+        val nextPage = first.copy(
+            id = "next",
+            productIdentity = first.productIdentity.copy(evidence = first.productIdentity.evidence.copy(snapshotId = "next-page")),
+            specification = first.specification.copy(evidence = first.specification.evidence.copy(snapshotId = "next-page")),
+            unitPrice = first.unitPrice.copy(evidence = first.unitPrice.evidence.copy(snapshotId = "next-page")),
+        )
+        val renamed = nextPage.copy(id = "renamed", unitPrice = nextPage.unitPrice.copy(
+            evidence = nextPage.unitPrice.evidence.copy(quote = "100.00"),
+        ))
+        val error = runCatching {
+            DiscountEngine { 1_000 }.compare(ShoppingComparisonRequest(candidates = listOf(first, nextPage, renamed)),
+                f.observed() + f.observed().single().copy(snapshotId = "next-page"))
+        }.exceptionOrNull()
+        assertTrue(error is ShoppingComparisonException)
+        assertEquals("duplicate_candidate_evidence", (error as ShoppingComparisonException).code)
+    }
+
     @Test fun `cross snapshot normalized identity and specification only warn without merging or verifying sku binding`() {
         val f = Fixture()
         val first = f.candidate("first", "90.00")
@@ -273,6 +347,59 @@ class DiscountEngineTest {
         val group = f.compare(candidates, listOf(coupon)).groups.single()
         assertEquals(listOf("a"), group.lowestConfirmedCandidateIds)
         assertFalse(group.rankedCandidates.single { it.id == "b" }.couponDecisions.single().included)
+    }
+
+    @Test fun `truncated candidate facts and fee nodes reject even a matching shorter quote`() {
+        val f = Fixture()
+        val candidate = f.candidate()
+        val refs = listOf(candidate.productIdentity.evidence, candidate.specification.evidence, candidate.unitPrice.evidence,
+            candidate.shipping!!.evidence, candidate.otherFees!!.evidence)
+        refs.forEach { ref ->
+            val observed = f.observed().map { page -> page.copy(nodes = page.nodes.map { node ->
+                node.copy(truncated = node.nodeId == ref.nodeId)
+            }) }
+            val shortened = candidate.copy(unitPrice = candidate.unitPrice.copy(evidence = candidate.unitPrice.evidence.copy(quote = "100.00")))
+            val error = runCatching {
+                DiscountEngine { 1_000 }.compare(ShoppingComparisonRequest(candidates = listOf(shortened)), observed)
+            }.exceptionOrNull()
+            assertTrue(error is ShoppingComparisonException)
+            assertEquals("incomplete_evidence", (error as ShoppingComparisonException).code)
+        }
+    }
+
+    @Test fun `clipped price or coupon text cannot hide conditions beyond the retained prefix`() {
+        val f = Fixture()
+        val price = f.ref("¥100.00".padEnd(240, ' ') + "券后价")
+        val candidate = f.candidate().copy(unitPrice = ShoppingMoney("100.00", price.copy(quote = "100.00")))
+        assertNull(f.compare(listOf(candidate)).groups.single().rankedCandidates.single().confirmedPlan)
+        val acquisition = f.ref("已领取可用".padEnd(240, ' ') + "仅会员使用")
+        val coupon = f.coupon().copy(acquisitionEvidence = acquisition.copy(quote = "已领取可用"))
+        assertFalse(f.compare(listOf(candidate), listOf(coupon)).groups.single().rankedCandidates.single().couponDecisions.single().included)
+
+        listOf(price, acquisition).forEach { clipped ->
+            val observed = f.observed().map { page -> page.copy(nodes = page.nodes.map { node ->
+                if (node.nodeId == clipped.nodeId) node.copy(text = node.text.take(240), truncated = true) else node
+            }) }
+            val error = runCatching {
+                DiscountEngine { 1_000 }.compare(ShoppingComparisonRequest(candidates = listOf(candidate), coupons = listOf(coupon)), observed)
+            }.exceptionOrNull()
+            assertTrue(error is ShoppingComparisonException)
+            assertEquals("incomplete_evidence", (error as ShoppingComparisonException).code)
+        }
+    }
+
+    @Test fun `unreferenced truncated nodes do not poison complete evidence and fabricated quotes remain unverified`() {
+        val f = Fixture()
+        val candidate = f.candidate()
+        val observed = f.observed().map { it.copy(nodes = it.nodes + ShoppingObservedNode("r-truncated", "unrelated", truncated = true)) }
+        val result = DiscountEngine { 1_000 }.compare(ShoppingComparisonRequest(candidates = listOf(candidate)), observed)
+        assertEquals(10500L, result.groups.single().rankedCandidates.single().confirmedPlan!!.payableCents)
+        assertFalse(result.productBindingVerified)
+        val fake = candidate.copy(unitPrice = ShoppingMoney("1.00", ShoppingEvidenceRef("snapshot-shop", "r-truncated", "¥1.00")))
+        val error = runCatching {
+            DiscountEngine { 1_000 }.compare(ShoppingComparisonRequest(candidates = listOf(fake)), observed)
+        }.exceptionOrNull() as ShoppingComparisonException
+        assertEquals("unverified_evidence", error.code)
     }
 
     @Test fun `missing fabricated or revoked source evidence cannot be marked verified`() {

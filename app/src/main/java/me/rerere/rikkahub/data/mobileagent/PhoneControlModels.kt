@@ -2,6 +2,7 @@ package me.rerere.rikkahub.data.mobileagent
 
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.serialization.Serializable
+import kotlinx.serialization.Transient
 
 data class PhoneSessionToken(
     val conversationId: String,
@@ -74,6 +75,24 @@ data class PhoneNode(
     val requiresUserConfirmation: Boolean = false,
 )
 
+/** Evidence only. An r* ID never has an action handle, bounds or input capability. */
+@Serializable
+data class PhoneReadOnlyContentNode(
+    val id: String,
+    val text: String = "",
+    val description: String = "",
+    /** A clipped field cannot establish that no additional product/price condition was present. */
+    val truncated: Boolean = false,
+)
+
+/** n* preview text first, followed by an r* prefix: this is pagination order, not UI spatial order. */
+@Serializable
+data class PhoneReadOnlyContent(
+    val nodes: List<PhoneReadOnlyContentNode>,
+    /** Content/field clipping only; this does not denote an incomplete safety inspection. */
+    val truncated: Boolean = false,
+)
+
 @Serializable
 data class PhoneObservation(
     val id: String,
@@ -89,7 +108,16 @@ data class PhoneObservation(
     val inspectionIssues: List<String> = emptyList(),
     /** Incomplete inspection; only the advertised native list scrolling capability is available. */
     val scrollOnly: Boolean = false,
+    val readOnlyContentAvailable: Boolean = false,
+    val readOnlyContentTruncated: Boolean = false,
+    /** Host-only transfer to the controller; never included in observe/action JSON. */
+    @Transient val readOnlyContent: PhoneReadOnlyContent? = null,
 )
+
+/** Read-only evidence annotations cannot change action snapshot identity or create capabilities. */
+internal fun PhoneObservation.withoutReadOnlyContentMetadata(): PhoneObservation =
+    if (readOnlyContent == null && !readOnlyContentAvailable && !readOnlyContentTruncated) this
+    else copy(readOnlyContent = null, readOnlyContentAvailable = false, readOnlyContentTruncated = false)
 
 enum class PhoneSwipeDirection { UP, DOWN, LEFT, RIGHT }
 
