@@ -1,6 +1,7 @@
 package me.rerere.rikkahub.data.ai.tools
 
 import kotlinx.coroutines.CancellationException
+import kotlinx.coroutines.currentCoroutineContext
 import kotlinx.serialization.encodeToString
 import kotlinx.serialization.json.Json
 import kotlinx.serialization.json.JsonArray
@@ -14,6 +15,8 @@ import me.rerere.ai.core.InputSchema
 import me.rerere.ai.core.Tool
 import me.rerere.ai.ui.UIMessagePart
 import me.rerere.rikkahub.data.mobileagent.PhoneAction
+import me.rerere.rikkahub.data.mobileagent.PhoneActionReceiptContext
+import me.rerere.rikkahub.data.mobileagent.phoneActionReceiptOperation
 import me.rerere.rikkahub.data.mobileagent.PhoneControlException
 import me.rerere.rikkahub.data.mobileagent.PhoneController
 import me.rerere.rikkahub.data.mobileagent.PhoneSessionToken
@@ -62,6 +65,9 @@ fun createPhoneTools(
     json: Json,
 ): List<Tool> {
     val prefix = phoneToolPrefix(token)
+    suspend fun knownActionResult(operation: String): List<UIMessagePart>? =
+        currentCoroutineContext()[PhoneActionReceiptContext]?.forTool(token, prefix + operation)?.knownResult()?.output()
+
     fun tool(
         operation: String,
         description: String,
@@ -96,21 +102,25 @@ fun createPhoneTools(
             } catch (error: CancellationException) {
                 throw error
             } catch (error: PhoneControlException) {
-                listOf(UIMessagePart.Text(buildJsonObject {
+                knownActionResult(operation) ?: listOf(UIMessagePart.Text(buildJsonObject {
                     put("accepted", false)
                     put("code", error.code)
                     put("detail", error.message ?: "手机控制操作已拒绝")
                 }.toString()))
             } catch (_: Exception) {
                 // Platform/parser failures must not echo an input value into logs or tool errors.
-                listOf(UIMessagePart.Text("""{"accepted":false,"code":"phone_operation_failed","detail":"手机控制操作失败，请检查设备状态后重新观察"}"""))
+                knownActionResult(operation) ?: listOf(UIMessagePart.Text("""{"accepted":false,"code":"phone_operation_failed","detail":"手机控制操作失败，请检查设备状态后重新观察"}"""))
             }
         },
     )
 
     suspend fun act(arguments: JsonObject, action: PhoneAction): List<UIMessagePart> {
         val snapshotId = if (action == PhoneAction.OpenApp) null else arguments.requiredString("snapshot_id")
-        val result = controller.act(token, snapshotId, action)
+        val receipt = phoneActionReceiptOperation(action)?.let { operation ->
+            currentCoroutineContext()[PhoneActionReceiptContext]?.forTool(token, prefix + operation)
+        }
+        val result = controller.act(token, snapshotId, action, receipt)
+        receipt?.knownResult()?.takeIf { it.postObserveError != null }?.let { return it.output() }
         return buildList {
             add(UIMessagePart.Text(json.encodeToString(result.copy(screenshotUri = null))))
             result.screenshotUri?.let { add(UIMessagePart.Image(it)) }

@@ -267,7 +267,33 @@ class PhoneController(
         guarded(token) { capture(token) }
     }
 
-    suspend fun act(token: PhoneSessionToken, snapshotId: String?, action: PhoneAction): PhoneActionResult = operations.withLock {
+    suspend fun act(token: PhoneSessionToken, snapshotId: String?, action: PhoneAction): PhoneActionResult =
+        act(token, snapshotId, action, null)
+
+    internal suspend fun act(
+        token: PhoneSessionToken,
+        snapshotId: String?,
+        action: PhoneAction,
+        recorder: PhoneActionReceiptRecorder?,
+    ): PhoneActionResult {
+        val receipt = recorder?.forAction(token, action)
+        try {
+            return actWithReceipt(token, snapshotId, action, receipt)
+        } catch (error: CancellationException) {
+            receipt?.postObserveFailed("CANCELLED")
+            throw error
+        } catch (error: PhoneControlException) {
+            receipt?.postObserveFailed(error.code)
+            throw error
+        }
+    }
+
+    private suspend fun actWithReceipt(
+        token: PhoneSessionToken,
+        snapshotId: String?,
+        action: PhoneAction,
+        receipt: PhoneActionReceiptRecorder?,
+    ): PhoneActionResult = operations.withLock {
         guarded(token) {
             authorize(token)
             val before = if (action == PhoneAction.OpenApp) null else requireObservation(token, snapshotId)
@@ -306,6 +332,8 @@ class PhoneController(
                     activity = PhoneActivity.ACTING, activityStartedAtMillis = now())
             }
             val result = backend.execute(permit(token), before, action)
+            // Metadata only, before authorization checks or suspension can lose the returned result.
+            receipt?.backendResult(result.accepted)
             authorize(token)
             if (!result.accepted) {
                 record(token, action, "平台未接受动作")
@@ -320,6 +348,7 @@ class PhoneController(
                 capture(token)
             } catch (error: PhoneControlException) {
                 // The action may already have happened; never report task success without observation.
+                receipt?.postObserveFailed(error.code)
                 pauseForSafetyFailure(token, error)
                 if (state.value.token?.sessionId != token.sessionId) throw error
                 return@guarded PhoneActionResult(true, detail = "动作已提交，但未能验证后续页面；请检查并重新观察")
@@ -328,6 +357,7 @@ class PhoneController(
             val key = actionKey(action, before)
             synchronized(gate) {
                 authorize(token)
+                if (!after.truncated && !after.scrollOnly) receipt?.observed(changed)
                 if (!changed && lastUnchangedAction == key) unchangedActions++ else unchangedActions = if (changed) 0 else 1
                 lastUnchangedAction = if (changed) null else key
                 record(token, action, if (changed) "页面已变化" else "页面未确认变化")

@@ -1,17 +1,116 @@
 package me.rerere.rikkahub.data.mobileagent
 
 import kotlinx.coroutines.CompletableDeferred
+import kotlinx.coroutines.CancellationException
+import kotlinx.coroutines.CoroutineStart
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.async
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.MutableStateFlow
+import kotlinx.coroutines.flow.first
+import kotlinx.coroutines.launch
 import kotlinx.coroutines.runBlocking
+import me.rerere.rikkahub.data.ai.tools.phoneToolPrefix
 import org.junit.Assert.*
 import org.junit.Test
 
 class PhoneControllerTest {
+    @Test fun `limited post action observation cannot mark a receipt as fully verified`() = runBlocking {
+        Fixture().use { f ->
+            val token = f.start()
+            val screen = f.controller.observe(token)
+            val ledger = PhoneActionReceiptLedger(token)
+            val name = phoneToolPrefix(token) + "click"
+            val recorder = ledger.beginCall("message", "call", name)!!.forTool(token, name)!!
+            f.backend.afterDispatch = {
+                f.backend.truncated = true
+                f.backend.scrollOnly = true
+                f.backend.inspectionIssues = listOf("unavailable_child")
+            }
+            val result = f.controller.act(token, screen.id, PhoneAction.Click("button"), recorder)
+            assertTrue(result.accepted)
+            assertTrue(result.observation!!.scrollOnly)
+            assertTrue(recorder.knownResult()!!.accepted)
+            assertFalse(recorder.knownResult()!!.observationVerified)
+            assertNull(recorder.knownResult()!!.screenChanged)
+            assertEquals(1, f.backend.actions)
+        }
+    }
+
+    @Test fun `accepted receipt survives synchronous cancellation on post observation pause`() = runBlocking {
+        for (sensitive in listOf(false, true)) Fixture().use { f ->
+            val token = f.start()
+            val screen = f.controller.observe(token)
+            val ledger = PhoneActionReceiptLedger(token)
+            val key = PhoneActionReceiptKey("message", "call", phoneToolPrefix(token) + "click")
+            val recorder = ledger.beginCall(key.messageId, key.toolCallId, key.toolName)!!.forTool(token, key.toolName)!!
+            f.backend.beforeRead = {
+                if (sensitive) { f.backend.sensitive = true; f.backend.text = "private page body" }
+                else throw PhoneControlException("PAGE_UNSTABLE", "fixed test error")
+            }
+            val action = async(start = CoroutineStart.LAZY) {
+                f.controller.act(token, screen.id, PhoneAction.Click("button"), recorder)
+            }
+            val cancellation = launch(Dispatchers.Unconfined) {
+                f.controller.state.first { it.status == PhoneSessionStatus.PAUSED }
+                action.cancel()
+            }
+            try { action.await(); fail("Pause must cancel the model job") } catch (_: CancellationException) { }
+            cancellation.join()
+            val receipt = ledger.freeze().find(token, key)!!
+            assertTrue(receipt.accepted)
+            assertFalse(receipt.observationVerified)
+            assertNull(receipt.screenChanged)
+            if (!sensitive) assertEquals("PAGE_UNSTABLE", receipt.postObserveError)
+            assertFalse(receipt.output().toString().contains("private page body"))
+            assertEquals(1, f.backend.actions)
+            assertNull(f.controller.activeToken("chat", "assistant"))
+        }
+    }
+
+    @Test fun `receipt distinguishes platform rejection from validation before dispatch`() = runBlocking {
+        Fixture().use { f ->
+            val token = f.start()
+            val screen = f.controller.observe(token)
+            val ledger = PhoneActionReceiptLedger(token)
+            val name = phoneToolPrefix(token) + "click"
+            val blocked = ledger.beginCall("message", "blocked", name)!!.forTool(token, name)!!
+            expectCode("UNKNOWN_NODE") { f.controller.act(token, screen.id, PhoneAction.Click("absent"), blocked) }
+            assertNull(blocked.knownResult())
+            assertEquals(0, f.backend.actions)
+            f.backend.accepts = false
+            val rejected = ledger.beginCall("message", "rejected", name)!!.forTool(token, name)!!
+            assertFalse(f.controller.act(token, screen.id, PhoneAction.Click("button"), rejected).accepted)
+            assertFalse(rejected.knownResult()!!.accepted)
+            assertNull(rejected.knownResult()!!.screenChanged)
+            assertEquals(1, f.backend.actions)
+        }
+    }
+
+    @Test fun `old receipt cannot bind a new grant action and stop does not erase returned acceptance`() = runBlocking {
+        Fixture().use { f ->
+            val old = f.start()
+            val ledger = PhoneActionReceiptLedger(old)
+            val name = phoneToolPrefix(old) + "click"
+            val recorder = ledger.beginCall("message", "call", name)!!.forTool(old, name)!!
+            val screen = f.controller.observe(old)
+            var replacement: PhoneSessionToken? = null
+            f.backend.afterDispatch = { f.controller.stop(); replacement = f.start() }
+            expectCode("SESSION_INVALID") { f.controller.act(old, screen.id, PhoneAction.Click("button"), recorder) }
+            assertTrue(recorder.knownResult()!!.accepted)
+            assertFalse(recorder.knownResult()!!.observationVerified)
+            assertEquals(replacement, f.controller.activeToken("chat", "assistant"))
+            f.backend.afterDispatch = {}
+            val fresh = replacement!!
+            f.controller.act(fresh, f.controller.observe(fresh).id, PhoneAction.Click("button"), recorder)
+            assertFalse(recorder.knownResult()!!.observationVerified)
+            assertEquals(2, f.backend.actions)
+            assertEquals(fresh, f.controller.activeToken("chat", "assistant"))
+        }
+    }
+
     private class Fixture(foregroundGraceMillis: Long = 750) : AutoCloseable {
         var time = 1_000L
         val backend = FakeBackend { time }
@@ -48,6 +147,7 @@ class PhoneControllerTest {
         var lastReadPermit: PhonePermit? = null
         var onStop: ((PhoneBackendStopReason) -> Unit)? = null
         var beforeDispatch: suspend (PhonePermit) -> Unit = {}
+        var afterDispatch: () -> Unit = {}
         var beforeRead: suspend () -> Unit = {}
         override fun isTargetAllowed(packageName: String) = packageName == "com.example.target"
         override fun showSessionNotice(token: PhoneSessionToken, targetPackage: String, onStop: (PhoneBackendStopReason) -> Unit): Boolean {
@@ -76,6 +176,7 @@ class PhoneControllerTest {
             if (!permit.isValid()) return PhoneBackendResult(false, "revoked")
             actions++
             if (changes) fingerprint = "changed$actions"
+            afterDispatch()
             return PhoneBackendResult(accepts, "platform result", if (action == PhoneAction.Screenshot) "content://test/window" else null)
         }
     }

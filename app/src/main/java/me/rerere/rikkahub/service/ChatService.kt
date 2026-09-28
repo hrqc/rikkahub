@@ -79,6 +79,9 @@ import me.rerere.rikkahub.data.files.FilesManager
 import me.rerere.rikkahub.data.model.Conversation
 import me.rerere.rikkahub.data.model.Assistant
 import me.rerere.rikkahub.data.mobileagent.PhoneController
+import me.rerere.rikkahub.data.mobileagent.PhoneActionReceiptBatch
+import me.rerere.rikkahub.data.mobileagent.PhoneActionReceiptKey
+import me.rerere.rikkahub.data.mobileagent.PhoneActionReceiptLedger
 import me.rerere.rikkahub.data.mobileagent.PhoneIntentBinding
 import me.rerere.rikkahub.data.mobileagent.PhoneIntentStore
 import me.rerere.rikkahub.data.mobileagent.PhoneSessionToken
@@ -108,15 +111,26 @@ internal fun isRevokedPhoneGeneration(run: PhoneSessionToken, state: PhoneSessio
         run.sessionId == state.sessionId && run.epoch < state.epoch
 
 /** Finalize only this grant's unresolved calls; an emitted call does not prove dispatch occurred. */
-internal fun finishUnresolvedPhoneTools(conversation: Conversation, token: PhoneSessionToken): Conversation {
+internal fun finishUnresolvedPhoneTools(
+    conversation: Conversation,
+    token: PhoneSessionToken,
+    receipts: PhoneActionReceiptBatch? = null,
+): Conversation {
     if (conversation.id.toString() != token.conversationId || conversation.assistantId.toString() != token.assistantId) {
         return conversation
     }
     val prefix = phoneToolPrefix(token)
+    val keyCounts = conversation.currentMessages.flatMap { message ->
+        message.getTools().map { PhoneActionReceiptKey(message.id.toString(), it.toolCallId, it.toolName) }
+    }.groupingBy { it }.eachCount()
     val nodes = conversation.messageNodes.map { node ->
         val current = node.currentMessage
         val finished = current.finishPendingTools { tool ->
-            if (tool.toolName.startsWith(prefix)) interruptedToolResult(tool) else tool
+            if (!tool.toolName.startsWith(prefix)) tool else {
+                val key = PhoneActionReceiptKey(current.id.toString(), tool.toolCallId, tool.toolName)
+                val receipt = if (keyCounts[key] == 1) receipts?.find(token, key) else null
+                receipt?.let { tool.copy(output = it.output()) } ?: interruptedToolResult(tool)
+            }
         }
         if (finished == current) node else node.copy(messages = node.messages.map { message ->
             if (message.id == current.id) finished else message
@@ -781,6 +795,8 @@ class ChatService(
             ?: throw IllegalStateException("No chat model selected")
         val generationPhoneToken = expectedPhoneToken
         val modelProgressTimeoutMillis = generationPhoneToken?.let { PHONE_MODEL_PROGRESS_TIMEOUT_MILLIS }
+        val actionReceipts = generationPhoneToken?.let(::PhoneActionReceiptLedger)
+        currentCoroutineContext()[Job]?.invokeOnCompletion { actionReceipts?.clear() }
         if (generationPhoneToken != null) {
             if (generationPhoneToken.conversationId != conversationId.toString() ||
                 generationPhoneToken.assistantId != assistant.id.toString() || phoneIntentBinding != null ||
@@ -898,12 +914,16 @@ class ChatService(
                 outputTransformers = outputTransformers,
                 tools = tools,
                 modelProgressTimeoutMillis = modelProgressTimeoutMillis,
+                phoneToolExecutionContext = actionReceipts?.let { ledger ->
+                    { messageId, callId, toolName -> ledger.beginCall(messageId, callId, toolName) }
+                },
             ).onCompletion {
+                val receipts = actionReceipts?.freeze()
                 // 可能被取消了，或者意外结束，兜底更新
                 val updatedConversation = session.finishGeneration { conversation ->
                     // finishGeneration saves under NonCancellable, including cancelled streams.
                     // Also reject an apparently normal completion that left only tool arguments.
-                    val finished = generationPhoneToken?.let { finishUnresolvedPhoneTools(conversation, it) }
+                    val finished = generationPhoneToken?.let { finishUnresolvedPhoneTools(conversation, it, receipts) }
                         ?: conversation
                     unresolvedPhoneTools = finished != conversation
                     saveConversation(conversationId, finished)

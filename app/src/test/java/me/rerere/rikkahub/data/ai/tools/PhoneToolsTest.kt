@@ -6,6 +6,7 @@ import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.runBlocking
+import kotlinx.coroutines.withContext
 import kotlinx.serialization.json.Json
 import kotlinx.serialization.json.JsonObject
 import kotlinx.serialization.json.buildJsonObject
@@ -17,6 +18,8 @@ import me.rerere.ai.core.Tool
 import me.rerere.ai.provider.Model
 import me.rerere.ai.ui.UIMessagePart
 import me.rerere.rikkahub.data.mobileagent.PhoneAction
+import me.rerere.rikkahub.data.mobileagent.PhoneActionReceiptKey
+import me.rerere.rikkahub.data.mobileagent.PhoneActionReceiptLedger
 import me.rerere.rikkahub.data.mobileagent.PhoneBackend
 import me.rerere.rikkahub.data.mobileagent.PhoneBackendResult
 import me.rerere.rikkahub.data.mobileagent.PhoneBackendState
@@ -33,6 +36,68 @@ import org.junit.Test
 
 class PhoneToolsTest {
     private val empty = JsonObject(emptyMap())
+
+    @Test fun `stop after acceptance returns receipt instead of false and leaves replacement grant active`() = runBlocking {
+        val backend = FakeBackend()
+        val controller = controller(backend)
+        try {
+            val token = controller.start("conversation", "assistant", "target")
+            val tool = createPhoneTools(controller, token, Json).first { it.name.endsWith("_open_app") }
+            val ledger = PhoneActionReceiptLedger(token)
+            val context = ledger.beginCall("message", "call", tool.name)!!
+            var replacement: PhoneSessionToken? = null
+            backend.afterDispatch = {
+                controller.stop()
+                replacement = controller.start("conversation", "assistant", "target")
+            }
+            val output = withContext(context) { tool.execute(empty) }
+            val result = Json.parseToJsonElement((output.single() as UIMessagePart.Text).text).jsonObject
+            assertEquals("true", result["accepted"]?.jsonPrimitive?.content)
+            assertEquals("accepted_unverified", result["execution_outcome"]?.jsonPrimitive?.content)
+            assertFalse(result.containsKey("screenChanged"))
+            assertEquals(replacement, controller.activeToken("conversation", "assistant"))
+            assertEquals(1, backend.actions)
+            assertEquals(0, backend.observations)
+        } finally { controller.close() }
+    }
+
+    @Test fun `cancellation after dispatch propagates and finalizer can recover only exact receipt`() = runBlocking {
+        val backend = FakeBackend()
+        val controller = controller(backend)
+        try {
+            val token = controller.start("conversation", "assistant", "target")
+            val tool = createPhoneTools(controller, token, Json).first { it.name.endsWith("_open_app") }
+            val ledger = PhoneActionReceiptLedger(token)
+            val context = ledger.beginCall("message", "call", tool.name)!!
+            backend.afterDispatch = { backend.cancelObservation = true }
+            var cancelled = false
+            try { withContext(context) { tool.execute(empty) } } catch (_: CancellationException) { cancelled = true }
+            assertTrue(cancelled)
+            val receipt = ledger.freeze().find(token, PhoneActionReceiptKey("message", "call", tool.name))!!
+            assertTrue(receipt.accepted)
+            assertEquals("CANCELLED", receipt.postObserveError)
+            assertFalse(receipt.observationVerified)
+            assertEquals(1, backend.actions)
+        } finally { controller.close() }
+    }
+
+    @Test fun `post observe failure without cancellation returns accepted unknown change metadata`() = runBlocking {
+        val backend = FakeBackend()
+        val controller = controller(backend)
+        try {
+            val token = controller.start("conversation", "assistant", "target")
+            val tool = createPhoneTools(controller, token, Json).first { it.name.endsWith("_open_app") }
+            val ledger = PhoneActionReceiptLedger(token)
+            val context = ledger.beginCall("message", "call", tool.name)!!
+            backend.afterDispatch = { backend.failObservation = true }
+            val output = withContext(context) { tool.execute(empty) }
+            val result = Json.parseToJsonElement((output.single() as UIMessagePart.Text).text).jsonObject
+            assertEquals("true", result["accepted"]?.jsonPrimitive?.content)
+            assertEquals("PAGE_UNSTABLE", result["post_observe_error"]?.jsonPrimitive?.content)
+            assertFalse(result.containsKey("screenChanged"))
+            assertEquals(1, backend.actions)
+        } finally { controller.close() }
+    }
 
     @Test
     fun `content tool reads retained page only and expires with its grant`() = runBlocking {
@@ -276,6 +341,8 @@ class PhoneToolsTest {
         var observations = 0
         var actions = 0
         var cancelObservation = false
+        var failObservation = false
+        var afterDispatch: () -> Unit = {}
         override fun isTargetAllowed(packageName: String) = packageName == "target"
         override fun showSessionNotice(token: PhoneSessionToken, targetPackage: String, onStop: (PhoneBackendStopReason) -> Unit) = true
         override fun endSessionNotice() = Unit
@@ -283,11 +350,13 @@ class PhoneToolsTest {
             check(permit.isValid())
             observations++
             if (cancelObservation) throw CancellationException()
+            if (failObservation) throw me.rerere.rikkahub.data.mobileagent.PhoneControlException("PAGE_UNSTABLE", "fixed test failure")
             return PhoneObservation("snapshot", "target", 1, 1, 1_000L, emptyList(), false, false, "fingerprint")
         }
         override suspend fun execute(permit: PhonePermit, observation: PhoneObservation?, action: PhoneAction): PhoneBackendResult {
             check(permit.isValid())
             actions++
+            afterDispatch()
             return PhoneBackendResult(true, "accepted", if (action == PhoneAction.Screenshot) "file:///private/screen.png" else null)
         }
         override fun invalidate() = Unit

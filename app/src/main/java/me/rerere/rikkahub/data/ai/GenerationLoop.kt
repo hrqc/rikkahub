@@ -7,6 +7,7 @@ import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.currentCoroutineContext
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.ensureActive
+import kotlinx.coroutines.withContext
 import kotlinx.coroutines.flow.Flow
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.flow
@@ -53,6 +54,7 @@ import java.net.NoRouteToHostException
 import java.net.SocketTimeoutException
 import java.net.UnknownHostException
 import kotlin.time.Clock
+import kotlin.coroutines.CoroutineContext
 import kotlin.uuid.Uuid
 
 private const val TAG = "GenerationHandler"
@@ -92,6 +94,7 @@ class GenerationLoop(
         conversationLorebookIds: Set<Uuid> = emptySet(),
         workspaceCwd: String? = null,
         modelProgressTimeoutMillis: Long? = null,
+        phoneToolExecutionContext: ((messageId: String, callId: String, toolName: String) -> CoroutineContext?)? = null,
     ): Flow<GenerationChunk> = flow {
         val provider = model.findProvider(settings.providers) ?: error("Provider not found")
         val providerImpl = providerManager.getProviderByType(provider)
@@ -304,7 +307,11 @@ class GenerationLoop(
                                 error("Invalid tool arguments JSON")
                             }
                             Log.i(TAG, "generateText: executing tool")
-                            val result = availableTool.execute(args)
+                            val phoneContext = phoneToolExecutionContext?.invoke(
+                                messages.last().id.toString(), tool.toolCallId, tool.toolName,
+                            )
+                            val result = if (phoneContext == null) availableTool.execute(args)
+                                else withContext(phoneContext) { availableTool.execute(args) }
                             phoneIntentProposed = isSuccessfulPhoneIntentProposal(tool.toolName, result)
                             val hasShellAccess = tools.any { it.name == "workspace_shell" }
                             executedTools += tool.copy(

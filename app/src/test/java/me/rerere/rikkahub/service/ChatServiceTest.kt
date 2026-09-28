@@ -15,6 +15,7 @@ import me.rerere.rikkahub.data.ai.tools.phoneToolPrefix
 import me.rerere.ai.ui.UIMessage
 import me.rerere.ai.ui.UIMessagePart
 import me.rerere.rikkahub.data.mobileagent.PhoneSessionToken
+import me.rerere.rikkahub.data.mobileagent.PhoneActionReceiptLedger
 import me.rerere.rikkahub.data.model.Assistant
 import me.rerere.rikkahub.data.model.Conversation
 import me.rerere.rikkahub.data.model.MessageNode
@@ -28,6 +29,73 @@ import org.junit.Test
 import kotlin.uuid.Uuid
 
 class ChatServiceTest {
+    @Test fun `receipt fills exact missing message call and preserves existing real output`() {
+        val id = Uuid.random()
+        val assistant = Uuid.random()
+        val token = PhoneSessionToken(id.toString(), assistant.toString(), "session", 1)
+        val name = phoneToolPrefix(token) + "back"
+        val call = UIMessagePart.Tool("reused", name, "{}")
+        val oldMessage = UIMessage(role = MessageRole.ASSISTANT, parts = listOf(call))
+        val message = UIMessage(role = MessageRole.ASSISTANT, parts = listOf(call))
+        val real = call.copy(toolCallId = "real", output = listOf(UIMessagePart.Text("real output")))
+        val realMessage = UIMessage(role = MessageRole.ASSISTANT, parts = listOf(real))
+        val ledger = PhoneActionReceiptLedger(token)
+        ledger.beginCall(message.id.toString(), call.toolCallId, name)!!.forTool(token, name)!!.apply {
+            backendResult(true)
+            postObserveFailed("PAGE_UNSTABLE")
+        }
+        ledger.beginCall(realMessage.id.toString(), real.toolCallId, name)!!.forTool(token, name)!!.backendResult(false)
+        val conversation = Conversation(id = id, assistantId = assistant,
+            messageNodes = listOf(oldMessage, message, realMessage).map { it.toMessageNode() })
+        val finished = finishUnresolvedPhoneTools(conversation, token, ledger.freeze())
+        fun result(index: Int) = Json.parseToJsonElement(
+            (finished.currentMessages[index].getTools().single().output.single() as UIMessagePart.Text).text,
+        ).jsonObject
+        assertEquals("unknown", result(0)["execution_outcome"]?.jsonPrimitive?.content)
+        assertEquals("accepted_unverified", result(1)["execution_outcome"]?.jsonPrimitive?.content)
+        assertEquals("PAGE_UNSTABLE", result(1)["post_observe_error"]?.jsonPrimitive?.content)
+        assertFalse(result(1).containsKey("screenChanged"))
+        assertEquals(real, finished.currentMessages[2].getTools().single())
+        assertTrue(finished.currentMessages.all { msg -> msg.getTools().all { !it.canResumeExecution } })
+    }
+
+    @Test fun `duplicate pending identity never receives a unique receipt even if only one call began`() {
+        val id = Uuid.random()
+        val assistant = Uuid.random()
+        val token = PhoneSessionToken(id.toString(), assistant.toString(), "session", 1)
+        val name = phoneToolPrefix(token) + "click"
+        val call = UIMessagePart.Tool("duplicate", name, "{}")
+        val message = UIMessage(role = MessageRole.ASSISTANT, parts = listOf(call, call))
+        val ledger = PhoneActionReceiptLedger(token)
+        ledger.beginCall(message.id.toString(), call.toolCallId, name)!!.forTool(token, name)!!.backendResult(true)
+        val conversation = Conversation(id = id, assistantId = assistant, messageNodes = listOf(message.toMessageNode()))
+        val finished = finishUnresolvedPhoneTools(conversation, token, ledger.freeze())
+        finished.currentMessages.single().getTools().forEach { tool ->
+            val result = Json.parseToJsonElement((tool.output.single() as UIMessagePart.Text).text).jsonObject
+            assertEquals("unknown", result["execution_outcome"]?.jsonPrimitive?.content)
+            assertFalse(result.containsKey("accepted"))
+        }
+    }
+
+    @Test fun `receipt from old epoch cannot fill replacement pending calls`() {
+        val id = Uuid.random()
+        val assistant = Uuid.random()
+        val old = PhoneSessionToken(id.toString(), assistant.toString(), "session", 1)
+        val fresh = old.copy(epoch = 2)
+        val oldName = phoneToolPrefix(old) + "back"
+        val call = UIMessagePart.Tool("call", phoneToolPrefix(fresh) + "back", "{}")
+        val message = UIMessage(role = MessageRole.ASSISTANT, parts = listOf(call))
+        val ledger = PhoneActionReceiptLedger(old)
+        ledger.beginCall(message.id.toString(), call.toolCallId, oldName)!!.forTool(old, oldName)!!.backendResult(true)
+        val conversation = Conversation(id = id, assistantId = assistant, messageNodes = listOf(message.toMessageNode()))
+        val finished = finishUnresolvedPhoneTools(conversation, fresh, ledger.freeze())
+        val result = Json.parseToJsonElement(
+            (finished.currentMessages.single().getTools().single().output.single() as UIMessagePart.Text).text,
+        ).jsonObject
+        assertEquals("unknown", result["execution_outcome"]?.jsonPrimitive?.content)
+        assertFalse(result.containsKey("accepted"))
+    }
+
     @Test
     fun `ending a phone generation records unknown for unresolved calls and preserves real results`() {
         val id = Uuid.random()
