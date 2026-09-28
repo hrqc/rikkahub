@@ -296,7 +296,7 @@ class PhoneController(
     ): PhoneActionResult = operations.withLock {
         guarded(token) {
             authorize(token)
-            val before = if (action == PhoneAction.OpenApp) null else requireObservation(token, snapshotId)
+            val before = if (action == PhoneAction.OpenApp) null else requireObservation(token, snapshotId, action)
             if (action == PhoneAction.OpenApp) {
                 if (synchronized(gate) { restrictedToNativeScroll }) {
                     fail("SCROLL_ONLY", "当前页面检查不完整，仅允许原生节点滚动；请先重新观察。")
@@ -353,7 +353,8 @@ class PhoneController(
                 if (state.value.token?.sessionId != token.sessionId) throw error
                 return@guarded PhoneActionResult(true, detail = "动作已提交，但未能验证后续页面；请检查并重新观察")
             }
-            val changed = before == null || before.fingerprint != after.fingerprint
+            val beforeFingerprint = result.beforeActionFingerprint ?: before?.fingerprint
+            val changed = beforeFingerprint == null || beforeFingerprint != after.fingerprint
             val key = actionKey(action, before)
             synchronized(gate) {
                 authorize(token)
@@ -446,15 +447,23 @@ class PhoneController(
         return safe
     }
 
-    private fun requireObservation(token: PhoneSessionToken, snapshotId: String?): PhoneObservation {
+    private fun requireObservation(token: PhoneSessionToken, snapshotId: String?, action: PhoneAction): PhoneObservation {
         authorize(token)
         requireForeground(token)
         val current = synchronized(gate) { authorize(token); observation }
         if (snapshotId.isNullOrBlank() || current == null || current.id != snapshotId) fail("STALE_SNAPSHOT", "请先重新观察页面，旧快照不可执行")
         val age = now() - current.capturedAtMillis
         val environment = backend.state.value
-        if (age !in 0..10_000 || current.windowRevision != environment.windowRevision || current.windowId != environment.windowId) {
-            fail("STALE_SNAPSHOT", "页面已变化或快照超时，请重新观察")
+        val revisionChanged = current.windowRevision != environment.windowRevision
+        val windowChanged = current.windowId != environment.windowId
+        val eligibleRefresh = action is PhoneAction.Click && backend.canRevalidateClick(token, current, action.nodeId)
+        if (age !in 0..10_000 || windowChanged || (revisionChanged && !eligibleRefresh)) {
+            throw PhoneControlException("STALE_SNAPSHOT", "页面已变化或快照超时，请重新观察；不得直接重放旧动作",
+                PhoneSnapshotRejection(when {
+                    age !in 0..10_000 -> PhoneSnapshotRejectionReason.AGE_LIMIT
+                    windowChanged -> PhoneSnapshotRejectionReason.WINDOW_CHANGED
+                    else -> PhoneSnapshotRejectionReason.REVISION_CHANGED
+                }, age.coerceIn(-300_000, 300_000), revisionChanged, windowChanged))
         }
         return current
     }

@@ -37,6 +37,27 @@ import org.junit.Test
 class PhoneToolsTest {
     private val empty = JsonObject(emptyMap())
 
+    @Test fun `stale snapshot error includes fixed cause metadata without page contents`() = runBlocking {
+        val backend = FakeBackend()
+        val controller = controller(backend)
+        try {
+            val token = controller.start("conversation", "assistant", "target")
+            val screen = controller.observe(token)
+            backend.state.value = backend.state.value.copy(windowRevision = 2)
+            val tool = createPhoneTools(controller, token, Json).first { it.name.endsWith("_back") }
+            val output = tool.execute(buildJsonObject { put("snapshot_id", screen.id) })
+            val result = Json.parseToJsonElement((output.single() as UIMessagePart.Text).text).jsonObject
+            val metadata = result.getValue("snapshot_validation").jsonObject
+            assertEquals("STALE_SNAPSHOT", result["code"]?.jsonPrimitive?.content)
+            assertEquals("REVISION_CHANGED", metadata["reason"]?.jsonPrimitive?.content)
+            assertEquals("0", metadata["age_ms"]?.jsonPrimitive?.content)
+            assertEquals("true", metadata["revision_changed"]?.jsonPrimitive?.content)
+            assertEquals("false", metadata["window_changed"]?.jsonPrimitive?.content)
+            assertEquals(setOf("reason", "age_ms", "revision_changed", "window_changed"), metadata.keys)
+            assertEquals(0, backend.actions)
+        } finally { controller.close() }
+    }
+
     @Test fun `stop after acceptance returns receipt instead of false and leaves replacement grant active`() = runBlocking {
         val backend = FakeBackend()
         val controller = controller(backend)

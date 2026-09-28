@@ -136,6 +136,8 @@ data class PhoneBackendResult(
     val accepted: Boolean,
     val detail: String,
     val screenshotUri: String? = null,
+    // Host-only baseline from a fresh validation read; never part of model-facing output.
+    internal val beforeActionFingerprint: String? = null,
 )
 
 @Serializable
@@ -148,7 +150,20 @@ data class PhoneActionResult(
 )
 
 /** Messages must be fixed local descriptions, never raw platform errors or user input. */
-class PhoneControlException(val code: String, message: String) : IllegalStateException(message)
+enum class PhoneSnapshotRejectionReason { AGE_LIMIT, WINDOW_CHANGED, REVISION_CHANGED }
+
+data class PhoneSnapshotRejection(
+    val reason: PhoneSnapshotRejectionReason,
+    val ageMillis: Long,
+    val revisionChanged: Boolean,
+    val windowChanged: Boolean,
+)
+
+class PhoneControlException(
+    val code: String,
+    message: String,
+    val snapshotRejection: PhoneSnapshotRejection? = null,
+) : IllegalStateException(message)
 
 interface PhoneBackend {
     val state: StateFlow<PhoneBackendState>
@@ -157,6 +172,8 @@ interface PhoneBackend {
     fun showSessionNotice(token: PhoneSessionToken, targetPackage: String, onStop: (PhoneBackendStopReason) -> Unit): Boolean
     fun endSessionNotice()
     suspend fun observe(permit: PhonePermit): PhoneObservation
+    /** Metadata eligibility only. Execution must independently reread and validate the exact target. */
+    fun canRevalidateClick(token: PhoneSessionToken, observation: PhoneObservation, nodeId: String): Boolean = false
     suspend fun execute(
         permit: PhonePermit,
         observation: PhoneObservation?,

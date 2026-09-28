@@ -106,6 +106,14 @@ fun createPhoneTools(
                     put("accepted", false)
                     put("code", error.code)
                     put("detail", error.message ?: "手机控制操作已拒绝")
+                    error.snapshotRejection?.let { rejection ->
+                        put("snapshot_validation", buildJsonObject {
+                            put("reason", rejection.reason.name)
+                            put("age_ms", rejection.ageMillis)
+                            put("revision_changed", rejection.revisionChanged)
+                            put("window_changed", rejection.windowChanged)
+                        })
+                    }
                 }.toString()))
             } catch (_: Exception) {
                 // Platform/parser failures must not echo an input value into logs or tool errors.
@@ -155,6 +163,8 @@ fun createPhoneTools(
                 评价不能只看高分：按商品分别查看中差评、追评和具体使用体验；用 shopping_review_evidence 整理实际读到的样本。重复模板只是异常线索，不能断言刷单，样本不足或商品归属未核证要明确说明。
                 PAGE_UNSTABLE 表示同一页面持续刷新且内部有限重读未取得稳定结果，不代表用户授权或 Root 丢失；停止重复 observe，请用户等页面加载后继续或切到稳定页面。
                 STALE_WINDOW 表示窗口或快照已改变，不等于系统权限被关闭；至多重新观察一次，仍失败就报告实际错误并暂停等待，不循环消耗任务预算。
+                STALE_SNAPSHOT 的 snapshot_validation 区分时限、窗口与内容版本变化；正文分页不延长10秒动作有效期。至多重新观察一次并核对目标，仍失败就停止并报告真实原因，不重放旧节点或循环观察/点击。
+                京东首页推荐词容器会变化，优先使用完整观察中的明确“搜索”原生按钮；宿主不会把空容器自动改向别的按钮。该按钮可能提交推荐词，点击后必须观察、核实并输入用户实际查询词，不能把打开搜索页面当作资料或商品筛选完成。
             """.trimIndent(),
         ) { listOf(UIMessagePart.Text(json.encodeToString(controller.observe(token)))) },
         tool("read_observed_content", "分批读取本授权已完整观察并保留的页面正文，不操作手机，不产生新的动作许可。",

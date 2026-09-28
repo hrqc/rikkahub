@@ -17,6 +17,86 @@ import org.junit.Assert.*
 import org.junit.Test
 
 class PhoneControllerTest {
+    @Test fun `click refresh eligibility cannot extend age change windows or refresh another action`() = runBlocking {
+        for (failure in listOf("age", "window", "other_action")) Fixture().use { f ->
+            val token = f.start()
+            val screen = f.controller.observe(token)
+            f.backend.allowClickRevalidation = true
+            f.backend.state.value = f.backend.state.value.copy(windowRevision = 2)
+            if (failure == "age") f.time += 10_001
+            if (failure == "window") f.backend.state.value = f.backend.state.value.copy(windowId = 8)
+            try {
+                f.controller.act(token, screen.id, if (failure == "other_action") PhoneAction.Back else PhoneAction.Click("button"))
+                fail("Expected stale snapshot")
+            } catch (error: PhoneControlException) {
+                assertEquals("STALE_SNAPSHOT", error.code)
+                val metadata = error.snapshotRejection!!
+                assertEquals(when (failure) {
+                    "age" -> PhoneSnapshotRejectionReason.AGE_LIMIT
+                    "window" -> PhoneSnapshotRejectionReason.WINDOW_CHANGED
+                    else -> PhoneSnapshotRejectionReason.REVISION_CHANGED
+                }, metadata.reason)
+                assertTrue(metadata.revisionChanged)
+            }
+            assertEquals(0, f.backend.actions)
+        }
+    }
+
+    @Test fun `only backend opted in click can reach execution after a content revision`() = runBlocking {
+        for (eligible in listOf(false, true)) Fixture().use { f ->
+            val token = f.start()
+            val screen = f.controller.observe(token)
+            f.backend.allowClickRevalidation = eligible
+            f.backend.state.value = f.backend.state.value.copy(windowRevision = 2)
+            if (eligible) {
+                // This verifies controller delegation, not the Android backend's revalidation proof.
+                assertTrue(f.controller.act(token, screen.id, PhoneAction.Click("button")).accepted)
+                assertEquals(1, f.backend.actions)
+            } else {
+                expectCode("STALE_SNAPSHOT") { f.controller.act(token, screen.id, PhoneAction.Click("button")) }
+                assertEquals(0, f.backend.actions)
+            }
+        }
+    }
+
+    @Test fun `pre click content changes are not reported as changes caused by revalidated click`() = runBlocking {
+        Fixture().use { f ->
+            val token = f.start()
+            val screen = f.controller.observe(token)
+            val ledger = PhoneActionReceiptLedger(token)
+            val name = phoneToolPrefix(token) + "click"
+            val recorder = ledger.beginCall("message", "call", name)!!.forTool(token, name)!!
+            f.backend.allowClickRevalidation = true
+            f.backend.state.value = f.backend.state.value.copy(windowRevision = 2)
+            f.backend.fingerprint = "fresh-ad-before-dispatch"
+            f.backend.beforeActionFingerprint = f.backend.fingerprint
+            f.backend.changes = false
+
+            val result = f.controller.act(token, screen.id, PhoneAction.Click("button"), recorder)
+
+            assertTrue(result.accepted)
+            assertNotEquals(screen.fingerprint, result.observation!!.fingerprint)
+            assertFalse(result.screenChanged)
+            assertTrue(recorder.knownResult()!!.observationVerified)
+            assertEquals(false, recorder.knownResult()!!.screenChanged)
+            assertEquals(1, f.backend.actions)
+        }
+    }
+
+    @Test fun `click refresh opt in cannot revive another snapshot or an old grant`() = runBlocking {
+        Fixture().use { f ->
+            val token = f.start()
+            val screen = f.controller.observe(token)
+            f.backend.allowClickRevalidation = true
+            f.backend.state.value = f.backend.state.value.copy(windowRevision = 2)
+            expectCode("STALE_SNAPSHOT") { f.controller.act(token, "forged", PhoneAction.Click("button")) }
+            f.controller.pause()
+            f.controller.resume()
+            expectCode("SESSION_INVALID") { f.controller.act(token, screen.id, PhoneAction.Click("button")) }
+            assertEquals(0, f.backend.actions)
+        }
+    }
+
     @Test fun `limited post action observation cannot mark a receipt as fully verified`() = runBlocking {
         Fixture().use { f ->
             val token = f.start()
@@ -140,6 +220,8 @@ class PhoneControllerTest {
         var fingerprint = "page"
         var changes = true
         var accepts = true
+        var allowClickRevalidation = false
+        var beforeActionFingerprint: String? = null
         var reads = 0
         var actions = 0
         var invalidations = 0
@@ -150,6 +232,7 @@ class PhoneControllerTest {
         var afterDispatch: () -> Unit = {}
         var beforeRead: suspend () -> Unit = {}
         override fun isTargetAllowed(packageName: String) = packageName == "com.example.target"
+        override fun canRevalidateClick(token: PhoneSessionToken, observation: PhoneObservation, nodeId: String) = allowClickRevalidation
         override fun showSessionNotice(token: PhoneSessionToken, targetPackage: String, onStop: (PhoneBackendStopReason) -> Unit): Boolean {
             this.onStop = onStop
             return noticeAllowed
@@ -177,7 +260,8 @@ class PhoneControllerTest {
             actions++
             if (changes) fingerprint = "changed$actions"
             afterDispatch()
-            return PhoneBackendResult(accepts, "platform result", if (action == PhoneAction.Screenshot) "content://test/window" else null)
+            return PhoneBackendResult(accepts, "platform result", if (action == PhoneAction.Screenshot) "content://test/window" else null,
+                beforeActionFingerprint = beforeActionFingerprint)
         }
     }
 

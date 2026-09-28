@@ -32,6 +32,7 @@ internal data class AndroidNodeSignature(
     val inspectionIncomplete: Boolean,
     val requiresUserConfirmation: Boolean,
     val contentFingerprint: String,
+    val metadataTruncated: Boolean = false,
 )
 
 internal data class AndroidNodeHandle(val path: List<Int>, val signature: AndroidNodeSignature)
@@ -47,6 +48,7 @@ internal data class AndroidTreeCapture(
     val restrictedPaths: List<List<Int>>,
     val nativeScrollNodeIds: Set<String>,
     val readOnlyContent: PhoneReadOnlyContent? = null,
+    val clickRevalidationProofs: List<PhoneClickRevalidationProof> = emptyList(),
 )
 
 /** Reads only the already authorized root supplied by the backend. Never queries windows itself. */
@@ -73,6 +75,7 @@ internal class AccessibilityTreeReader {
         val restrictedPaths = mutableListOf<List<Int>>()
         val nativeScrollNodeIds = mutableSetOf<String>()
         val inspectedSignatures = mutableListOf<AndroidNodeSignature>()
+        val signaturesByPath = linkedMapOf<List<Int>, AndroidNodeSignature>()
         val content = if (collectReadOnlyContent) PhoneReadOnlyContentCollector() else null
         var sensitive = false
 
@@ -104,6 +107,7 @@ internal class AccessibilityTreeReader {
             }
             val signature = signature(node)
             inspectedSignatures += signature
+            signaturesByPath[path] = signature
             sensitive = sensitive || signature.sensitive
             if (signature.truncated) budget.markPreviewTruncated()
             if (signature.inspectionIncomplete) budget.markTruncated("text_limit")
@@ -194,16 +198,44 @@ internal class AccessibilityTreeReader {
         }
         // Preview omission must not omit safety inspection or freshness of the remaining tree.
         val fingerprint = digest(inspectedSignatures.joinToString("\n") { it.toString() })
+        val searchCandidates = signaturesByPath.filterValues(::isJdSearchNavigationSignature)
+        val clickProofs = if (budget.truncated || sensitive) emptyList() else if (searchCandidates.size > 1) {
+            // Two structural candidates already prove ambiguity, including candidates outside preview.
+            searchCandidates.entries.take(2).map { (path, _) ->
+                PhoneClickRevalidationProof("", path, "", "", "", "", PhoneClickRevalidationScope.JD_SEARCH_NAVIGATION,
+                    restricted = true)
+            }
+        } else searchCandidates.map { (path, signature) ->
+            val ancestors = (0 until path.size).map { signaturesByPath.getValue(path.take(it)) }
+            val context = phoneClickRevalidationContext(path, signaturesByPath)
+            fun subtreeHash(prefix: List<Int>): String = digest(signaturesByPath.entries
+                .filter { (nodePath, _) -> nodePath.take(prefix.size) == prefix }
+                .joinToString("\n") { (nodePath, value) -> "${nodePath.drop(prefix.size)}:$value" })
+            val node = guardedNodes.firstOrNull { handles[it.id]?.path == path }
+            PhoneClickRevalidationProof(
+                nodeId = node?.id.orEmpty(), path = path, signatureFingerprint = digest(signature.toString()),
+                subtreeFingerprint = subtreeHash(path),
+                ancestorFingerprint = digest(ancestors.joinToString("\n") {
+                    // Dynamic contents belong to the explicitly selected semantic context below.
+                    it.copy(text = "", description = "", contentFingerprint = "").toString()
+                }),
+                contextFingerprint = context?.fingerprint.orEmpty(), scope = PhoneClickRevalidationScope.JD_SEARCH_NAVIGATION,
+                hasSemanticLabel = signature.text.isNotBlank() || signature.description.isNotBlank(),
+                truncated = signature.truncated || signature.inspectionIncomplete || signature.metadataTruncated,
+                restricted = context == null || node == null || node.requiresUserConfirmation || !node.enabled || !node.clickable ||
+                    node.password || ancestors.any { it.sensitive || it.inspectionIncomplete || it.requiresUserConfirmation || !it.enabled },
+            )
+        }
         return AndroidTreeCapture(guardedNodes, handles, budget.truncated, sensitive, fingerprint,
             budget.previewTruncated, budget.issues.toList(), restrictedPaths.toList(), nativeScrollNodeIds.toSet(),
-            content?.finish(inspectionComplete = !budget.truncated, sensitive = sensitive))
+            content?.finish(inspectionComplete = !budget.truncated, sensitive = sensitive), clickProofs)
     }
 
     /** Returns an owned fresh node; the caller must recycle it on API < 33. */
     fun resolve(
         root: AccessibilityNodeInfo,
         handle: AndroidNodeHandle,
-        strictNativeScroll: Boolean = false,
+        strictAncestors: Boolean = false,
         isValid: () -> Boolean,
     ): AccessibilityNodeInfo? {
         @Suppress("DEPRECATION")
@@ -221,13 +253,13 @@ internal class AccessibilityTreeReader {
             }
             for (index in handle.path) {
                 if (!isValid()) throw TreeReadAborted()
-                if (strictNativeScroll && !permittedAncestor()) return null
+                if (strictAncestors && !permittedAncestor()) return null
                 if (index !in 0 until current.childCount) return null
                 val next = child(current, index) ?: return null
                 recycleNode(current)
                 current = next
             }
-            if (strictNativeScroll && !permittedAncestor()) return null
+            if (strictAncestors && !permittedAncestor()) return null
             if (!isValid() || !current.refresh() || !current.isVisibleToUser || signature(current) != handle.signature) {
                 return null
             }
@@ -245,12 +277,16 @@ internal class AccessibilityTreeReader {
         val description = samplePhoneNodeText(protected) { node.contentDescription }
         val sensitive = protected || text.sensitive || description.sensitive
         val bounds = Rect().also(node::getBoundsInScreen)
+        val rawPackage = node.packageName
+        val rawRole = node.className
+        val rawViewId = node.viewIdResourceName
+        val rawUniqueId = if (Build.VERSION.SDK_INT >= 33) node.uniqueId else null
         return AndroidNodeSignature(
             windowId = node.windowId,
-            packageName = bounded(node.packageName, 256),
-            uniqueId = if (Build.VERSION.SDK_INT >= 33) node.uniqueId?.take(256) else null,
-            role = bounded(node.className, 160),
-            viewId = node.viewIdResourceName?.take(256).orEmpty(),
+            packageName = bounded(rawPackage, 256),
+            uniqueId = rawUniqueId?.take(256),
+            role = bounded(rawRole, 160),
+            viewId = rawViewId?.take(256).orEmpty(),
             text = if (sensitive) "" else text.value,
             description = if (sensitive) "" else description.value,
             left = bounds.left,
@@ -268,6 +304,8 @@ internal class AccessibilityTreeReader {
             inspectionIncomplete = text.inspectionIncomplete || description.inspectionIncomplete,
             requiresUserConfirmation = text.requiresUserConfirmation || description.requiresUserConfirmation,
             contentFingerprint = text.contentFingerprint + ":" + description.contentFingerprint,
+            metadataTruncated = (rawPackage?.length ?: 0) > 256 || (rawRole?.length ?: 0) > 160 ||
+                (rawViewId?.length ?: 0) > 256 || (rawUniqueId?.length ?: 0) > 256,
         )
     }
 

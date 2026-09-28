@@ -62,6 +62,9 @@ class AccessibilityPhoneBackend(
     private val service = AtomicReference<AccessibilityService?>(null)
     private val activeNotice = AtomicReference<SessionNotice?>(null)
     private val snapshot = AtomicReference<Snapshot?>(null)
+    // A read-only target reference, never a substitute executable snapshot.
+    private val clickAnchor = AtomicReference<Snapshot?>(null)
+    private val clickContextRevision = AtomicLong(0L)
     private val readDiagnostics = AtomicReference<ReadDiagnosticCapture?>(null)
     private val readDiagnosticAuthority = ReadDiagnosticAuthority()
     private val readDiagnosticFlags = AtomicReference<ReadDiagnosticFlagLease?>(null)
@@ -78,6 +81,7 @@ class AccessibilityPhoneBackend(
         val tree: AndroidTreeCapture,
         val identity: Long,
         val capability: PhoneSnapshotCapability,
+        val clickContextRevision: Long,
         val capturedAtElapsedMillis: Long = SystemClock.elapsedRealtime(),
     )
     private data class EventMetadata(val type: Int, val windowId: Int, val packageName: String?)
@@ -103,6 +107,7 @@ class AccessibilityPhoneBackend(
     }
 
     override fun endSessionNotice() {
+        clearClickAnchor()
         readDiagnosticAuthority.revoke()
         readDiagnostics.get()?.stop(ReadDiagnosticStop.SESSION_INVALIDATED)
         restoreReadDiagnosticFlags()
@@ -159,6 +164,7 @@ class AccessibilityPhoneBackend(
         controlOverlayWindowId = attachedId
         revision.incrementAndGet()
         snapshot.set(null)
+        clearClickAnchor()
         refreshEnvironment()
     }
 
@@ -167,7 +173,10 @@ class AccessibilityPhoneBackend(
         val packageName = event.packageName?.toString()?.take(256)
         recentEvents.addLast(EventMetadata(event.eventType, eventWindowId, packageName))
         if (recentEvents.size > 12) recentEvents.removeFirst()
-        if (event.eventType !in observedEvents) return
+        if (event.eventType !in observedEvents) {
+            if (shouldClearPhoneClickAnchor(event.eventType, eventWindowId, mutableState.value.windowId, false)) clearClickAnchor()
+            return
+        }
         if (eventWindowId >= 0 && !packageName.isNullOrBlank()) windowPackages[eventWindowId] = packageName
         if (windowPackages.size > 64) windowPackages.clear()
         val previous = mutableState.value
@@ -176,6 +185,11 @@ class AccessibilityPhoneBackend(
         val ownOverlayEvent = eventWindowId == controlOverlayWindowId && withWindows { windows ->
             windows.firstOrNull { it.id == eventWindowId }
                 ?.let { isPhoneControlOverlay(windowMetadata(it), controlOverlayWindowId) } == true
+        }
+        // Only target content/text revisions can retain a read-only search reference. Manual
+        // navigation, focus, scrolling and structural changes require a new model observation.
+        if (shouldClearPhoneClickAnchor(event.eventType, eventWindowId, previous.windowId, ownOverlayEvent)) {
+            clearClickAnchor()
         }
         // Do not hide A -> B -> A inside a content retry when the event queue trails the live list.
         if (shouldChangePhoneWindowIdentity(eventWindowId, previous.windowId, structuralChange, ownOverlayEvent)) {
@@ -268,6 +282,7 @@ class AccessibilityPhoneBackend(
             try {
                 // Any previously executable snapshot is invalid before changing the read configuration.
                 snapshot.set(null)
+                clearClickAnchor()
                 revision.incrementAndGet()
                 mutableState.update { it.copy(windowRevision = revision.get()) }
                 synchronized(readDiagnosticFlags) {
@@ -442,12 +457,14 @@ class AccessibilityPhoneBackend(
         windowIdentity.incrementAndGet()
         revision.incrementAndGet()
         snapshot.set(null)
+        clearClickAnchor()
         rootExecutor.cancel()
         mutableState.update { it.copy(windowRevision = revision.get()) }
     }
 
     override suspend fun observe(permit: PhonePermit): PhoneObservation = operationLock.withLock {
         withContext(Dispatchers.Main.immediate) {
+            clearClickAnchor()
             var diagnostic: ReadDiagnosticCapture? = null
             var diagnosticSample: ReadDiagnosticSample? = null
             var diagnosticOutcome = "OBSERVATION_UNAVAILABLE"
@@ -525,7 +542,7 @@ class AccessibilityPhoneBackend(
                                     scrollOnly -> PhoneSnapshotCapability.NATIVE_SCROLL_ONLY
                                     !tree.sensitive && !tree.truncated -> PhoneSnapshotCapability.FULL
                                     else -> PhoneSnapshotCapability.NONE
-                                })
+                                }, clickContextRevision.get())
                             } catch (_: TreeReadAborted) {
                                 throw PhoneObservationInvalidated()
                             } catch (error: PhoneControlException) {
@@ -561,7 +578,12 @@ class AccessibilityPhoneBackend(
                 requireRevision(permit, captured.observation.windowRevision)
                 // Retain only executable state. Read-only text is transferred once to the
                 // controller and is never part of the backend's saved action snapshot.
-                snapshot.set(captured.copy(tree = captured.tree.copy(readOnlyContent = null)))
+                val executable = captured.copy(tree = captured.tree.copy(readOnlyContent = null))
+                snapshot.set(executable)
+                if (executable.capability == PhoneSnapshotCapability.FULL &&
+                    executable.tree.clickRevalidationProofs.singleOrNull()?.let {
+                        matchPhoneClickRevalidation(it, executable.tree.clickRevalidationProofs, false, false) != null
+                    } == true) clickAnchor.set(executable)
                 diagnosticOutcome = if (captured.observation.scrollOnly) "OBSERVED_SCROLL_ONLY" else "OBSERVED"
                 diagnosticSnapshotId = captured.observation.id
                 captured.observation.copy(readOnlyContent = captured.tree.readOnlyContent?.takeIf {
@@ -591,6 +613,9 @@ class AccessibilityPhoneBackend(
                             fail("SCROLL_ONLY", "本次不完整观察仅允许已验证列表的原生滚动，请重新观察后执行其他动作。")
                         }
                         return@withContext openTarget(permit)
+                    }
+                    if (action is PhoneAction.Click) {
+                        revalidateClick(permit, observation, action)?.let { return@withContext it }
                     }
                     val stored = validatedSnapshot(permit, observation)
                     if (stored.capability == PhoneSnapshotCapability.NATIVE_SCROLL_ONLY &&
@@ -691,6 +716,7 @@ class AccessibilityPhoneBackend(
                     } finally {
                         recycleNode(root)
                         snapshot.set(null) // An action is single-use, including failed or uncertain dispatch.
+                        clickAnchor.get()?.takeIf { it.token == permit.token }?.let { clickAnchor.compareAndSet(it, null) }
                     }
                 } catch (_: TreeReadAborted) {
                     throw PhoneControlException("STALE_WINDOW", "窗口或执行许可已改变，请重新观察。")
@@ -700,6 +726,8 @@ class AccessibilityPhoneBackend(
                     throw cancelled
                 } catch (_: Exception) {
                     throw PhoneControlException("ACTION_FAILED", "系统未能完成本次动作，请重新观察。")
+                } finally {
+                    clickAnchor.get()?.takeIf { it.token == permit.token }?.let { clickAnchor.compareAndSet(it, null) }
                 }
             }
         }
@@ -723,6 +751,7 @@ class AccessibilityPhoneBackend(
             windowIdentity.incrementAndGet()
             revision.incrementAndGet()
             snapshot.set(null)
+            clearClickAnchor()
         }
         mutableState.value = PhoneBackendState(connectedService != null, revision.get(), packageName, windowId, locked)
     }
@@ -808,6 +837,100 @@ class AccessibilityPhoneBackend(
         return stored
     }
 
+    private fun clearClickAnchor() {
+        clickAnchor.set(null)
+        clickContextRevision.incrementAndGet()
+    }
+
+    override fun canRevalidateClick(token: PhoneSessionToken, observation: PhoneObservation, nodeId: String): Boolean {
+        val anchor = clickAnchor.get() ?: return false
+        if (anchor.token != token || anchor.observation != observation.withoutReadOnlyContentMetadata() ||
+            anchor.capability != PhoneSnapshotCapability.FULL || anchor.identity != windowIdentity.get() ||
+            anchor.clickContextRevision != clickContextRevision.get()) return false
+        val target = anchor.tree.clickRevalidationProofs.singleOrNull { it.nodeId == nodeId } ?: return false
+        return matchPhoneClickRevalidation(target, anchor.tree.clickRevalidationProofs,
+            anchor.tree.sensitive, anchor.tree.truncated) != null
+    }
+
+    private fun validClickContext(permit: PhonePermit, anchor: Snapshot, expectedRevision: Long): Boolean =
+        anchor.token == permit.token && anchor.identity == windowIdentity.get() &&
+            anchor.clickContextRevision == clickContextRevision.get() &&
+            anchor.observation.windowId == mutableState.value.windowId &&
+            SystemClock.elapsedRealtime() - anchor.capturedAtElapsedMillis in 0..10_000 &&
+            System.currentTimeMillis() - anchor.observation.capturedAtMillis in 0..10_000 &&
+            validAtRevision(permit, expectedRevision)
+
+    private fun requireClickContext(permit: PhonePermit, anchor: Snapshot, expectedRevision: Long) {
+        requirePermit(permit)
+        if (!validClickContext(permit, anchor, expectedRevision)) {
+            fail("STALE_WINDOW", "搜索导航目标或窗口已改变，请重新观察；本次未派发点击。")
+        }
+    }
+
+    /** Revalidates one explicit search target, never relocates an unknown or empty container. */
+    private suspend fun revalidateClick(
+        permit: PhonePermit,
+        requestedObservation: PhoneObservation?,
+        action: PhoneAction.Click,
+    ): PhoneBackendResult? {
+        val anchor = clickAnchor.get() ?: return null
+        if (requestedObservation == null || anchor.token != permit.token ||
+            anchor.observation != requestedObservation.withoutReadOnlyContentMetadata() ||
+            anchor.capability != PhoneSnapshotCapability.FULL) return null
+        val original = anchor.tree.clickRevalidationProofs.singleOrNull { it.nodeId == action.nodeId } ?: return null
+        if (matchPhoneClickRevalidation(original, anchor.tree.clickRevalidationProofs,
+                anchor.tree.sensitive, anchor.tree.truncated) == null) return null
+        // Consume before reading. A failed validation or platform false never retries this dispatch.
+        if (!clickAnchor.compareAndSet(anchor, null)) fail("STALE_SNAPSHOT", "搜索导航参照已失效，请重新观察。")
+        snapshot.get()?.takeIf { it.token == permit.token }?.let { snapshot.compareAndSet(it, null) }
+        val freshRevision = revision.get()
+        requireClickContext(permit, anchor, freshRevision)
+        val root = authorizedRoot(permit)
+        try {
+            val latest = withContext(Dispatchers.Default) {
+                val readContext = currentCoroutineContext()
+                if (!readContext.isActive || !root.refresh() || root.windowId != anchor.observation.windowId ||
+                    root.packageName?.toString() != permit.targetPackage || !validClickContext(permit, anchor, freshRevision)) {
+                    throw TreeReadAborted()
+                }
+                reader.capture(root, permit.targetPackage) {
+                    readContext.isActive && validClickContext(permit, anchor, freshRevision)
+                }
+            }
+            requireClickContext(permit, anchor, freshRevision)
+            if (latest.sensitive || latest.truncated) {
+                fail("USER_REQUIRED", "搜索点击前无法完整确认页面安全状态，请用户检查；未执行点击。")
+            }
+            val fresh = matchPhoneClickRevalidation(original, latest.clickRevalidationProofs,
+                latest.sensitive, latest.truncated)
+                ?: fail("STALE_NODE", "原搜索按钮或导航上下文已改变，请重新观察；不能改点其他节点。")
+            val guarded = latest.nodes.singleOrNull { it.id == fresh.nodeId }
+                ?: fail("STALE_NODE", "原搜索按钮不在当前可操作预览中，请重新观察。")
+            if (guarded.requiresUserConfirmation || guarded.password || !guarded.enabled || !guarded.clickable) {
+                fail("USER_REQUIRED", "该节点当前不允许自动点击，请用户检查。")
+            }
+            val handle = latest.handles[fresh.nodeId] ?: fail("STALE_NODE", "搜索节点已不可用。")
+            val node = withContext(Dispatchers.Default) {
+                val readContext = currentCoroutineContext()
+                reader.resolve(root, handle, strictAncestors = true) {
+                    readContext.isActive && validClickContext(permit, anchor, freshRevision)
+                }
+            } ?: fail("STALE_NODE", "搜索按钮或祖先状态已改变，请重新观察。")
+            try {
+                if (!node.isVisibleToUser || !node.isEnabled || node.isPassword || !node.isClickable ||
+                    (Build.VERSION.SDK_INT >= 34 && node.isAccessibilityDataSensitive) ||
+                    node.actionList.none { it.id == AccessibilityNodeInfo.ACTION_CLICK }) {
+                    fail("ACTION_UNSUPPORTED", "搜索按钮未提供可用原生点击，本次不使用后备动作。")
+                }
+                requireClickContext(permit, anchor, freshRevision)
+                val dispatched = node.performAction(AccessibilityNodeInfo.ACTION_CLICK)
+                return PhoneBackendResult(dispatched, if (dispatched) "已请求原生搜索导航；必须观察并核实实际查询词。"
+                    else "平台未接受原生搜索点击；未执行后备动作或重试。",
+                    beforeActionFingerprint = latest.fingerprint)
+            } finally { recycleNode(node) }
+        } finally { recycleNode(root) }
+    }
+
     private fun nativeScrollNodes(tree: AndroidTreeCapture): List<PhoneNode> = tree.nodes.mapNotNull { node ->
         val handle = tree.handles[node.id] ?: return@mapNotNull null
         if (node.id !in tree.nativeScrollNodeIds || isNativeScrollPathRestricted(handle.path, tree.restrictedPaths)) return@mapNotNull null
@@ -853,7 +976,7 @@ class AccessibilityPhoneBackend(
         requireNativeScrollSnapshot(permit, stored)
         val node = withContext(Dispatchers.Default) {
             val readContext = currentCoroutineContext()
-            reader.resolve(root, handle, strictNativeScroll = true) {
+            reader.resolve(root, handle, strictAncestors = true) {
                 readContext.isActive && validNativeScrollSnapshot(permit, stored)
             }
         } ?: fail("STALE_NODE", "滚动节点或祖先已改变，请重新观察。")
@@ -897,6 +1020,7 @@ class AccessibilityPhoneBackend(
         intent.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
         context.startActivity(intent)
         snapshot.set(null)
+        clearClickAnchor()
         return PhoneBackendResult(true, "已请求打开目标应用，请等待前台切换后观察。")
     }
 

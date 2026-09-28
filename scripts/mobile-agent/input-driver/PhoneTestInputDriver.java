@@ -314,6 +314,11 @@ public final class PhoneTestInputDriver extends Instrumentation {
             result.putString("ui_error_code", "TARGET_NOT_ALLOWED");
             throw new IllegalArgumentException("Package is outside test scope");
         }
+        // Explicit local inspection of our own tool-detail sheet; third-party pages keep small limits.
+        boolean toolDetail = "me.rerere.rikkahub.debug".equals(expected)
+            && "true".equals(arguments.getString("tool_detail_text", "false"));
+        int textLimit = toolDetail ? 96000 : 900;
+        int outputLimit = toolDetail ? 128000 : 18000;
         result.putString("ui_error_code", "UI_AUTOMATION_UNAVAILABLE");
         UiAutomation automation = getUiAutomation(UiAutomation.FLAG_DONT_SUPPRESS_ACCESSIBILITY_SERVICES);
         if (automation == null) throw new IllegalStateException("Automation unavailable");
@@ -337,9 +342,10 @@ public final class PhoneTestInputDriver extends Instrumentation {
         pending.add(root);
         StringBuilder output = new StringBuilder();
         int visits = 0;
+        boolean textTruncated = false;
         long deadline = SystemClock.elapsedRealtime() + 2500;
         try {
-            while (!pending.isEmpty() && visits++ < 768 && output.length() < 18000 && SystemClock.elapsedRealtime() < deadline) {
+            while (!pending.isEmpty() && visits++ < 768 && output.length() < outputLimit && SystemClock.elapsedRealtime() < deadline) {
                 AccessibilityNodeInfo node = pending.removeFirst();
                 try {
                     if (!expected.contentEquals(node.getPackageName() == null ? "" : node.getPackageName())) continue;
@@ -352,8 +358,15 @@ public final class PhoneTestInputDriver extends Instrumentation {
                         if (text != null || description != null || node.isClickable() || node.isEditable() || node.isScrollable()) {
                             output.append(bounds.toShortString()).append(" click=").append(node.isClickable())
                                 .append(" edit=").append(node.isEditable()).append(" scroll=").append(node.isScrollable()).append(" ");
-                            if (text != null) output.append(text.subSequence(0, Math.min(text.length(), 900)));
-                            if (description != null) output.append(" [").append(description.subSequence(0, Math.min(description.length(), 400))).append("]");
+                            if (text != null) {
+                                int kept = Math.min(text.length(), Math.min(textLimit, Math.max(0, outputLimit - output.length())));
+                                textTruncated |= kept < text.length();
+                                output.append(text.subSequence(0, kept));
+                            }
+                            if (description != null) {
+                                textTruncated |= description.length() > 400;
+                                output.append(" [").append(description.subSequence(0, Math.min(description.length(), 400))).append("]");
+                            }
                             output.append('\n');
                         }
                     }
@@ -363,7 +376,12 @@ public final class PhoneTestInputDriver extends Instrumentation {
                     }
                 } finally { node.recycle(); }
             }
-            result.putBoolean("partial", !pending.isEmpty());
+            if (output.length() > outputLimit) {
+                output.setLength(outputLimit);
+                textTruncated = true;
+            }
+            result.putBoolean("partial", !pending.isEmpty() || textTruncated);
+            result.putBoolean("text_truncated", textTruncated);
         } finally { while (!pending.isEmpty()) pending.removeFirst().recycle(); }
         result.putString("ui_b64", Base64.encodeToString(output.toString().getBytes(StandardCharsets.UTF_8), Base64.NO_WRAP));
         result.putString("ui_error_code", "NONE");
