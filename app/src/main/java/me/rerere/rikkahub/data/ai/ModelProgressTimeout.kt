@@ -1,8 +1,11 @@
 package me.rerere.rikkahub.data.ai
 
+import kotlinx.coroutines.NonCancellable
+import kotlinx.coroutines.cancelAndJoin
 import kotlinx.coroutines.channels.Channel
 import kotlinx.coroutines.coroutineScope
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.withContext
 import kotlinx.coroutines.withTimeoutOrNull
 
 internal const val PHONE_MODEL_PROGRESS_TIMEOUT_MILLIS = 60_000L
@@ -37,8 +40,12 @@ internal suspend fun <T> withModelProgressTimeout(
         try {
             block { activity.trySend(Unit) }
         } finally {
-            watchdog.cancel()
-            activity.close()
+            // cancel() alone can race a new receive's closed-channel fast path on another
+            // thread. Join before closing, including when the model request was cancelled.
+            withContext(NonCancellable) {
+                watchdog.cancelAndJoin()
+                activity.close()
+            }
         }
     }
 }

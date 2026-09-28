@@ -1,7 +1,9 @@
 package me.rerere.rikkahub.data.ai
 
 import kotlinx.coroutines.CompletableDeferred
+import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.async
+import kotlinx.coroutines.awaitAll
 import kotlinx.coroutines.awaitCancellation
 import kotlinx.coroutines.cancelAndJoin
 import kotlinx.coroutines.channels.awaitClose
@@ -11,6 +13,8 @@ import kotlinx.coroutines.flow.collect
 import kotlinx.coroutines.flow.flow
 import kotlinx.coroutines.flow.toList
 import kotlinx.coroutines.runBlocking
+import kotlinx.coroutines.supervisorScope
+import kotlinx.coroutines.yield
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
 import org.junit.Assert.assertTrue
@@ -18,6 +22,47 @@ import org.junit.Assert.fail
 import org.junit.Test
 
 class ModelProgressTimeoutTest {
+    @Test(timeout = 15_000)
+    fun `concurrent normal completions cannot fail when watchdog receive races cleanup`(): Unit = runBlocking {
+        // Stress the real Default dispatcher: runBlocking alone serializes the old race away.
+        // Interleaving is nondeterministic; no assertion depends on the old implementation
+        // failing a particular iteration. Every completed model wait must remain successful.
+        supervisorScope {
+            List(8) {
+                async(Dispatchers.Default) {
+                    repeat(5_000) {
+                        assertEquals("complete", withModelProgressTimeout(60_000) { progress ->
+                            progress()
+                            yield()
+                            progress()
+                            "complete"
+                        })
+                    }
+                }
+            }.awaitAll()
+        }
+    }
+
+    @Test(timeout = 5_000)
+    fun `model failure preserves its type message and original cause after watchdog cleanup`() = runBlocking {
+        val original = IllegalStateException("synthetic provider failure")
+        try {
+            withModelProgressTimeout(2_000) { progress ->
+                progress()
+                yield()
+                throw original
+            }
+            fail("Expected the original model failure")
+        } catch (error: IllegalStateException) {
+            assertEquals(original.javaClass, error.javaClass)
+            assertEquals(original.message, error.message)
+            // Coroutine debug stack recovery may copy the throwable and attach the original
+            // as its cause. Its causal identity must survive even when wrapper identity changes.
+            assertTrue("The original provider failure must remain in the causal chain",
+                generateSequence<Throwable>(error) { it.cause }.take(16).any { it === original })
+        }
+    }
+
     @Test(timeout = 5_000)
     fun `silent provider is cancelled before timeout returns and is never replayed`() = runBlocking {
         var requests = 0
