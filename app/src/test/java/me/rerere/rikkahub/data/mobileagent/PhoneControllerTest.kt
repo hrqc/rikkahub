@@ -147,6 +147,8 @@ class PhoneControllerTest {
                     else -> PhoneSnapshotRejectionReason.REVISION_CHANGED
                 }, metadata.reason)
                 assertTrue(metadata.revisionChanged)
+                if (failure == "other_action") assertEquals(null, metadata.clickRevalidation)
+                else assertEquals(PhoneClickRevalidationStage.ELIGIBLE, metadata.clickRevalidation?.stage)
             }
             assertEquals(0, f.backend.actions)
         }
@@ -166,6 +168,24 @@ class PhoneControllerTest {
                 expectCode("STALE_SNAPSHOT") { f.controller.act(token, screen.id, PhoneAction.Click("button")) }
                 assertEquals(0, f.backend.actions)
             }
+        }
+    }
+
+    @Test fun `click failure keeps backend stage metadata and never dispatches from diagnostics alone`() = runBlocking {
+        for (stage in listOf(PhoneClickRevalidationStage.NO_ANCHOR, PhoneClickRevalidationStage.OBSERVATION_MISMATCH,
+            PhoneClickRevalidationStage.IDENTITY_CHANGED, PhoneClickRevalidationStage.INELIGIBLE_TARGET)) Fixture().use { f ->
+            val token = f.start()
+            val screen = f.controller.observe(token)
+            val diagnostic = PhoneClickRevalidationDiagnostic(stage, candidateCount = 2, eligibleCount = 0,
+                targetProofReason = PhoneClickProofRejection.TRUNCATED_CONTEXT)
+            f.backend.clickDiagnostic = diagnostic
+            f.backend.state.value = f.backend.state.value.copy(windowRevision = 2)
+            val failure = runCatching { f.controller.act(token, screen.id, PhoneAction.Click("button")) }.exceptionOrNull()
+            assertTrue(failure is PhoneControlException)
+            assertEquals(diagnostic, (failure as PhoneControlException).snapshotRejection?.clickRevalidation)
+            assertEquals(1, f.backend.diagnosticChecks)
+            assertEquals(0, f.backend.actions)
+            assertEquals(1, f.backend.reads)
         }
     }
 
@@ -332,6 +352,8 @@ class PhoneControllerTest {
         var accepts = true
         var executor: PhoneActionExecutor? = null
         var allowClickRevalidation = false
+        var clickDiagnostic: PhoneClickRevalidationDiagnostic? = null
+        var diagnosticChecks = 0
         var beforeActionFingerprint: String? = null
         var reads = 0
         var actions = 0
@@ -344,6 +366,10 @@ class PhoneControllerTest {
         var beforeRead: suspend () -> Unit = {}
         override fun isTargetAllowed(packageName: String) = packageName == "com.example.target"
         override fun canRevalidateClick(token: PhoneSessionToken, observation: PhoneObservation, nodeId: String) = allowClickRevalidation
+        override fun clickRevalidationDiagnostic(token: PhoneSessionToken, observation: PhoneObservation, nodeId: String): PhoneClickRevalidationDiagnostic {
+            diagnosticChecks++
+            return clickDiagnostic ?: super.clickRevalidationDiagnostic(token, observation, nodeId)
+        }
         override fun showSessionNotice(token: PhoneSessionToken, targetPackage: String, onStop: (PhoneBackendStopReason) -> Unit): Boolean {
             this.onStop = onStop
             return noticeAllowed

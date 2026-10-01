@@ -31,6 +31,7 @@ internal data class PhoneClickRevalidationProof(
     val hasSemanticLabel: Boolean = true,
     val truncated: Boolean = false,
     val restricted: Boolean = false,
+    val failure: PhoneClickProofRejection? = null,
 )
 
 /** Candidates must come from the complete tree, including otherwise omitted preview nodes. */
@@ -60,28 +61,29 @@ internal data class PhoneClickRevalidationContext(val scope: PhoneClickRevalidat
 internal fun phoneClickRevalidationContext(
     targetPath: List<Int>,
     signatures: Map<List<Int>, AndroidNodeSignature>,
+    onFailure: (PhoneClickProofRejection) -> Unit = {},
 ): PhoneClickRevalidationContext? {
-    val target = signatures[targetPath] ?: return null
-    if (targetPath.isEmpty() || !isJdSearchNavigationSignature(target)) return null
-    fun safe(node: AndroidNodeSignature) = node.packageName == target.packageName && node.windowId == target.windowId &&
-        node.enabled && !node.password && !node.sensitive &&
-        !node.truncated && !node.metadataTruncated && !node.inspectionIncomplete && !node.requiresUserConfirmation
-    val ancestors = (0 until targetPath.size).map { signatures[targetPath.take(it)] ?: return null }
+    fun reject(reason: PhoneClickProofRejection): PhoneClickRevalidationContext? { onFailure(reason); return null }
+    val target = signatures[targetPath] ?: return reject(PhoneClickProofRejection.TARGET_STRUCTURE)
+    if (targetPath.isEmpty() || !isJdSearchNavigationSignature(target)) return reject(PhoneClickProofRejection.TARGET_STRUCTURE)
+    fun safe(node: AndroidNodeSignature): Boolean = phoneClickUnsafeReason(node, target)?.let { onFailure(it); false } ?: true
+    val ancestors = (0 until targetPath.size).map { signatures[targetPath.take(it)] ?: return reject(PhoneClickProofRejection.MISSING_ANCESTOR) }
     if (ancestors.any { !safe(it) } || !safe(target)) return null
     val descendants = signatures.filterKeys { it.size > targetPath.size && it.take(targetPath.size) == targetPath }.values
     if (descendants.any { !safe(it) }) return null
     val labelled = descendants.filter { it.text.isNotBlank() || it.description.isNotBlank() }
-    val label = labelled.singleOrNull() ?: return null
+    val label = labelled.singleOrNull() ?: return reject(PhoneClickProofRejection.DESCENDANT_STRUCTURE)
     if (label.role != "android.widget.TextView" || label.text != "搜索" || label.description.isNotBlank() ||
-        label.clickable || label.editable) return null
+        label.clickable || label.editable) return reject(PhoneClickProofRejection.DESCENDANT_STRUCTURE)
     val parentPath = targetPath.dropLast(1)
     // This verified sibling identifies the homepage search bar; arbitrary product buttons are unknown.
     val camera = signatures.entries.filter { (path, signature) ->
         path != targetPath && path.size == targetPath.size && path.dropLast(1) == parentPath &&
             signature.packageName == "com.jingdong.app.mall" && signature.role == "android.widget.Button" &&
             signature.description == "拍照购" && signature.text.isBlank()
-    }.singleOrNull() ?: return null
-    if (!safe(camera.value) || !camera.value.clickable) return null
+    }.singleOrNull() ?: return reject(PhoneClickProofRejection.CAMERA_MISSING_OR_AMBIGUOUS)
+    if (!safe(camera.value)) return null
+    if (!camera.value.clickable) return reject(PhoneClickProofRejection.TARGET_UNAVAILABLE)
     val cameraTree = signatures.entries.filter { (path, _) -> path.take(camera.key.size) == camera.key }
     if (cameraTree.any { !safe(it.value) }) return null
     val parent = ancestors.last().copy(text = "", description = "", contentFingerprint = "")
@@ -114,42 +116,54 @@ private fun isJdSearchEntryCandidate(path: List<Int>, signatures: Map<List<Int>,
 
 private data class SearchEntryContext(val fingerprint: String, val recommendationPath: List<Int>)
 
+private fun phoneClickUnsafeReason(node: AndroidNodeSignature, target: AndroidNodeSignature): PhoneClickProofRejection? = when {
+    node.packageName != target.packageName || node.windowId != target.windowId -> PhoneClickProofRejection.FOREIGN_CONTEXT
+    !node.enabled -> PhoneClickProofRejection.DISABLED_CONTEXT
+    node.password || node.sensitive -> PhoneClickProofRejection.SENSITIVE_CONTEXT
+    node.truncated || node.metadataTruncated || node.inspectionIncomplete -> PhoneClickProofRejection.TRUNCATED_CONTEXT
+    node.requiresUserConfirmation -> PhoneClickProofRejection.RESTRICTED_CONTEXT
+    else -> null
+}
+
 /** The recommendation is content inside this verified search entry, never a generic product card. */
 private fun searchEntryContext(
     path: List<Int>,
     signatures: Map<List<Int>, AndroidNodeSignature>,
+    onFailure: (PhoneClickProofRejection) -> Unit,
 ): SearchEntryContext? {
-    if (!isJdSearchEntryCandidate(path, signatures) || signatures.values.count(::isJdSearchBar) != 1) return null
+    fun reject(reason: PhoneClickProofRejection): SearchEntryContext? { onFailure(reason); return null }
+    if (!isJdSearchEntryCandidate(path, signatures)) return reject(PhoneClickProofRejection.TARGET_STRUCTURE)
+    if (signatures.values.count(::isJdSearchBar) != 1) return reject(PhoneClickProofRejection.SEARCH_BAR_AMBIGUOUS)
     val target = signatures.getValue(path)
     val parentPath = path.dropLast(1)
     val parent = signatures.getValue(parentPath)
     val bar = signatures.getValue(path.dropLast(2))
-    fun safe(node: AndroidNodeSignature) = node.packageName == target.packageName && node.windowId == target.windowId &&
-        node.enabled && !node.password && !node.sensitive && !node.truncated && !node.metadataTruncated &&
-        !node.inspectionIncomplete && !node.requiresUserConfirmation
-    val ancestors = (0 until path.size).map { signatures[path.take(it)] ?: return null }
-    if (ancestors.any { !safe(it) } || !safe(target) || target.viewId.isNotEmpty() ||
+    fun safe(node: AndroidNodeSignature): Boolean = phoneClickUnsafeReason(node, target)?.let { onFailure(it); false } ?: true
+    val ancestors = (0 until path.size).map { signatures[path.take(it)] ?: return reject(PhoneClickProofRejection.MISSING_ANCESTOR) }
+    if (ancestors.any { !safe(it) } || !safe(target)) return null
+    if (target.viewId.isNotEmpty() ||
         target.longClickable || target.editable || target.scrollable || parent.viewId.isNotEmpty() ||
         parent.longClickable || parent.editable || parent.scrollable || bar.clickable || bar.longClickable ||
-        bar.editable || bar.scrollable) return null
+        bar.editable || bar.scrollable) return reject(PhoneClickProofRejection.TARGET_STRUCTURE)
     val descendants = signatures.entries.filter { (childPath, _) ->
         childPath.size > path.size && childPath.take(path.size) == path
     }
     // Preserve the complete subtree topology, including unlabelled and invisible descendants.
-    val recommendation = descendants.singleOrNull() ?: return null
+    val recommendation = descendants.singleOrNull() ?: return reject(PhoneClickProofRejection.DESCENDANT_STRUCTURE)
     val label = recommendation.value
-    if (recommendation.key != path + 0 || !safe(label) || label.role != "android.widget.TextView" ||
+    if (!safe(label)) return null
+    if (recommendation.key != path + 0 || label.role != "android.widget.TextView" ||
         label.viewId.isNotEmpty() || label.text.isBlank() || label.description != label.text ||
-        label.clickable || label.longClickable || label.editable || label.scrollable) return null
+        label.clickable || label.longClickable || label.editable || label.scrollable) return reject(PhoneClickProofRejection.DESCENDANT_STRUCTURE)
     val search = signatures.entries.filter { (_, value) -> isJdSearchNavigationSignature(value) }.singleOrNull()
-        ?: return null
-    if (search.key.size != path.size || search.key.dropLast(1) != parentPath ||
-        phoneClickRevalidationContext(search.key, signatures) == null) return null
+        ?: return reject(PhoneClickProofRejection.SEARCH_MISSING_OR_AMBIGUOUS)
+    if (search.key.size != path.size || search.key.dropLast(1) != parentPath) return reject(PhoneClickProofRejection.TARGET_STRUCTURE)
+    if (phoneClickRevalidationContext(search.key, signatures, onFailure) == null) return null
     val camera = signatures.entries.filter { (childPath, value) ->
         childPath.size == path.size && childPath.dropLast(1) == parentPath &&
             value.packageName == target.packageName && value.role == "android.widget.Button" &&
             value.description == "拍照购" && value.text.isBlank()
-    }.singleOrNull() ?: return null
+    }.singleOrNull() ?: return reject(PhoneClickProofRejection.CAMERA_MISSING_OR_AMBIGUOUS)
     val fixedTrees = signatures.entries.filter { (childPath, _) ->
         childPath.take(search.key.size) == search.key || childPath.take(camera.key.size) == camera.key
     }
@@ -160,7 +174,7 @@ private fun searchEntryContext(
     if (!contains(bar, parent) || !contains(parent, target) || !contains(target, label) ||
         !contains(parent, search.value) || !contains(parent, camera.value) ||
         target.top != parent.top || target.bottom != parent.bottom ||
-        target.right > camera.value.left || target.right > search.value.left || camera.value.right > search.value.left) return null
+        target.right > camera.value.left || target.right > search.value.left || camera.value.right > search.value.left) return reject(PhoneClickProofRejection.GEOMETRY_MISMATCH)
     val fingerprint = phoneClickProofHash("JD_SEARCH_ENTRY:v1\n$bar\n$parent\n" + fixedTrees.joinToString("\n") {
         "${it.key.drop(parentPath.size)}:${it.value}"
     })
@@ -183,14 +197,17 @@ internal fun buildPhoneClickRevalidationProofs(
         if (scopedCandidates.size > 1) {
             // Two candidates prove ambiguity even when one is unsafe or omitted from the preview.
             scopedCandidates.keys.take(2).map { path ->
-                PhoneClickRevalidationProof("", path, "", "", "", "", scope, restricted = true)
+                PhoneClickRevalidationProof("", path, "", "", "", "", scope, restricted = true,
+                    failure = PhoneClickProofRejection.SCOPE_AMBIGUOUS)
             }
         } else scopedCandidates.map { (path, signature) ->
             val ancestors = (0 until path.size).mapNotNull { signatures[path.take(it)] }
+            var failure: PhoneClickProofRejection? = null
+            val rejected: (PhoneClickProofRejection) -> Unit = { if (failure == null) failure = it }
             val navigation = if (scope == PhoneClickRevalidationScope.JD_SEARCH_NAVIGATION) {
-                phoneClickRevalidationContext(path, signatures)
+                phoneClickRevalidationContext(path, signatures, rejected)
             } else null
-            val entry = if (scope == PhoneClickRevalidationScope.JD_SEARCH_ENTRY) searchEntryContext(path, signatures) else null
+            val entry = if (scope == PhoneClickRevalidationScope.JD_SEARCH_ENTRY) searchEntryContext(path, signatures, rejected) else null
             fun normalized(nodePath: List<Int>, value: AndroidNodeSignature): AndroidNodeSignature = when {
                 entry == null -> value
                 nodePath == path -> value.copy(right = 0)
@@ -213,6 +230,13 @@ internal fun buildPhoneClickRevalidationProofs(
                 restricted = contextFingerprint.isBlank() || ancestors.size != path.size || node == null ||
                     node.requiresUserConfirmation || !node.enabled || !node.clickable || node.password ||
                     ancestors.any { it.sensitive || it.inspectionIncomplete || it.requiresUserConfirmation || !it.enabled },
+                failure = failure ?: when {
+                    ancestors.size != path.size -> PhoneClickProofRejection.MISSING_ANCESTOR
+                    node == null -> PhoneClickProofRejection.PREVIEW_UNAVAILABLE
+                    node.requiresUserConfirmation -> PhoneClickProofRejection.RESTRICTED_CONTEXT
+                    !node.enabled || !node.clickable || node.password -> PhoneClickProofRejection.TARGET_UNAVAILABLE
+                    else -> null
+                },
             )
         }
     }
@@ -224,3 +248,56 @@ internal fun hasEligiblePhoneClickRevalidationProof(proofs: List<PhoneClickReval
 
 internal fun phoneClickProofHash(value: String): String = MessageDigest.getInstance("SHA-256")
     .digest(value.toByteArray(Charsets.UTF_8)).joinToString("") { "%02x".format(it) }
+
+internal fun phoneClickAnchorEvent(type: Int): PhoneClickAnchorEvent = when (type) {
+    AccessibilityEvent.TYPE_WINDOWS_CHANGED -> PhoneClickAnchorEvent.WINDOWS_CHANGED
+    AccessibilityEvent.TYPE_WINDOW_STATE_CHANGED -> PhoneClickAnchorEvent.WINDOW_STATE_CHANGED
+    AccessibilityEvent.TYPE_WINDOW_CONTENT_CHANGED -> PhoneClickAnchorEvent.CONTENT_CHANGED
+    AccessibilityEvent.TYPE_VIEW_TEXT_CHANGED -> PhoneClickAnchorEvent.TEXT_CHANGED
+    AccessibilityEvent.TYPE_VIEW_SCROLLED -> PhoneClickAnchorEvent.SCROLLED
+    AccessibilityEvent.TYPE_VIEW_CLICKED -> PhoneClickAnchorEvent.CLICKED
+    AccessibilityEvent.TYPE_VIEW_FOCUSED -> PhoneClickAnchorEvent.FOCUSED
+    AccessibilityEvent.TYPE_VIEW_TEXT_SELECTION_CHANGED -> PhoneClickAnchorEvent.TEXT_SELECTION_CHANGED
+    AccessibilityEvent.TYPE_VIEW_ACCESSIBILITY_FOCUSED -> PhoneClickAnchorEvent.ACCESSIBILITY_FOCUSED
+    AccessibilityEvent.TYPE_VIEW_ACCESSIBILITY_FOCUS_CLEARED -> PhoneClickAnchorEvent.ACCESSIBILITY_FOCUS_CLEARED
+    else -> PhoneClickAnchorEvent.OTHER
+}
+
+/** One observation's bounded metadata. Never retains an extra tree or exports its identity keys. */
+internal class PhoneClickDiagnosticHistory {
+    private data class Target(val id: String, val failure: PhoneClickProofRejection?, val eligible: Boolean)
+    private data class Record(
+        val token: PhoneSessionToken, val observationId: String, val targets: List<Target>,
+        val clearReason: PhoneClickAnchorClearReason? = null, val clearEvent: PhoneClickAnchorEvent? = null,
+    )
+    private var record: Record? = null
+
+    @Synchronized fun built(token: PhoneSessionToken, observationId: String, proofs: List<PhoneClickRevalidationProof>) {
+        record = Record(token, observationId, proofs.take(4).map {
+            Target(it.nodeId, it.failure, matchPhoneClickRevalidation(it, proofs, false, false) != null)
+        })
+    }
+
+    @Synchronized fun cleared(token: PhoneSessionToken, observationId: String, reason: PhoneClickAnchorClearReason, event: PhoneClickAnchorEvent?) {
+        val current = record ?: return
+        if (current.token == token && current.observationId == observationId) {
+            record = current.copy(clearReason = reason, clearEvent = event)
+        }
+    }
+
+    @Synchronized fun reset() { record = null }
+
+    @Synchronized fun describe(token: PhoneSessionToken, observationId: String, nodeId: String): PhoneClickRevalidationDiagnostic? {
+        val current = record?.takeIf { it.token == token && it.observationId == observationId } ?: return null
+        val target = current.targets.singleOrNull { it.id == nodeId }
+        return PhoneClickRevalidationDiagnostic(
+            stage = PhoneClickRevalidationStage.NO_ANCHOR,
+            candidateCount = current.targets.size, eligibleCount = current.targets.count { it.eligible },
+            targetProofReason = target?.failure,
+            proofReasons = current.targets.mapNotNull { it.failure }.distinct().take(4).ifEmpty {
+                if (current.targets.isEmpty()) listOf(PhoneClickProofRejection.NO_CANDIDATE) else emptyList()
+            },
+            lastClearReason = current.clearReason, lastClearEvent = current.clearEvent,
+        )
+    }
+}

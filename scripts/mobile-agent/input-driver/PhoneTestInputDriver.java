@@ -317,6 +317,7 @@ public final class PhoneTestInputDriver extends Instrumentation {
         // Explicit local inspection of our own tool-detail sheet; third-party pages keep small limits.
         boolean toolDetail = "me.rerere.rikkahub.debug".equals(expected)
             && "true".equals(arguments.getString("tool_detail_text", "false"));
+        boolean nodeMetadata = "true".equals(arguments.getString("node_metadata", "false"));
         int textLimit = toolDetail ? 96000 : 900;
         int outputLimit = toolDetail ? 128000 : 18000;
         result.putString("ui_error_code", "UI_AUTOMATION_UNAVAILABLE");
@@ -358,6 +359,24 @@ public final class PhoneTestInputDriver extends Instrumentation {
                         if (text != null || description != null || node.isClickable() || node.isEditable() || node.isScrollable()) {
                             output.append(bounds.toShortString()).append(" click=").append(node.isClickable())
                                 .append(" edit=").append(node.isEditable()).append(" scroll=").append(node.isScrollable()).append(" ");
+                            if (nodeMetadata) {
+                                output.append("class=").append(gapMetadata(node.getClassName(), 160))
+                                    .append(" viewId=").append(gapMetadata(node.getViewIdResourceName(), 256));
+                                AccessibilityNodeInfo parent = node.getParent();
+                                if (parent != null) {
+                                    try {
+                                        if (expected.contentEquals(parent.getPackageName() == null ? "" : parent.getPackageName())
+                                            && !parent.isPassword() && !(android.os.Build.VERSION.SDK_INT >= 34 && parent.isAccessibilityDataSensitive())) {
+                                            Rect parentBounds = new Rect();
+                                            parent.getBoundsInScreen(parentBounds);
+                                            output.append(" parentClass=").append(gapMetadata(parent.getClassName(), 160))
+                                                .append(" parentId=").append(gapMetadata(parent.getViewIdResourceName(), 256))
+                                                .append(" parentBounds=").append(parentBounds.toShortString());
+                                        }
+                                    } finally { parent.recycle(); }
+                                }
+                                output.append(" | ");
+                            }
                             if (text != null) {
                                 int kept = Math.min(text.length(), Math.min(textLimit, Math.max(0, outputLimit - output.length())));
                                 textTruncated |= kept < text.length();

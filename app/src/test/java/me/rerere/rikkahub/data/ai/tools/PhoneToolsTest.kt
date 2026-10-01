@@ -25,6 +25,10 @@ import me.rerere.rikkahub.data.mobileagent.PhoneBackendResult
 import me.rerere.rikkahub.data.mobileagent.PhoneBackendState
 import me.rerere.rikkahub.data.mobileagent.PhoneBackendStopReason
 import me.rerere.rikkahub.data.mobileagent.PhoneController
+import me.rerere.rikkahub.data.mobileagent.PhoneClickRevalidationDiagnostic
+import me.rerere.rikkahub.data.mobileagent.PhoneClickRevalidationStage
+import me.rerere.rikkahub.data.mobileagent.PhoneClickAnchorClearReason
+import me.rerere.rikkahub.data.mobileagent.PhoneClickAnchorEvent
 import me.rerere.rikkahub.data.mobileagent.PhoneObservation
 import me.rerere.rikkahub.data.mobileagent.PhonePermit
 import me.rerere.rikkahub.data.mobileagent.PhoneSessionToken
@@ -36,6 +40,37 @@ import org.junit.Test
 
 class PhoneToolsTest {
     private val empty = JsonObject(emptyMap())
+
+    @Test fun `click refusal exposes fixed anchor failure with no observation or target identifiers`() = runBlocking {
+        val backend = FakeBackend().apply {
+            clickDiagnostic = PhoneClickRevalidationDiagnostic(PhoneClickRevalidationStage.NO_ANCHOR,
+                candidateCount = 2, eligibleCount = 2,
+                lastClearReason = PhoneClickAnchorClearReason.ACCESSIBILITY_EVENT,
+                lastClearEvent = PhoneClickAnchorEvent.SCROLLED)
+        }
+        val controller = controller(backend)
+        try {
+            val token = controller.start("private-conversation", "private-assistant", "target")
+            val screen = controller.observe(token)
+            backend.state.value = backend.state.value.copy(windowRevision = 2)
+            val tool = createPhoneTools(controller, token, Json).first { it.name.endsWith("_click") }
+            val output = tool.execute(buildJsonObject {
+                put("snapshot_id", screen.id); put("node_id", "private-node")
+            })
+            val raw = (output.single() as UIMessagePart.Text).text
+            val result = Json.parseToJsonElement(raw).jsonObject
+            val diagnostic = result.getValue("snapshot_validation").jsonObject.getValue("click_revalidation").jsonObject
+            assertEquals("STALE_SNAPSHOT", result["code"]?.jsonPrimitive?.content)
+            assertEquals("NO_ANCHOR", diagnostic["stage"]?.jsonPrimitive?.content)
+            assertEquals("SCROLLED", diagnostic["last_clear_event"]?.jsonPrimitive?.content)
+            assertEquals("2", diagnostic["eligible_count"]?.jsonPrimitive?.content)
+            assertEquals(setOf("stage", "anchor_present", "candidate_count", "eligible_count", "target_proof_reason",
+                "proof_reasons", "last_clear_reason", "last_clear_event"), diagnostic.keys)
+            assertFalse(raw.contains("private-"))
+            assertFalse(raw.contains("fingerprint"))
+            assertEquals(0, backend.actions)
+        } finally { controller.close() }
+    }
 
     @Test fun `stale snapshot error includes fixed cause metadata without page contents`() = runBlocking {
         val backend = FakeBackend()
@@ -363,8 +398,11 @@ class PhoneToolsTest {
         var actions = 0
         var cancelObservation = false
         var failObservation = false
+        var clickDiagnostic: PhoneClickRevalidationDiagnostic? = null
         var afterDispatch: () -> Unit = {}
         override fun isTargetAllowed(packageName: String) = packageName == "target"
+        override fun clickRevalidationDiagnostic(token: PhoneSessionToken, observation: PhoneObservation, nodeId: String) =
+            clickDiagnostic ?: super.clickRevalidationDiagnostic(token, observation, nodeId)
         override fun showSessionNotice(token: PhoneSessionToken, targetPackage: String, onStop: (PhoneBackendStopReason) -> Unit) = true
         override fun endSessionNotice() = Unit
         override suspend fun observe(permit: PhonePermit): PhoneObservation {

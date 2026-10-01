@@ -3,6 +3,7 @@ package me.rerere.rikkahub.data.shopping
 import kotlinx.serialization.SerialName
 import kotlinx.serialization.Serializable
 import java.math.BigDecimal
+import java.text.Normalizer
 import java.util.Locale
 
 /** Supplied by the host from real observations in the current grant, never by tool arguments. */
@@ -34,6 +35,32 @@ data class ShoppingRating(
 )
 
 @Serializable
+enum class ShoppingComparisonMode { EXACT_PRODUCT, FUNCTIONAL_ALTERNATIVES }
+
+@Serializable
+enum class ShoppingFunctionalCategory { USB_C_CABLE }
+
+/** Values are parsed locally from complete observed nodes, never supplied as a model grouping key. */
+@Serializable
+data class ShoppingCableSpecEvidence(
+    val connectors: ShoppingEvidenceRef? = null,
+    val power: ShoppingEvidenceRef? = null,
+    val length: ShoppingEvidenceRef? = null,
+    @SerialName("pack_quantity") val packQuantity: ShoppingEvidenceRef? = null,
+)
+
+@Serializable
+data class ShoppingFunctionalSpecification(
+    val category: ShoppingFunctionalCategory,
+    val connectors: String,
+    @SerialName("power_watts") val powerWatts: Int,
+    @SerialName("length_mm") val lengthMm: Int,
+    @SerialName("units_per_pack") val unitsPerPack: Int,
+    @SerialName("item_unit") val itemUnit: String = "条",
+    @SerialName("price_unit") val priceUnit: String = "包",
+)
+
+@Serializable
 data class ShoppingCandidate(
     val id: String,
     @SerialName("product_identity") val productIdentity: ShoppingFact,
@@ -47,6 +74,9 @@ data class ShoppingCandidate(
     val rating: ShoppingRating? = null,
     @SerialName("quality_evidence") val qualityEvidence: List<ShoppingFact> = emptyList(),
     val unknowns: List<String> = emptyList(),
+    val brand: ShoppingFact? = null,
+    val store: ShoppingFact? = null,
+    @SerialName("cable_spec_evidence") val cableSpecEvidence: ShoppingCableSpecEvidence? = null,
 )
 
 @Serializable
@@ -92,6 +122,8 @@ data class ShoppingComparisonRequest(
     val candidates: List<ShoppingCandidate>,
     val coupons: List<ShoppingCoupon> = emptyList(),
     val compatibility: List<ShoppingCompatibility> = emptyList(),
+    @SerialName("comparison_mode") val comparisonMode: ShoppingComparisonMode = ShoppingComparisonMode.EXACT_PRODUCT,
+    @SerialName("functional_category") val functionalCategory: ShoppingFunctionalCategory? = null,
 )
 
 @Serializable
@@ -120,7 +152,15 @@ data class ShoppingCandidateResult(
     @SerialName("quality_evidence") val qualityEvidence: List<ShoppingFact>,
     @SerialName("coupon_decisions") val couponDecisions: List<ShoppingCouponDecision>,
     val unknowns: List<String>,
+    @SerialName("product_identity") val productIdentity: ShoppingFact? = null,
+    val specification: ShoppingFact? = null,
+    val brand: ShoppingFact? = null,
+    val store: ShoppingFact? = null,
 )
+
+@Serializable
+/** Unresolved units/specifications retain raw facts, never an already simulated payable total. */
+data class ShoppingUnrankedCandidate(val candidate: ShoppingCandidate, val reasons: List<String>)
 
 @Serializable
 enum class ShoppingRankingBasis { CONFIRMED_PAYABLE, CONFIRMED_PAYABLE_THEN_DISPLAYED_SUBTOTAL, DISPLAYED_SUBTOTAL }
@@ -152,6 +192,7 @@ data class ShoppingComparisonGroup(
     @SerialName("has_unpriced_candidates") val hasUnpricedCandidates: Boolean,
     @SerialName("ranking_basis") val rankingBasis: ShoppingRankingBasis,
     @SerialName("displayed_subtotal_prefilter") val displayedSubtotalPrefilter: ShoppingDisplayedSubtotalPrefilter,
+    @SerialName("functional_specification") val functionalSpecification: ShoppingFunctionalSpecification? = null,
 )
 
 @Serializable
@@ -161,8 +202,11 @@ data class ShoppingComparisonResult(
     val groups: List<ShoppingComparisonGroup>,
     @SerialName("possible_duplicate_candidate_ids") val possibleDuplicateCandidateIds: List<String> = emptyList(),
     @SerialName("product_binding_verified") val productBindingVerified: Boolean = false,
+    @SerialName("comparison_mode") val comparisonMode: ShoppingComparisonMode = ShoppingComparisonMode.EXACT_PRODUCT,
+    @SerialName("unranked_candidates") val unrankedCandidates: List<ShoppingUnrankedCandidate> = emptyList(),
     val limitations: List<String> = listOf(
-        "排序仅限本次已观察证据中商品身份、规格和数量相同的候选，不是全平台最低价。",
+        "EXACT_PRODUCT仅比较同身份、规格与数量；FUNCTIONAL_ALTERNATIVES仅比较本地可解析的同用途、核心规格、每包数量及购买数量，品牌和店铺仍分别保留，不是全平台最低价。",
+        "功能属性一致只说明已引用文字的比较口径一致，不证明性能、质量相同或商品归属；未解析、缺失或多规格候选不参与横向排序。",
         "当前仅核对引用来自真实观察节点，尚未核证标题、规格、价格、店铺和优惠属于同一商品；候选ID或条数不能证明不同SKU，排序不是最终最优。",
         "单个候选的商品身份、规格和单价必须来自同一快照；此约束只拦截跨快照拼接，不证明同页节点属于同一商品或SKU。",
         "跨快照相同标题和规格仅标记可能重复，可能是同一商品再次出现，也可能是不同店铺同款；不会自动合并或宣称已确认独立商品。",
@@ -182,6 +226,9 @@ class DiscountEngine(private val nowMillis: () -> Long = System::currentTimeMill
         checkInput(request.candidates.map { it.id }.distinct().size == request.candidates.size &&
             request.coupons.map { it.id }.distinct().size == request.coupons.size, "候选和券的ID必须分别唯一。")
         checkInput(request.compatibility.size <= 66, "叠加关系数量超过上限。")
+        checkInput(request.comparisonMode != ShoppingComparisonMode.FUNCTIONAL_ALTERNATIVES ||
+            request.functionalCategory == ShoppingFunctionalCategory.USB_C_CABLE,
+            "功能替代比较须明确支持的用途类别；当前仅支持USB-C数据线，不猜测其他商品的核心规格。")
         val evidence = EvidenceIndex(observed)
         request.candidates.forEach { validateCandidate(it, evidence) }
         val coreKeys = request.candidates.map { candidate ->
@@ -222,9 +269,27 @@ class DiscountEngine(private val nowMillis: () -> Long = System::currentTimeMill
             pairRules[key] = rule.stackable
         }
         val now = nowMillis()
-        val groups = request.candidates.groupBy { Triple(it.productIdentity.value.trim(), it.specification.value.trim(), it.quantity) }
-            .map { (key, candidates) ->
-                val evaluated = candidates.map { evaluate(it, request.coupons, pairRules, evidence, now) }
+        val results = request.candidates.associate { it.id to evaluate(it, request.coupons, pairRules, evidence, now) }
+        val unranked = mutableListOf<ShoppingUnrankedCandidate>()
+        data class GroupKey(val identity: String, val specification: String, val quantity: Int,
+            val functional: ShoppingFunctionalSpecification? = null)
+        val grouped = linkedMapOf<GroupKey, MutableList<ShoppingCandidateResult>>()
+        request.candidates.forEach { candidate ->
+            val functional = if (request.comparisonMode == ShoppingComparisonMode.FUNCTIONAL_ALTERNATIVES) {
+                val parsed = parseCableSpecification(candidate, evidence)
+                if (parsed.specification == null) {
+                    unranked += ShoppingUnrankedCandidate(candidate, parsed.reasons)
+                    return@forEach
+                }
+                parsed.specification
+            } else null
+            val key = if (functional == null) GroupKey(candidate.productIdentity.value.trim(), candidate.specification.value.trim(), candidate.quantity)
+            else GroupKey("USB-C数据线（功能替代比较，商品身份分别保留）",
+                "${functional.connectors} / ${functional.powerWatts}W / ${functional.lengthMm}mm / ${functional.unitsPerPack}条装",
+                candidate.quantity, functional)
+            grouped.getOrPut(key) { mutableListOf() } += results.getValue(candidate.id)
+        }
+        val groups = grouped.map { (key, evaluated) ->
                 val ranked = evaluated.sortedWith(
                     compareBy<ShoppingCandidateResult> { it.confirmedPlan?.payableCents ?: Long.MAX_VALUE }
                         .thenBy { if (it.confirmedPlan == null) it.merchandiseSubtotalCents else 0L },
@@ -241,12 +306,13 @@ class DiscountEngine(private val nowMillis: () -> Long = System::currentTimeMill
                         if (it.otherFeesCents == null) add("other_fees")
                     }, it.unknowns)
                 })
-                ShoppingComparisonGroup(key.first, key.second, key.third, ranked,
+                ShoppingComparisonGroup(key.identity, key.specification, key.quantity, ranked,
                     ranked.filter { lowest != null && it.confirmedPlan?.payableCents == lowest }.map { it.id },
-                    ranked.any { it.confirmedPlan == null }, basis, prefilter)
+                    ranked.any { it.confirmedPlan == null }, basis, prefilter, key.functional)
             }
         return ShoppingComparisonResult(evaluatedAtEpochMillis = now, groups = groups,
-            possibleDuplicateCandidateIds = request.candidates.map { it.id }.filter { it in possibleDuplicateIds })
+            possibleDuplicateCandidateIds = request.candidates.map { it.id }.filter { it in possibleDuplicateIds },
+            comparisonMode = request.comparisonMode, unrankedCandidates = unranked)
     }
 
     private fun coreRefs(candidate: ShoppingCandidate) = listOf(
@@ -273,6 +339,14 @@ class DiscountEngine(private val nowMillis: () -> Long = System::currentTimeMill
         candidate.otherFees?.let { evidence.money(it, allowFree = true) }
         checkInput(candidate.qualityEvidence.size <= 8 && candidate.unknowns.size <= 20 && candidate.unknowns.all { it.length <= 300 }, "候选证据或未知条件过长。")
         candidate.qualityEvidence.forEach(evidence::fact)
+        candidate.brand?.let(evidence::fact)
+        candidate.store?.let(evidence::fact)
+        val addedRefs = listOfNotNull(candidate.brand?.evidence, candidate.store?.evidence) +
+            candidate.cableSpecEvidence?.let { listOfNotNull(it.connectors, it.power, it.length, it.packQuantity) }.orEmpty()
+        addedRefs.forEach(evidence::source)
+        if (addedRefs.any { it.snapshotId != candidate.productIdentity.evidence.snapshotId }) throw ShoppingComparisonException(
+            "candidate_evidence_mismatch", "商品品牌、店铺和功能规格引用必须与该候选核心证据同一快照；尚无商品归属时不能跨页拼接。",
+        )
         candidate.rating?.let { rating ->
             evidence.source(rating.evidence)
             val value = rating.value.toBigDecimalOrNull()
@@ -288,8 +362,109 @@ class DiscountEngine(private val nowMillis: () -> Long = System::currentTimeMill
         }
         val refs = coreRefs(candidate) +
             listOfNotNull(candidate.quantityEvidence, candidate.shipping?.evidence, candidate.otherFees?.evidence, candidate.rating?.evidence, candidate.rating?.reviewCountEvidence) +
-            candidate.qualityEvidence.map { it.evidence }
+            candidate.qualityEvidence.map { it.evidence } + addedRefs
         checkInput(refs.map(evidence::source).distinct().size == 1, "单个候选必须来自同一应用，不能拼接不同店铺页面的价格。")
+    }
+
+    private data class ParsedCable(val specification: ShoppingFunctionalSpecification?, val reasons: List<String>)
+
+    /** Deliberately small grammar: unclear/ranged/multiple specifications stay outside rankings. */
+    private fun parseCableSpecification(candidate: ShoppingCandidate, evidence: EvidenceIndex): ParsedCable {
+        val refs = candidate.cableSpecEvidence
+        val reasons = mutableListOf<String>()
+        fun full(ref: ShoppingEvidenceRef?): String? = ref?.let { normalizeSpec(evidence.fullText(it)) }
+        val identity = normalizeSpec(evidence.fullText(candidate.productIdentity.evidence) + "\n" +
+            evidence.fullText(candidate.specification.evidence))
+        if (!Regex("数据线|充电线|快充线|连接线|cable").containsMatchIn(identity) ||
+            Regex("充电器|充电头|电源适配器|转接头|扩展坞").containsMatchIn(identity)) {
+            reasons += "用途未能确认是单独数据线，不能把充电器、转接器或组合商品当作相同用途。"
+        }
+        val connectorText = full(refs?.connectors)?.replace(Regex("usb\\s*-?\\s*c|type\\s*-?\\s*c"), "c")
+            ?.replace(Regex("\\s+"), "")
+        val connectorsKnown = connectorText != null &&
+            Regex("双(?:头)?c|c(?:公)?(?:对|转|到|to|-|2)c(?:公)?").containsMatchIn(connectorText) &&
+            !Regex("lightning|雷电接口|micro.?usb|usb-?a|type-?a|a(?:对|转|到|to|-|2)c|c(?:对|转|到|to|-|2)a|一拖|三合一|多接口|非双c|不是|不支持")
+                .containsMatchIn(connectorText)
+        if (!connectorsKnown) reasons += "连接器缺失、存在其他接口或表达未能解析为USB-C对USB-C。"
+        val powerText = full(refs?.power)
+        val power = parseSingleMeasurement(powerText, "w|瓦", mapOf("w" to BigDecimal.ONE, "瓦" to BigDecimal.ONE), 1_000)
+        if (power == null) reasons += "额定功率缺失、表达不明确或同时出现多个功率规格，不能猜测W数。"
+        val length = parseSingleMeasurement(full(refs?.length), "毫米|厘米|mm|cm|米|m",
+            mapOf("毫米" to BigDecimal.ONE, "mm" to BigDecimal.ONE, "厘米" to BigDecimal.TEN,
+                "cm" to BigDecimal.TEN, "米" to BigDecimal(1_000), "m" to BigDecimal(1_000)), 100_000)
+        if (length == null) reasons += "长度缺失、范围或多规格不能合并比较；须有唯一可解析的米/厘米/毫米证据。"
+        val packText = full(refs?.packQuantity)
+        val pack = parsePackQuantity(packText)
+        if (pack == null) reasons += "每包条数缺失、范围或多包装规格不能猜测为单条；须有明确条/根单位。"
+        val priceText = normalizeSpec(evidence.fullText(candidate.unitPrice.evidence))
+        if (Regex("(?:每|/)\\s*(?:米|厘米|毫米|m|cm|mm)(?![a-z])").containsMatchIn(priceText)) {
+            reasons += "展示单价的计价单位与每包价格不一致，不能直接乘购买包数。"
+        }
+        if (pack != null && pack > 1 && !hasExplicitPackPrice(priceText, candidate.unitPrice.amount)) {
+            reasons += "多条包装须有与所报金额直接对应的每包/每套报价；单条、单根、混合口径或单位未明确的价格不能当整包价。"
+        }
+        return ParsedCable(if (reasons.isEmpty()) ShoppingFunctionalSpecification(
+            ShoppingFunctionalCategory.USB_C_CABLE, "USB_C_TO_USB_C", checkNotNull(power), checkNotNull(length), checkNotNull(pack),
+        ) else null, reasons)
+    }
+
+    private fun normalizeSpec(text: String): String = Normalizer.normalize(text, Normalizer.Form.NFKC).lowercase(Locale.ROOT)
+
+    private fun hasExplicitPackPrice(text: String, amount: String): Boolean {
+        // A pack label elsewhere in the node cannot reclassify an individually quoted amount.
+        if (Regex("(?:每|单|一|1|/)\\s*(?:条|根)").containsMatchIn(text)) return false
+        if (hasUncertainNumericExpression(text, "包|套|元") ||
+            Regex("(?<![0-9.])(?:[2-9]|[1-9][0-9]+|二|两|三|四|五|六|七|八|九|十)\\s*(?:包|套)").containsMatchIn(text)) return false
+        val value = "(?<![0-9.])${Regex.escape(amount)}(?![0-9.])"
+        val prefix = "(?:每\\s*(?:包|套)(?:售价|价格|报价|价)?|整\\s*(?:包|套)(?:售价|价格|报价|价)|(?:包|套)价|(?<![0-9])(?:1|一)\\s*(?:包|套))"
+        return Regex("$prefix\\s*(?:为|是)?\\s*[:：]?\\s*[¥￥]?\\s*$value").containsMatchIn(text) ||
+            Regex("$value\\s*元?\\s*(?:/\\s*(?:包|套)|(?:每|一|1)\\s*(?:包|套))").containsMatchIn(text)
+    }
+
+    /** Check the complete field before extracting any endpoint; Chinese counts follow the same rules. */
+    private fun hasUncertainNumericExpression(text: String, units: String): Boolean {
+        val number = "(?:[0-9]+(?:\\.[0-9]+)?|[零〇一二两三四五六七八九十百千万]+|单|双)"
+        val separator = "(?:[\\p{Pd}−~〜∼]|至|到|或|/|、)"
+        val unit = "(?:$units)"
+        val range = Regex("$number\\s*(?:$unit\\s*)?$separator\\s*$number")
+        val prefix = Regex("(?:大约|约为|约|大概|接近|近|大于|小于|超过|不足|少于|多于|至少|至多|最多|最少|不超过|不少于|不低于|不高于|不满|[≈≃≅≥≤><±−-])\\s*$number\\s*$unit")
+        val suffix = Regex("$number\\s*$unit\\s*(?:装\\s*)?(?:及以上|及以下|以上|以下|以内|以外|左右|上下|起|不等|[+＋])")
+        return range.containsMatchIn(text) || prefix.containsMatchIn(text) || suffix.containsMatchIn(text)
+    }
+
+    private fun parseSingleMeasurement(text: String?, units: String, factors: Map<String, BigDecimal>, maximum: Int): Int? {
+        if (text == null) return null
+        val number = "[0-9]+(?:\\.[0-9]+)?"
+        if (hasUncertainNumericExpression(text, units) ||
+            Regex("(?:不支持|不是|不含|不提供|非)\\s*$number\\s*(?:$units)(?![a-z])").containsMatchIn(text)) return null
+        val matches = Regex("(?<![0-9.])($number)\\s*($units)(?![a-z])").findAll(text).toList()
+        if (matches.isEmpty()) return null
+        val values = matches.map { match ->
+            val amount = match.groupValues[1].toBigDecimalOrNull() ?: return null
+            val scaled = amount.multiply(factors.getValue(match.groupValues[2]))
+            val value = try { scaled.intValueExact() } catch (_: ArithmeticException) { return null }
+            if (value !in 1..maximum) return null
+            value
+        }.distinct()
+        return values.singleOrNull()
+    }
+
+    private fun parsePackQuantity(text: String?): Int? {
+        if (text == null) return null
+        if (Regex("赠|随机|任选|不含|不带").containsMatchIn(text)) return null
+        if (hasUncertainNumericExpression(text, "条|根")) return null
+        // Do not extract a supported suffix from an unsupported compound Chinese numeral.
+        val values = Regex("(?<![0-9.零〇一二两兩三四五六七八九十百千万萬亿億兆壹贰貳叁參肆伍陆陸柒捌玖拾佰仟-])([0-9]+|单|一|二|两|三|四|五|六|七|八|九|十)\\s*(?:条|根)")
+            .findAll(text).toList().map { match ->
+                val value = match.groupValues[1].toIntOrNull() ?: when (match.groupValues[1]) {
+                    "单", "一" -> 1; "二", "两" -> 2; "三" -> 3; "四" -> 4; "五" -> 5
+                    "六" -> 6; "七" -> 7; "八" -> 8; "九" -> 9; "十" -> 10
+                    else -> return null
+                }
+                if (value !in 1..1_000) return null
+                value
+            }.toList().distinct()
+        return values.singleOrNull()
     }
 
     private fun evaluate(candidate: ShoppingCandidate, coupons: List<ShoppingCoupon>, pairs: Map<Set<String>, Boolean>, evidence: EvidenceIndex, now: Long): ShoppingCandidateResult {
@@ -333,7 +508,8 @@ class DiscountEngine(private val nowMillis: () -> Long = System::currentTimeMill
         val afterClaim = if (priceKnown) bestPlan(subtotal, shipping!!, fees!!, usable, pairs)
             .takeIf { it.freeClaimRequired.isNotEmpty() && it.payableCents < confirmed!!.payableCents } else null
         return ShoppingCandidateResult(candidate.id, source, subtotal, shipping, fees, baseline, confirmed, afterClaim, candidate.rating,
-            candidate.qualityEvidence, decisions, unknowns.distinct())
+            candidate.qualityEvidence, decisions, unknowns.distinct(), candidate.productIdentity, candidate.specification,
+            candidate.brand, candidate.store)
     }
 
     private fun bestPlan(subtotal: Long, shipping: Long, fees: Long, coupons: List<ShoppingCoupon>, pairs: Map<Set<String>, Boolean>): ShoppingPricePlan {

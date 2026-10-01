@@ -27,6 +27,208 @@ class DiscountEngineTest {
         fun observed() = nodes.map { (source, values) -> ShoppingObservedEvidence("snapshot-$source", source, values.toList()) }
         fun compare(candidates: List<ShoppingCandidate>, coupons: List<ShoppingCoupon> = emptyList(), pairs: List<ShoppingCompatibility> = emptyList(), now: Long = 1_000) =
             DiscountEngine { now }.compare(ShoppingComparisonRequest(candidates = candidates, coupons = coupons, compatibility = pairs), observed())
+        fun cable(id: String, price: String = "10.00", connectors: String = "USB-C对USB-C", power: String = "60W",
+            length: String = "1米", pack: String = "单条装", quantity: Int = 1, priceText: String? = null): ShoppingCandidate {
+            val original = candidate(id, price)
+            val title = "品牌$id USB-C 数据线"
+            return original.copy(productIdentity = ShoppingFact(title, ref(title)),
+                specification = ShoppingFact("数据线所选规格", ref("数据线所选规格")), quantity = quantity,
+                quantityEvidence = if (quantity == 1) null else ref("购买数量$quantity"),
+                unitPrice = if (priceText == null) original.unitPrice else ShoppingMoney(price, ref(priceText)),
+                brand = ShoppingFact("品牌$id", ref("品牌$id")), store = ShoppingFact("店铺$id", ref("店铺$id")),
+                cableSpecEvidence = ShoppingCableSpecEvidence(ref(connectors), ref(power), ref(length), ref(pack)))
+        }
+        fun alternatives(candidates: List<ShoppingCandidate>) = DiscountEngine { 1_000 }.compare(
+            ShoppingComparisonRequest(candidates = candidates, comparisonMode = ShoppingComparisonMode.FUNCTIONAL_ALTERNATIVES,
+                functionalCategory = ShoppingFunctionalCategory.USB_C_CABLE), observed())
+    }
+
+    @Test fun `functional cable alternatives group different brands with locally equivalent units and retain identities`() {
+        val f = Fixture()
+        val a = f.cable("a", "19.90")
+        val b = f.cable("b", "9.90", connectors = "双C", power = "60瓦", length = "100cm", pack = "1根装")
+        val c = f.cable("c", "12.90", connectors = "Type-C to Type-C", length = "1000毫米", pack = "一条装")
+        val result = f.alternatives(listOf(a, b, c))
+        val group = result.groups.single()
+        assertEquals(listOf("b", "c", "a"), group.rankedCandidates.map { it.id })
+        assertEquals(listOf(b.productIdentity, c.productIdentity, a.productIdentity), group.rankedCandidates.map { it.productIdentity })
+        assertEquals(listOf(b.brand, c.brand, a.brand), group.rankedCandidates.map { it.brand })
+        assertEquals(listOf(b.store, c.store, a.store), group.rankedCandidates.map { it.store })
+        val parsed = checkNotNull(group.functionalSpecification)
+        assertEquals(60, parsed.powerWatts)
+        assertEquals(1_000, parsed.lengthMm)
+        assertEquals(1, parsed.unitsPerPack)
+        assertEquals("条", parsed.itemUnit)
+        assertEquals("包", parsed.priceUnit)
+        assertTrue(result.unrankedCandidates.isEmpty())
+        assertFalse(result.productBindingVerified)
+        assertFalse(group.displayedSubtotalPrefilter.isFinalBest)
+        assertEquals(3, f.compare(listOf(a, b, c)).groups.size)
+    }
+
+    @Test fun `functional grouping is not hardcoded to one test task and separates power length packs and purchases`() {
+        val f = Fixture()
+        val candidates = listOf(f.cable("a", power = "100W", length = "1.5米", pack = "2条装", quantity = 2, priceText = "整包价¥10.00"),
+            f.cable("b", power = "100瓦", length = "150cm", pack = "两根装", quantity = 2, priceText = "每包¥10.00"),
+            f.cable("power", power = "60W", length = "1.5米", pack = "2条装", quantity = 2, priceText = "¥10.00/包"),
+            f.cable("length", power = "100W", length = "2米", pack = "2条装", quantity = 2, priceText = "每套价格为¥10.00"),
+            f.cable("pack", power = "100W", length = "1.5米", quantity = 2),
+            f.cable("quantity", power = "100W", length = "1.5米", pack = "2条装", quantity = 1, priceText = "10.00元一包"))
+        val result = f.alternatives(candidates)
+        assertEquals(5, result.groups.size)
+        assertEquals(setOf("a", "b"), result.groups.single { it.rankedCandidates.size == 2 }.rankedCandidates.map { it.id }.toSet())
+        assertTrue(result.unrankedCandidates.isEmpty())
+    }
+
+    @Test fun `missing cable evidence stays unranked rather than guessing power length or a single pack`() {
+        val f = Fixture()
+        val known = f.cable("known")
+        val missing = listOf(
+            f.cable("all").copy(cableSpecEvidence = null),
+            f.cable("connector").let { it.copy(cableSpecEvidence = it.cableSpecEvidence!!.copy(connectors = null)) },
+            f.cable("power").let { it.copy(cableSpecEvidence = it.cableSpecEvidence!!.copy(power = null)) },
+            f.cable("length").let { it.copy(cableSpecEvidence = it.cableSpecEvidence!!.copy(length = null)) },
+            f.cable("pack").let { it.copy(cableSpecEvidence = it.cableSpecEvidence!!.copy(packQuantity = null)) },
+        )
+        val result = f.alternatives(listOf(known) + missing)
+        assertEquals(listOf("known"), result.groups.single().rankedCandidates.map { it.id })
+        assertEquals(missing.map { it.id }, result.unrankedCandidates.map { it.candidate.id })
+        assertTrue(result.unrankedCandidates.all { it.reasons.isNotEmpty() })
+        assertTrue(f.alternatives(missing).groups.isEmpty())
+    }
+
+    @Test fun `full attribute nodes reject multi spec alternatives despite a narrowed model quote`() {
+        val f = Fixture()
+        val power = f.cable("power", power = "60W/100W可选").let {
+            val specs = checkNotNull(it.cableSpecEvidence)
+            it.copy(cableSpecEvidence = specs.copy(power = specs.power!!.copy(quote = "60W")))
+        }
+        val length = f.cable("length", length = "1米、2米可选")
+        val pack = f.cable("pack", pack = "1条装或2条装")
+        val range = f.cable("range", length = "0.5-1m")
+        val connector = f.cable("connector", connectors = "双C和USB-A转USB-C可选")
+        val result = f.alternatives(listOf(power, length, pack, range, connector))
+        assertTrue(result.groups.isEmpty())
+        assertEquals(5, result.unrankedCandidates.size)
+    }
+
+    @Test fun `unsupported units approximate dimensions and non cable purposes are not functionally ranked`() {
+        val f = Fixture()
+        val candidates = listOf(f.cable("inches", length = "3英尺"), f.cable("approx", length = "约1米"),
+            f.cable("negative", power = "-60W"), f.cable("fractional", length = "0.0001米"),
+            f.cable("pack", pack = "十一条装"), f.cable("unit", pack = "1件"),
+            f.cable("bundle").copy(productIdentity = ShoppingFact("充电器和数据线套装", f.ref("充电器和数据线套装"))))
+        val result = f.alternatives(candidates)
+        assertTrue(result.groups.isEmpty())
+        assertEquals(candidates.size, result.unrankedCandidates.size)
+    }
+
+    @Test fun `functional attributes cannot borrow another page or override truncated host evidence`() {
+        val f = Fixture()
+        val candidate = f.cable("a")
+        val specs = checkNotNull(candidate.cableSpecEvidence)
+        val ref = checkNotNull(specs.length)
+        val altered = candidate.copy(cableSpecEvidence = specs.copy(length = ref.copy(snapshotId = "later")))
+        val later = f.observed().single().copy(snapshotId = "later")
+        val request = ShoppingComparisonRequest(candidates = listOf(altered), comparisonMode = ShoppingComparisonMode.FUNCTIONAL_ALTERNATIVES,
+            functionalCategory = ShoppingFunctionalCategory.USB_C_CABLE)
+        assertEquals("candidate_evidence_mismatch", (runCatching { DiscountEngine().compare(request, f.observed() + later) }
+            .exceptionOrNull() as ShoppingComparisonException).code)
+        val truncated = f.observed().map { page -> page.copy(nodes = page.nodes.map {
+            if (it.nodeId == ref.nodeId) it.copy(truncated = true) else it
+        }) }
+        assertEquals("incomplete_evidence", (runCatching { DiscountEngine().compare(request.copy(candidates = listOf(candidate)), truncated) }
+            .exceptionOrNull() as ShoppingComparisonException).code)
+    }
+
+    @Test fun `functional selection preserves unknown prices and refuses per-item prices for multi-item packs`() {
+        val f = Fixture()
+        val unknown = f.cable("unknown").copy(shipping = null, otherFees = null, priceBeforeListedCoupons = false)
+        val perItem = f.cable("peritem", pack = "2条装").copy(unitPrice = ShoppingMoney("10.00", f.ref("¥10.00/条")))
+        val result = f.alternatives(listOf(unknown, perItem))
+        assertNull(result.groups.single().rankedCandidates.single().confirmedPlan)
+        assertEquals(ShoppingRankingBasis.DISPLAYED_SUBTOTAL, result.groups.single().rankingBasis)
+        assertFalse(result.groups.single().displayedSubtotalPrefilter.isPayable)
+        assertEquals(listOf("peritem"), result.unrankedCandidates.map { it.candidate.id })
+    }
+
+    @Test fun `functional mode requires a supported category and cannot hide duplicate candidate sources`() {
+        val f = Fixture()
+        val candidate = f.cable("a")
+        val request = ShoppingComparisonRequest(candidates = listOf(candidate), comparisonMode = ShoppingComparisonMode.FUNCTIONAL_ALTERNATIVES)
+        assertEquals("invalid_arguments", (runCatching { DiscountEngine().compare(request, f.observed()) }
+            .exceptionOrNull() as ShoppingComparisonException).code)
+        assertEquals("duplicate_candidate_evidence", (runCatching { f.alternatives(listOf(candidate, candidate.copy(id = "renamed"))) }
+            .exceptionOrNull() as ShoppingComparisonException).code)
+    }
+
+    @Test fun `multi item packs require the quoted amount to explicitly price one whole pack`() {
+        for (text in listOf("单条价¥10.00", "¥10.00一条", "每根¥10.00", "单根10.00元", "10.00元/条",
+            "¥10.00", "2包合计¥10.00", "整包价¥10.00/2包", "每包¥5.00，2包¥10.00",
+            "整包价¥20.00，单条价¥10.00", "整包价¥20.00，其他数值10.00")) {
+            val f = Fixture()
+            val candidate = f.cable("a", pack = "2条装", quantity = 2, priceText = text)
+            val result = f.alternatives(listOf(candidate))
+            assertTrue(text, result.groups.isEmpty())
+            assertEquals(candidate, result.unrankedCandidates.single().candidate)
+            assertTrue(text, result.unrankedCandidates.single().reasons.any { "每包/每套报价" in it })
+            // Rejection preserves only raw input facts, with no speculative derived payable plan.
+            val encoded = kotlinx.serialization.json.Json.encodeToString(ShoppingComparisonResult.serializer(), result)
+            assertFalse(text, encoded.contains("\"confirmed_plan\""))
+            assertFalse(text, encoded.contains("\"merchandise_subtotal_cents\""))
+        }
+    }
+
+    @Test fun `explicit whole pack prices retain pack count and multiply only purchased packs`() {
+        for (text in listOf("整包价¥10.00", "每包¥10.00", "每套价格为¥10.00", "10.00元/包", "10.00元一套")) {
+            val f = Fixture()
+            val candidate = f.cable("a", pack = "2条装", quantity = 2, priceText = text)
+            val result = f.alternatives(listOf(candidate))
+            assertTrue(text, result.unrankedCandidates.isEmpty())
+            val group = result.groups.single()
+            assertEquals(2, group.quantity)
+            assertEquals(2, group.functionalSpecification!!.unitsPerPack)
+            assertEquals(2_000L, group.rankedCandidates.single().merchandiseSubtotalCents)
+        }
+    }
+
+    @Test fun `Chinese and Arabic pack ranges approximations and bounds are rejected as complete fields`() {
+        for (text in listOf("一至三条装", "约2条装", "两—三根装", "2–3条装", "一条至三条",
+            "≥2条装", "最多二条装", "2条左右", "两根装以上", "3条+", "二/三根装")) {
+            val f = Fixture()
+            val candidate = f.cable("a", pack = text, priceText = "整包价¥10.00")
+            val result = f.alternatives(listOf(candidate))
+            assertTrue(text, result.groups.isEmpty())
+            assertTrue(text, result.unrankedCandidates.single().reasons.any { "每包条数" in it })
+        }
+    }
+
+    @Test fun `unsupported compound Chinese pack counts cannot be parsed from a trailing supported numeral`() {
+        for (text in listOf("一百零一条装", "一百三条装", "零一条装", "〇一条装", "二十一条装",
+            "一千零一条装", "一万一条装", "一佰一条装", "一億一条装")) {
+            val f = Fixture()
+            val candidate = f.cable("a", pack = text, priceText = "整包价¥10.00")
+            val result = f.alternatives(listOf(candidate))
+            assertTrue(text, result.groups.isEmpty())
+            assertTrue(text, result.unrankedCandidates.single().reasons.any { "每包条数" in it })
+        }
+    }
+
+    @Test fun `Unicode measurement ranges and bounds cannot normalize only the last endpoint`() {
+        val separators = listOf("-", "‐", "‑", "‒", "–", "—", "―", "−", "~", "〜", "∼", "至", "到", "/")
+        for (text in separators.map { "0.5${it}1m" } + listOf("约1m", "至少1米", "1米左右", "≤1m", "1m+")) {
+            val f = Fixture()
+            val candidate = f.cable("a", length = text)
+            val result = f.alternatives(listOf(candidate))
+            assertTrue(text, result.groups.isEmpty())
+            assertTrue(text, result.unrankedCandidates.single().reasons.any { "长度" in it })
+        }
+        for (text in listOf("60–100W", "约60瓦", "≥60W", "60W以上")) {
+            val f = Fixture()
+            val result = f.alternatives(listOf(f.cable("a", power = text)))
+            assertTrue(text, result.groups.isEmpty())
+            assertTrue(text, result.unrankedCandidates.single().reasons.any { "额定功率" in it })
+        }
     }
 
     @Test fun `money is exact integer cents and rejects fractional cents exponents negative and huge input`() {

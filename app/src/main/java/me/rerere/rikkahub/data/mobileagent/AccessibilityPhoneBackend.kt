@@ -65,6 +65,7 @@ class AccessibilityPhoneBackend(
     // A read-only target reference, never a substitute executable snapshot.
     private val clickAnchor = AtomicReference<Snapshot?>(null)
     private val clickContextRevision = AtomicLong(0L)
+    private val clickDiagnosticHistory = PhoneClickDiagnosticHistory()
     private val readDiagnostics = AtomicReference<ReadDiagnosticCapture?>(null)
     private val readDiagnosticAuthority = ReadDiagnosticAuthority()
     private val readDiagnosticFlags = AtomicReference<ReadDiagnosticFlagLease?>(null)
@@ -102,12 +103,13 @@ class AccessibilityPhoneBackend(
         if (!notifications.show(token, targetPackage)) return false
         readDiagnostics.get()?.takeIf { it.token != token }?.stop(ReadDiagnosticStop.REPLACED)
         activeNotice.set(SessionNotice(token, targetPackage, onStop))
+        clickDiagnosticHistory.reset()
         readDiagnosticAuthority.activate(token)
         return true
     }
 
     override fun endSessionNotice() {
-        clearClickAnchor()
+        clearClickAnchor(PhoneClickAnchorClearReason.SESSION_ENDED)
         readDiagnosticAuthority.revoke()
         readDiagnostics.get()?.stop(ReadDiagnosticStop.SESSION_INVALIDATED)
         restoreReadDiagnosticFlags()
@@ -164,7 +166,7 @@ class AccessibilityPhoneBackend(
         controlOverlayWindowId = attachedId
         revision.incrementAndGet()
         snapshot.set(null)
-        clearClickAnchor()
+        clearClickAnchor(PhoneClickAnchorClearReason.OVERLAY_CHANGED)
         refreshEnvironment()
     }
 
@@ -174,7 +176,9 @@ class AccessibilityPhoneBackend(
         recentEvents.addLast(EventMetadata(event.eventType, eventWindowId, packageName))
         if (recentEvents.size > 12) recentEvents.removeFirst()
         if (event.eventType !in observedEvents) {
-            if (shouldClearPhoneClickAnchor(event.eventType, eventWindowId, mutableState.value.windowId, false)) clearClickAnchor()
+            if (shouldClearPhoneClickAnchor(event.eventType, eventWindowId, mutableState.value.windowId, false)) {
+                clearClickAnchor(PhoneClickAnchorClearReason.ACCESSIBILITY_EVENT, phoneClickAnchorEvent(event.eventType))
+            }
             return
         }
         if (eventWindowId >= 0 && !packageName.isNullOrBlank()) windowPackages[eventWindowId] = packageName
@@ -189,7 +193,7 @@ class AccessibilityPhoneBackend(
         // Only target content/text revisions can retain a read-only search reference. Manual
         // navigation, focus, scrolling and structural changes require a new model observation.
         if (shouldClearPhoneClickAnchor(event.eventType, eventWindowId, previous.windowId, ownOverlayEvent)) {
-            clearClickAnchor()
+            clearClickAnchor(PhoneClickAnchorClearReason.ACCESSIBILITY_EVENT, phoneClickAnchorEvent(event.eventType))
         }
         // Do not hide A -> B -> A inside a content retry when the event queue trails the live list.
         if (shouldChangePhoneWindowIdentity(eventWindowId, previous.windowId, structuralChange, ownOverlayEvent)) {
@@ -282,7 +286,7 @@ class AccessibilityPhoneBackend(
             try {
                 // Any previously executable snapshot is invalid before changing the read configuration.
                 snapshot.set(null)
-                clearClickAnchor()
+                clearClickAnchor(PhoneClickAnchorClearReason.DIAGNOSTIC_READ)
                 revision.incrementAndGet()
                 mutableState.update { it.copy(windowRevision = revision.get()) }
                 synchronized(readDiagnosticFlags) {
@@ -457,14 +461,14 @@ class AccessibilityPhoneBackend(
         windowIdentity.incrementAndGet()
         revision.incrementAndGet()
         snapshot.set(null)
-        clearClickAnchor()
+        clearClickAnchor(PhoneClickAnchorClearReason.INVALIDATED)
         rootExecutor.cancel()
         mutableState.update { it.copy(windowRevision = revision.get()) }
     }
 
     override suspend fun observe(permit: PhonePermit): PhoneObservation = operationLock.withLock {
         withContext(Dispatchers.Main.immediate) {
-            clearClickAnchor()
+            clearClickAnchor(PhoneClickAnchorClearReason.NEW_OBSERVATION)
             var diagnostic: ReadDiagnosticCapture? = null
             var diagnosticSample: ReadDiagnosticSample? = null
             var diagnosticOutcome = "OBSERVATION_UNAVAILABLE"
@@ -580,6 +584,7 @@ class AccessibilityPhoneBackend(
                 // controller and is never part of the backend's saved action snapshot.
                 val executable = captured.copy(tree = captured.tree.copy(readOnlyContent = null))
                 snapshot.set(executable)
+                clickDiagnosticHistory.built(permit.token, executable.observation.id, executable.tree.clickRevalidationProofs)
                 if (executable.capability == PhoneSnapshotCapability.FULL &&
                     hasEligiblePhoneClickRevalidationProof(executable.tree.clickRevalidationProofs)) clickAnchor.set(executable)
                 diagnosticOutcome = if (captured.observation.scrollOnly) "OBSERVED_SCROLL_ONLY" else "OBSERVED"
@@ -719,7 +724,7 @@ class AccessibilityPhoneBackend(
                     } finally {
                         recycleNode(root)
                         snapshot.set(null) // An action is single-use, including failed or uncertain dispatch.
-                        clickAnchor.get()?.takeIf { it.token == permit.token }?.let { clickAnchor.compareAndSet(it, null) }
+                        consumeClickAnchor(permit.token)
                     }
                 } catch (_: TreeReadAborted) {
                     throw PhoneControlException("STALE_WINDOW", "窗口或执行许可已改变，请重新观察。")
@@ -730,7 +735,7 @@ class AccessibilityPhoneBackend(
                 } catch (_: Exception) {
                     throw PhoneControlException("ACTION_FAILED", "系统未能完成本次动作，请重新观察。")
                 } finally {
-                    clickAnchor.get()?.takeIf { it.token == permit.token }?.let { clickAnchor.compareAndSet(it, null) }
+                    consumeClickAnchor(permit.token)
                 }
             }
         }
@@ -754,7 +759,7 @@ class AccessibilityPhoneBackend(
             windowIdentity.incrementAndGet()
             revision.incrementAndGet()
             snapshot.set(null)
-            clearClickAnchor()
+            clearClickAnchor(PhoneClickAnchorClearReason.ENVIRONMENT_CHANGED)
         }
         mutableState.value = PhoneBackendState(connectedService != null, revision.get(), packageName, windowId, locked)
     }
@@ -840,19 +845,42 @@ class AccessibilityPhoneBackend(
         return stored
     }
 
-    private fun clearClickAnchor() {
-        clickAnchor.set(null)
+    private fun clearClickAnchor(reason: PhoneClickAnchorClearReason, event: PhoneClickAnchorEvent? = null) {
+        clickAnchor.getAndSet(null)?.let {
+            clickDiagnosticHistory.cleared(it.token, it.observation.id, reason, event)
+        }
         clickContextRevision.incrementAndGet()
     }
 
-    override fun canRevalidateClick(token: PhoneSessionToken, observation: PhoneObservation, nodeId: String): Boolean {
-        val anchor = clickAnchor.get() ?: return false
-        if (anchor.token != token || anchor.observation != observation.withoutReadOnlyContentMetadata() ||
-            anchor.capability != PhoneSnapshotCapability.FULL || anchor.identity != windowIdentity.get() ||
-            anchor.clickContextRevision != clickContextRevision.get()) return false
-        val target = anchor.tree.clickRevalidationProofs.singleOrNull { it.nodeId == nodeId } ?: return false
-        return matchPhoneClickRevalidation(target, anchor.tree.clickRevalidationProofs,
-            anchor.tree.sensitive, anchor.tree.truncated) != null
+    private fun consumeClickAnchor(token: PhoneSessionToken) {
+        clickAnchor.get()?.takeIf { it.token == token }?.let {
+            if (clickAnchor.compareAndSet(it, null)) {
+                clickDiagnosticHistory.cleared(it.token, it.observation.id, PhoneClickAnchorClearReason.CONSUMED, null)
+            }
+        }
+    }
+
+    override fun canRevalidateClick(token: PhoneSessionToken, observation: PhoneObservation, nodeId: String): Boolean =
+        clickRevalidationDiagnostic(token, observation, nodeId).eligible
+
+    override fun clickRevalidationDiagnostic(token: PhoneSessionToken, observation: PhoneObservation, nodeId: String): PhoneClickRevalidationDiagnostic {
+        val summary = clickDiagnosticHistory.describe(token, observation.id, nodeId)
+        val anchor = clickAnchor.get()
+        fun result(stage: PhoneClickRevalidationStage, targetFailure: PhoneClickProofRejection? = summary?.targetProofReason) =
+            (summary ?: PhoneClickRevalidationDiagnostic(stage)).copy(stage = stage,
+                anchorPresent = anchor != null, targetProofReason = targetFailure)
+        if (anchor == null) return result(if (summary == null) PhoneClickRevalidationStage.NO_BUILD_RECORD else PhoneClickRevalidationStage.NO_ANCHOR)
+        if (anchor.token != token) return result(PhoneClickRevalidationStage.TOKEN_MISMATCH)
+        if (anchor.observation != observation.withoutReadOnlyContentMetadata()) return result(PhoneClickRevalidationStage.OBSERVATION_MISMATCH)
+        if (anchor.capability != PhoneSnapshotCapability.FULL) return result(PhoneClickRevalidationStage.NOT_FULL)
+        if (anchor.identity != windowIdentity.get()) return result(PhoneClickRevalidationStage.IDENTITY_CHANGED)
+        if (anchor.clickContextRevision != clickContextRevision.get()) return result(PhoneClickRevalidationStage.CONTEXT_CHANGED)
+        val target = anchor.tree.clickRevalidationProofs.singleOrNull { it.nodeId == nodeId }
+            ?: return result(PhoneClickRevalidationStage.NO_TARGET_PROOF)
+        if (matchPhoneClickRevalidation(target, anchor.tree.clickRevalidationProofs, anchor.tree.sensitive, anchor.tree.truncated) == null) {
+            return result(PhoneClickRevalidationStage.INELIGIBLE_TARGET, target.failure ?: PhoneClickProofRejection.INELIGIBLE_PROOF)
+        }
+        return result(PhoneClickRevalidationStage.ELIGIBLE)
     }
 
     private fun validClickContext(permit: PhonePermit, anchor: Snapshot, expectedRevision: Long): Boolean =
@@ -885,6 +913,7 @@ class AccessibilityPhoneBackend(
                 anchor.tree.sensitive, anchor.tree.truncated) == null) return null
         // Consume before reading. A failed validation or platform false never retries this dispatch.
         if (!clickAnchor.compareAndSet(anchor, null)) fail("STALE_SNAPSHOT", "搜索导航参照已失效，请重新观察。")
+        clickDiagnosticHistory.cleared(anchor.token, anchor.observation.id, PhoneClickAnchorClearReason.CONSUMED, null)
         snapshot.get()?.takeIf { it.token == permit.token }?.let { snapshot.compareAndSet(it, null) }
         val freshRevision = revision.get()
         requireClickContext(permit, anchor, freshRevision)
@@ -1090,7 +1119,7 @@ class AccessibilityPhoneBackend(
         intent.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
         context.startActivity(intent)
         snapshot.set(null)
-        clearClickAnchor()
+        clearClickAnchor(PhoneClickAnchorClearReason.OPEN_APP)
         return PhoneBackendResult(true, "已请求打开目标应用，请等待前台切换后观察。")
     }
 

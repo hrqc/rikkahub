@@ -485,14 +485,15 @@ class PhoneController(
         val environment = backend.state.value
         val revisionChanged = current.windowRevision != environment.windowRevision
         val windowChanged = current.windowId != environment.windowId
-        val eligibleRefresh = action is PhoneAction.Click && backend.canRevalidateClick(token, current, action.nodeId)
+        val clickDiagnostic = (action as? PhoneAction.Click)?.let { backend.clickRevalidationDiagnostic(token, current, it.nodeId) }
+        val eligibleRefresh = clickDiagnostic?.eligible == true
         if (age !in 0..10_000 || windowChanged || (revisionChanged && !eligibleRefresh)) {
             throw PhoneControlException("STALE_SNAPSHOT", "页面已变化或快照超时，请重新观察；不得直接重放旧动作",
                 PhoneSnapshotRejection(when {
                     age !in 0..10_000 -> PhoneSnapshotRejectionReason.AGE_LIMIT
                     windowChanged -> PhoneSnapshotRejectionReason.WINDOW_CHANGED
                     else -> PhoneSnapshotRejectionReason.REVISION_CHANGED
-                }, age.coerceIn(-300_000, 300_000), revisionChanged, windowChanged))
+                }, age.coerceIn(-300_000, 300_000), revisionChanged, windowChanged, clickDiagnostic))
         }
         return current
     }

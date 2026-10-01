@@ -132,4 +132,63 @@ class ShoppingToolsTest {
             assertTrue(it, prompt.contains(it))
         }
     }
+
+    @Test fun `functional alternatives wire schema groups cross brand references and preserves binding uncertainty`() = runBlocking {
+        val extra = mutableListOf<ShoppingObservedNode>()
+        fun fact(id: String, value: String): ShoppingFact {
+            extra += ShoppingObservedNode(id, value)
+            return ShoppingFact(value, ref(id, value))
+        }
+        val candidates = listOf("a", "b", "c").mapIndexed { index, id ->
+            val title = fact("title_$id", "品牌$id USB-C数据线")
+            val spec = fact("spec_$id", if (index == 0) "双C 60W 1米 单条装" else "Type-C对Type-C 60瓦 100厘米 1根装")
+            val brand = fact("brand_$id", "品牌$id")
+            val store = fact("store_$id", "店铺$id")
+            val price = (30 - index * 10).toString() + ".00"
+            val priceFact = fact("price_$id", "¥$price")
+            ShoppingCandidate(id, title, spec, 1, unitPrice = ShoppingMoney(price, priceFact.evidence),
+                brand = brand, store = store, cableSpecEvidence = ShoppingCableSpecEvidence(
+                    spec.evidence, spec.evidence, spec.evidence, spec.evidence))
+        }
+        val evidence = listOf(observed.single().copy(nodes = extra))
+        val request = ShoppingComparisonRequest(candidates = candidates, comparisonMode = ShoppingComparisonMode.FUNCTIONAL_ALTERNATIVES,
+            functionalCategory = ShoppingFunctionalCategory.USB_C_CABLE)
+        val tool = createShoppingTools(Json) { evidence }.single()
+        val response = tool.execute(Json.parseToJsonElement(Json.encodeToString(request)))
+        val output = Json.parseToJsonElement((response.single() as UIMessagePart.Text).text).jsonObject
+        assertEquals("true", output["accepted"]!!.jsonPrimitive.content)
+        assertEquals("false", output["execution_started"]!!.jsonPrimitive.content)
+        val comparison = output["comparison"]!!.jsonObject
+        assertEquals("FUNCTIONAL_ALTERNATIVES", comparison["comparison_mode"]!!.jsonPrimitive.content)
+        assertEquals("false", comparison["product_binding_verified"]!!.jsonPrimitive.content)
+        val group = comparison["groups"]!!.jsonArray.single().jsonObject
+        val ranked = group["ranked_candidates"]!!.jsonArray
+        assertEquals(listOf("c", "b", "a"), ranked.map { it.jsonObject["id"]!!.jsonPrimitive.content })
+        assertEquals("品牌c", ranked.first().jsonObject["brand"]!!.jsonObject["value"]!!.jsonPrimitive.content)
+        assertEquals("店铺c", ranked.first().jsonObject["store"]!!.jsonObject["value"]!!.jsonPrimitive.content)
+        assertEquals("1000", group["functional_specification"]!!.jsonObject["length_mm"]!!.jsonPrimitive.content)
+        assertTrue(group["lowest_confirmed_candidate_ids"]!!.jsonArray.isEmpty())
+        val schema = (tool.parameters() as me.rerere.ai.core.InputSchema.Obj).properties
+        assertTrue(schema.containsKey("comparison_mode"))
+        assertTrue(schema.containsKey("functional_category"))
+    }
+
+    @Test fun `functional wire requests cannot replace evidence with model supplied normalized values or group ids`() = runBlocking {
+        val tool = createShoppingTools(Json) { observed }.single()
+        val functional = JsonObject(arguments() + mapOf(
+            "comparison_mode" to JsonPrimitive("FUNCTIONAL_ALTERNATIVES"),
+            "functional_category" to JsonPrimitive("USB_C_CABLE"),
+        ))
+        for (field in listOf("comparison_group_id", "verified_specs", "normalized_length_mm")) {
+            val response = tool.execute(JsonObject(functional + (field to JsonPrimitive("1000"))))
+            val output = Json.parseToJsonElement((response.single() as UIMessagePart.Text).text).jsonObject
+            assertEquals("false", output["accepted"]!!.jsonPrimitive.content)
+            assertEquals("invalid_arguments", output["code"]!!.jsonPrimitive.content)
+        }
+        val response = tool.execute(functional)
+        val output = Json.parseToJsonElement((response.single() as UIMessagePart.Text).text).jsonObject
+        assertEquals("true", output["accepted"]!!.jsonPrimitive.content)
+        assertTrue(output["comparison"]!!.jsonObject["groups"]!!.jsonArray.isEmpty())
+        assertEquals(1, output["comparison"]!!.jsonObject["unranked_candidates"]!!.jsonArray.size)
+    }
 }

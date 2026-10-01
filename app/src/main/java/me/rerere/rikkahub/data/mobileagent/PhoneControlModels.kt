@@ -162,11 +162,50 @@ data class PhoneActionResult(
 /** Messages must be fixed local descriptions, never raw platform errors or user input. */
 enum class PhoneSnapshotRejectionReason { AGE_LIMIT, WINDOW_CHANGED, REVISION_CHANGED }
 
+/** Fixed metadata only: no node text, identifiers, hashes or platform exception messages. */
+enum class PhoneClickProofRejection {
+    NO_CANDIDATE, SCOPE_AMBIGUOUS, MISSING_ANCESTOR, FOREIGN_CONTEXT, DISABLED_CONTEXT,
+    SENSITIVE_CONTEXT, TRUNCATED_CONTEXT, RESTRICTED_CONTEXT, TARGET_STRUCTURE,
+    DESCENDANT_STRUCTURE, CAMERA_MISSING_OR_AMBIGUOUS, SEARCH_MISSING_OR_AMBIGUOUS,
+    SEARCH_BAR_AMBIGUOUS, GEOMETRY_MISMATCH, PREVIEW_UNAVAILABLE, TARGET_UNAVAILABLE,
+    INELIGIBLE_PROOF,
+}
+
+enum class PhoneClickRevalidationStage {
+    ELIGIBLE, NOT_SUPPORTED, NO_ANCHOR, NO_BUILD_RECORD, TOKEN_MISMATCH, OBSERVATION_MISMATCH,
+    NOT_FULL, IDENTITY_CHANGED, CONTEXT_CHANGED, NO_TARGET_PROOF, INELIGIBLE_TARGET,
+}
+
+enum class PhoneClickAnchorClearReason {
+    SESSION_ENDED, OVERLAY_CHANGED, ACCESSIBILITY_EVENT, DIAGNOSTIC_READ, INVALIDATED,
+    NEW_OBSERVATION, ENVIRONMENT_CHANGED, OPEN_APP, CONSUMED,
+}
+
+enum class PhoneClickAnchorEvent {
+    WINDOWS_CHANGED, WINDOW_STATE_CHANGED, CONTENT_CHANGED, TEXT_CHANGED, SCROLLED, CLICKED,
+    FOCUSED, TEXT_SELECTION_CHANGED, ACCESSIBILITY_FOCUSED, ACCESSIBILITY_FOCUS_CLEARED,
+    OTHER,
+}
+
+data class PhoneClickRevalidationDiagnostic(
+    val stage: PhoneClickRevalidationStage,
+    val anchorPresent: Boolean = false,
+    val candidateCount: Int = 0,
+    val eligibleCount: Int = 0,
+    val targetProofReason: PhoneClickProofRejection? = null,
+    val proofReasons: List<PhoneClickProofRejection> = emptyList(),
+    val lastClearReason: PhoneClickAnchorClearReason? = null,
+    val lastClearEvent: PhoneClickAnchorEvent? = null,
+) {
+    val eligible: Boolean get() = stage == PhoneClickRevalidationStage.ELIGIBLE
+}
+
 data class PhoneSnapshotRejection(
     val reason: PhoneSnapshotRejectionReason,
     val ageMillis: Long,
     val revisionChanged: Boolean,
     val windowChanged: Boolean,
+    val clickRevalidation: PhoneClickRevalidationDiagnostic? = null,
 )
 
 class PhoneControlException(
@@ -184,6 +223,9 @@ interface PhoneBackend {
     suspend fun observe(permit: PhonePermit): PhoneObservation
     /** Metadata eligibility only. Execution must independently reread and validate the exact target. */
     fun canRevalidateClick(token: PhoneSessionToken, observation: PhoneObservation, nodeId: String): Boolean = false
+    fun clickRevalidationDiagnostic(token: PhoneSessionToken, observation: PhoneObservation, nodeId: String): PhoneClickRevalidationDiagnostic =
+        PhoneClickRevalidationDiagnostic(if (canRevalidateClick(token, observation, nodeId))
+            PhoneClickRevalidationStage.ELIGIBLE else PhoneClickRevalidationStage.NOT_SUPPORTED)
     suspend fun execute(
         permit: PhonePermit,
         observation: PhoneObservation?,
